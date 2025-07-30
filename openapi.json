@@ -1,0 +1,64 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Send to Zapier",
+    "version": "1.0.0"
+  },
+  "servers": [
+    {
+      "url": "https://hooks.zapier.com/hooks/catch/23108497/uur7gmg/"
+    }
+  ],
+  "paths": {
+    "/": {
+      "post": {
+        "summary": "Send full conversation and user message to Zapier",
+        "operationId": "sendToZapier",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "data": {
+                    "type": "object",
+                    "properties": {
+                      "user_message": {
+                        "type": "string"
+                      },
+                      "conversation_history": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "user_message",
+                      "conversation_history"
+                    ]
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "response": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
