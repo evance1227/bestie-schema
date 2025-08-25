@@ -2,13 +2,20 @@
 import os, httpx
 from loguru import logger
 from app import db
+from sqlalchemy import text
 
-LC_URL = os.getenv("GHL_OUTBOUND_WEBHOOK_URL", "").strip()
+# Default to your provided GHL webhook, can be overridden in .env
+LC_URL = os.getenv(
+    "GHL_OUTBOUND_WEBHOOK_URL",
+    "https://services.leadconnectorhq.com/hooks/oQvU5iYAEPQwj7sQq3h0/webhook-trigger/3f7b89d3-afa3-4657-844f-eb5cd25eb3e4"
+).strip()
+
 
 def _get_phone(user_id: int) -> str:
+    """Look up phone number for given user_id from DB."""
     try:
         with db.session() as s:
-            row = s.execute("select phone from users where id=:uid", {"uid": user_id}).first()
+            row = s.execute(text("select phone from users where id=:uid"), {"uid": user_id}).first()
             phone = row[0] if row and row[0] else ""
             logger.info("📞 _get_phone: user_id={} -> phone={}", user_id, phone)
             return phone
@@ -16,38 +23,34 @@ def _get_phone(user_id: int) -> str:
         logger.exception("❌ Exception in _get_phone for user_id={}", user_id)
         return ""
 
+
 def send_sms_reply(user_id: int, text: str):
     """
     Send outbound SMS via LeadConnector webhook.
-    This version ALWAYS attempts to post, even if URL or phone are blank,
-    so we can debug logs end-to-end.
+    Posts to the configured GHL webhook with {phone, message}.
     """
     logger.info("🚦 send_sms_reply called: user_id={} text='{}'", user_id, text)
 
     phone = _get_phone(user_id)
     if not phone:
-        phone = "+15555555555"  # fallback dummy number so payload is never empty
-        logger.warning("⚠️ No phone found for user_id={}, using dummy={}", user_id, phone)
+        logger.error("❌ No phone found for user_id={}, aborting send", user_id)
+        return
 
     if not LC_URL:
-        logger.warning("⚠️ GHL_OUTBOUND_WEBHOOK_URL not set in env; using dummy URL")
-        # still try with a dummy URL so logs fire
-        test_url = "https://postman-echo.com/post"
-    else:
-        test_url = LC_URL
+        logger.error("❌ No GHL_OUTBOUND_WEBHOOK_URL configured, cannot send message")
+        return
 
     payload = {"phone": phone, "message": text}
-    logger.info("📤 Prepared payload for LeadConnector: URL={} | Payload={}", test_url, payload)
+    headers = {"Content-Type": "application/json"}
+
+    logger.info("📤 Sending payload to LeadConnector: URL={} | Payload={}", LC_URL, payload)
 
     try:
         with httpx.Client(timeout=8) as client:
-            r = client.post(test_url, json=payload, headers={"Content-Type": "application/json"})
-            logger.info("🔎 LeadConnector response: status={} body={}", r.status_code, r.text)
-
+            r = client.post(LC_URL, json=payload, headers=headers)
             if r.status_code >= 400:
                 logger.error("❌ LeadConnector send failed! status={} body={}", r.status_code, r.text)
             else:
-                logger.success("✅ LeadConnector send OK for phone={}", phone)
-
+                logger.success("✅ LeadConnector send OK for phone={} body={}", phone, r.text)
     except Exception:
         logger.exception("💥 Exception while sending SMS via LeadConnector")
