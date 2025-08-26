@@ -15,10 +15,8 @@ app = FastAPI(title="Bestie Backend")
 def process_incoming(message_id: str, user_phone: str, text_val: str, raw_body: dict):
     """Run DB insert + enqueue safely in background after GHL gets 200."""
     try:
-        logger.info(
-            "[API][Process] Starting DB insert for msg_id={} phone={} text={}",
-            message_id, user_phone, text_val
-        )
+        logger.info("[API][Process] Starting DB insert for msg_id={} phone={} text={}",
+                    message_id, user_phone, text_val)
 
         with db.session() as s:
             # Always allow follow-ups — each inbound SMS is unique
@@ -26,17 +24,13 @@ def process_incoming(message_id: str, user_phone: str, text_val: str, raw_body: 
             convo = models.get_or_create_conversation(s, user.id)
             models.insert_message(s, convo.id, "in", message_id, text_val)
             s.commit()
-            logger.info(
-                "[API][Process] 💾 Stored inbound: convo_id={} user_id={}",
-                convo.id, user.id
-            )
+            logger.info("[API][Process] 💾 Stored inbound: convo_id={} user_id={}",
+                        convo.id, user.id)
 
         # Hand off to worker
         job = enqueue_generate_reply(convo.id, user.id, text_val)
-        logger.success(
-            "[API][Queue] ✅ Enqueued job={} convo_id={} user_id={} text={}",
-            job.id, convo.id, user.id, text_val
-        )
+        logger.success("[API][Queue] ✅ Enqueued job={} convo_id={} user_id={} text={}",
+                       job.id, convo.id, user.id, text_val)
 
     except Exception as e:
         logger.exception("💥 [API][Process] Exception in background process: {}", e)
@@ -50,14 +44,14 @@ async def incoming_message_any(req: Request, background_tasks: BackgroundTasks):
         logger.info("[API][Webhook] >>> Incoming webhook hit! Raw body: {}", body)
     except Exception:
         logger.exception("[API][Webhook] Invalid JSON received")
-        return JSONResponse(
-            status_code=200,
-            content={"ok": False, "error": "invalid json"}
-        )
+        return JSONResponse(status_code=200, content={"ok": False, "error": "invalid json"})
 
-    # Use customData if present
+    # ✅ Use customData if present, else fallback to body
     cd = body.get("customData") or body.get("custom_data")
-    payload = cd if isinstance(cd, dict) else {}
+    if cd and isinstance(cd, dict):
+        payload = cd
+    else:
+        payload = body
 
     # ✅ Always force unique message_id by appending timestamp
     base_id = (
@@ -94,10 +88,8 @@ async def incoming_message_any(req: Request, background_tasks: BackgroundTasks):
     logger.info("[API][Webhook] Extracted text={}", text_val)
 
     if not user_phone or not text_val:
-        logger.warning(
-            "⚠️ [API][Webhook] Missing required fields. phone={} text={}",
-            user_phone, text_val
-        )
+        logger.warning("⚠️ [API][Webhook] Missing required fields. phone={} text={}",
+                       user_phone, text_val)
         return JSONResponse(
             status_code=200,
             content={"ok": False, "error": "missing required fields"}
@@ -115,10 +107,6 @@ async def incoming_message_any(req: Request, background_tasks: BackgroundTasks):
 @app.post("/tasks/trigger_reengagement")
 async def trigger_reengagement(background_tasks: BackgroundTasks):
     """Manually or via cron: enqueue re-engagement nudges for inactive users."""
-    try:
-        logger.info("[API][Reengage] 🔔 Trigger received from cron or manual call")
-        background_tasks.add_task(send_reengagement_job)
-        return {"ok": True, "message": "Re-engagement job queued"}
-    except Exception as e:
-        logger.exception("💥 [API][Reengage] Exception while scheduling re-engagement: {}", e)
-        return {"ok": False, "error": str(e)}
+    logger.info("[API][Reengage] 🔔 Trigger received")
+    background_tasks.add_task(send_reengagement_job)
+    return {"ok": True, "message": "Re-engagement job queued"}
