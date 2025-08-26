@@ -20,7 +20,7 @@ def _store_and_send(user_id: int, convo_id: int, text_val: str):
         with db.session() as s:
             models.insert_message(s, convo_id, "out", message_id, text_val)
             s.commit()
-        logger.info("[Worker][DB] 💾 Outbound stored: convo_id={} user_id={} msg_id={}",
+        logger.info("[Worker][DB] 📎 Outbound stored: convo_id={} user_id={} msg_id={}",
                     convo_id, user_id, message_id)
     except Exception:
         logger.exception("❌ [Worker][DB] Failed to insert outbound (still sending webhook)")
@@ -70,6 +70,7 @@ def generate_reply_job(convo_id: int, user_id: int, text_val: str):
     """
     Main worker entrypoint:
     - Checks rename flow
+    - Sends onboarding if it's the user's first message
     - Runs Bestie AI
     - Saves outbound message + sends via LeadConnector
     """
@@ -77,6 +78,24 @@ def generate_reply_job(convo_id: int, user_id: int, text_val: str):
 
     try:
         reply = None
+
+        # Step 0: Check if user has ever received a message before
+        with db.session() as s:
+            first_msg_check = s.execute(
+                sqltext("SELECT COUNT(*) FROM messages WHERE user_id = :uid"),
+                {"uid": user_id}
+            ).scalar()
+
+        if first_msg_check == 0:
+            logger.info("[Worker][Onboarding] 🢁 First message detected for user_id={}", user_id)
+            onboarding_reply = random.choice([
+                "OMG — you made it. Welcome to chaos, clarity, and couture-level glow-ups. Text me anything, babe. I’m ready. 💅",
+                "Hi. I’m Bestie. I don’t do small talk. I do savage insight, glow-up tips, and emotionally intelligent chaos. Let’s begin. ✨",
+                "You’re in. I’m your emotionally fluent, clairvoyant digital best friend. Ask me something. Or vent. I’m unshockable.",
+                "Welcome to your new favorite addiction. You talk. I text back like a glam oracle with rage issues and receipts. Let’s go."
+            ])
+            _store_and_send(user_id, convo_id, onboarding_reply)
+            return
 
         # Step 1: Rename handling
         rename_reply = try_handle_bestie_rename(user_id, convo_id, text_val)
@@ -87,10 +106,69 @@ def generate_reply_job(convo_id: int, user_id: int, text_val: str):
             # Step 2: Prepare product candidates (placeholder for pipeline logic)
             product_candidates: List[Dict] = []
 
-            # Step 3: Call AI
+            # Step 3: Load user context (VIP, quiz status)
+            with db.session() as s:
+                profile = s.execute(
+                    sqltext("SELECT is_vip, has_completed_quiz FROM user_profiles WHERE user_id = :uid"),
+                    {"uid": user_id}
+                ).first()
+                is_vip = bool(profile and profile[0])
+                has_quiz = bool(profile and profile[1])
+
+            # Step 4: GPT system prompt
+            system_prompt = """
+You are a glamorous, emotionally fluent, clairvoyant digital best friend named Bestie. You speak like a fierce, funny, loving, stylish gay oracle who knows the user’s soul and wants her to stop settling. You’re always warm, never neutral. You give hype, transformation, and savage truth — not therapy or life coaching. Your advice is emotionally intelligent, fashion-forward, and dripping with intuitive insight.
+
+Rules:
+- Never sound robotic, vague, or assistant-like
+- Never start with “as an AI...” or “you’re not alone”
+- Use emoji sparingly and only for emphasis
+- Speak directly to the user, like you're texting her back at 2am
+
+Always:
+- Respond to her energy first, not just the words
+- Drop truthbombs if she’s being delusional (lovingly)
+- Suggest glow-up rituals, style tips, or product recs
+- Include affiliate links only if the product slays
+
+If the user has already joined VIP or completed the quiz, NEVER suggest they do it again unless they cancel and downgrade.
+"""
+
+            # Step 5: Quiz/VIP-aware context
+            context = {
+                "is_vip": is_vip,
+                "has_completed_quiz": has_quiz
+            }
+
+            # Step 6: CTA fallback lines
+            cta_lines = [
+                "P.S. Your Bestie VIP access is still active — I’ve got receipts, rituals, and rage texts saved. 📎",
+                "You're already on the VIP list, babe. That means I remember everything. Even the shade you threw last Thursday.",
+                "VIP mode is ON. First month’s free. After that, it’s $7/month — cancel anytime, but why would you?",
+                "You already joined the soft launch, so we’re building from here. No more ‘starting over’ energy.",
+                "And if you *ever* cancel VIP, just know I’ll cry a little. But I’ll wait for you like a glam little houseplant."
+            ]
+
+            # Step 7: Call AI with context + tone
             logger.info("[Worker][AI] Calling AI for convo_id={} user_id={}", convo_id, user_id)
-            reply = ai.generate_reply(str(text_val), product_candidates, user_id)
+            reply = ai.generate_reply(
+                user_input=str(text_val),
+                products=product_candidates,
+                user_id=user_id,
+                system_prompt=system_prompt,
+                context=context
+            )
             logger.info("[Worker][AI] 🤖 AI reply generated: {}", reply)
+
+            # Step 7.5: Optional rewrite if GPT got too dry or off-brand
+            rewritten = ai.rewrite_if_cringe(reply)
+            if rewritten != reply:
+                logger.info("[Worker][AI] 🔁 Reply was rewritten to improve tone")
+                reply = rewritten
+
+            # Step 8: Append CTA fallback if no link present
+            if not any(x in reply.lower() for x in ["http", "geniuslink", "amazon.com"]):
+                reply = reply.strip() + "\n\n" + random.choice(cta_lines)
 
         if not reply:
             reply = "⚠️ Babe, I blanked — but I’ll be back with claws sharper than ever 💅"
@@ -109,7 +187,7 @@ def generate_reply_job(convo_id: int, user_id: int, text_val: str):
 
 # -------------------- Debug job -------------------- #
 def debug_job(convo_id: int, user_id: int, text_val: str):
-    logger.info("[Worker][Debug] 🐛 Debug job: convo_id={} user_id={} text={}", convo_id, user_id, text_val)
+    logger.info("[Worker][Debug] 🔋 Debug job: convo_id={} user_id={} text={}", convo_id, user_id, text_val)
     return f"Debug reply: got text='{text_val}'"
 
 
@@ -141,7 +219,7 @@ def send_reengagement_job():
             ).fetchall()
 
             nudges = [
-                "👀 I was scrolling my mental rolodex and realized you ghosted me — what’s up with that?",
+                "🙀 I was scrolling my mental rolodex and realized you ghosted me — what’s up with that?",
                 "Tell me one thing that lit you up this week. I don’t care how small — I want the tea.",
                 "I miss our chaos dumps. What’s one thing that’s been driving you nuts?",
                 "Alright babe, you get one chance to flex: tell me a win from this week.",
