@@ -4,10 +4,34 @@ multiprocessing.set_start_method("spawn", force=True)
 
 from loguru import logger
 from typing import Optional, List, Dict
-import re, uuid
+import re, uuid, random
 from sqlalchemy import text as sqltext
+from datetime import datetime, timedelta
 
 from app import db, models, ai, integrations
+
+# -------------------- Core: store + send -------------------- #
+def _store_and_send(user_id: int, convo_id: int, text_val: str):
+    """
+    Insert outbound message in DB and send via LeadConnector.
+    """
+    message_id = str(uuid.uuid4())
+    try:
+        with db.session() as s:
+            models.insert_message(s, convo_id, "out", message_id, text_val)
+            s.commit()
+        logger.info("[Worker][DB] 💾 Outbound stored: convo_id={} user_id={} msg_id={}",
+                    convo_id, user_id, message_id)
+    except Exception:
+        logger.exception("❌ [Worker][DB] Failed to insert outbound (still sending webhook)")
+
+    try:
+        logger.info("[Worker][Send] 📤 Sending SMS to user_id={} text='{}'", user_id, text_val)
+        integrations.send_sms_reply(user_id, text_val)
+        logger.success("[Worker][Send] ✅ SMS send attempted for user_id={}", user_id)
+    except Exception:
+        logger.exception("💥 [Worker][Send] Exception while calling send_sms_reply")
+
 
 # -------------------- Rename flow -------------------- #
 RENAME_PATTERNS = [
@@ -39,6 +63,7 @@ def try_handle_bestie_rename(user_id: int, convo_id: int, text_val: str) -> Opti
         logger.info("[Worker][Rename] Bestie renamed for user_id={} → {}", user_id, new_name)
         return ai.witty_rename_response(new_name)
     return None
+
 
 # -------------------- Worker job -------------------- #
 def generate_reply_job(convo_id: int, user_id: int, text_val: str):
@@ -78,47 +103,61 @@ def generate_reply_job(convo_id: int, user_id: int, text_val: str):
         _store_and_send(
             user_id,
             convo_id,
-            "Bestie: Babe, I glitched — but I’ll be back to drag you properly 💅"
+            "Babe, I glitched — but I’ll be back to drag you properly 💅"
         )
 
-def _store_and_send(user_id: int, convo_id: int, text_val: str):
-    """
-    Insert outbound message in DB and send via LeadConnector.
-    """
-    message_id = str(uuid.uuid4())
-    try:
-        with db.session() as s:
-            models.insert_message(s, convo_id, "out", message_id, text_val)
-            s.commit()
-        logger.info("[Worker][DB] 💾 Outbound stored: convo_id={} user_id={} msg_id={}",
-                    convo_id, user_id, message_id)
-    except Exception:
-        logger.exception("❌ [Worker][DB] Failed to insert outbound (still sending webhook)")
-
-    try:
-        logger.info("[Worker][Send] 📤 Sending SMS to user_id={} text='{}'", user_id, text_val)
-        integrations.send_sms_reply(user_id, text_val)
-        logger.success("[Worker][Send] ✅ SMS send attempted for user_id={}", user_id)
-    except Exception:
-        logger.exception("💥 [Worker][Send] Exception while calling send_sms_reply")
 
 # -------------------- Debug job -------------------- #
 def debug_job(convo_id: int, user_id: int, text_val: str):
     logger.info("[Worker][Debug] 🐛 Debug job: convo_id={} user_id={} text={}", convo_id, user_id, text_val)
     return f"Debug reply: got text='{text_val}'"
 
+
 # -------------------- Re-engagement job -------------------- #
 def send_reengagement_job():
     """
-    Placeholder re-engagement task.
-    Eventually: query DB for inactive users (>48h silence), enqueue nudges.
-    For now: just log + safe no-op.
+    Query DB for inactive users (>48h silence) and send engaging nudges.
+    Only reengage once every 24h after the last nudge.
     """
     try:
         logger.info("[Worker][Reengage] 🔔 Running re-engagement job")
-        # TODO: Add DB query to find inactive users and enqueue nudges
-        # Example: inactive = db.find_inactive_users(hours=48)
-        # for u in inactive: enqueue_generate_reply(convo.id, u.id, "Hey babe, miss me?")
-        logger.info("[Worker][Reengage] ✅ Re-engagement job completed (stub)")
+
+        now = datetime.utcnow()
+        cutoff = now - timedelta(hours=48)
+        nudge_cooldown = now - timedelta(hours=24)
+
+        with db.session() as s:
+            rows = s.execute(
+                sqltext("""
+                    SELECT c.id as convo_id, u.id as user_id, u.phone,
+                           MAX(m.created_at) as last_message_at
+                    FROM conversations c
+                    JOIN users u ON u.id = c.user_id
+                    LEFT JOIN messages m ON m.conversation_id = c.id
+                    GROUP BY c.id, u.id, u.phone
+                    HAVING MAX(m.created_at) < :cutoff
+                """),
+                {"cutoff": cutoff}
+            ).fetchall()
+
+            nudges = [
+                "👀 I was scrolling my mental rolodex and realized you ghosted me — what’s up with that?",
+                "Tell me one thing that lit you up this week. I don’t care how small — I want the tea.",
+                "I miss our chaos dumps. What’s one thing that’s been driving you nuts?",
+                "Alright babe, you get one chance to flex: tell me a win from this week.",
+                "I know you’ve got a story. Spill one ridiculous detail from the last 48 hours."
+            ]
+
+            for convo_id, user_id, phone, last_message_at in rows:
+                if last_message_at and last_message_at > nudge_cooldown:
+                    logger.info("[Worker][Reengage] Skipping user_id={} (last nudge too recent)", user_id)
+                    continue
+
+                message = random.choice(nudges)
+                logger.info("[Worker][Reengage] Nudging user_id={} phone={} with: {}", user_id, phone, message)
+                _store_and_send(user_id, convo_id, message)
+
+        logger.info("[Worker][Reengage] ✅ Completed re-engagement run")
+
     except Exception as e:
         logger.exception("💥 [Worker][Reengage] Exception in re-engagement job: {}", e)
