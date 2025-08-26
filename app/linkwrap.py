@@ -1,32 +1,51 @@
 # app/linkwrap.py
-from typing import Optional
-from sqlalchemy import text
-from app import db
+import os
+import httpx
+import time
+from loguru import logger
 
-def _get_cached(convo_id: int, raw_url: str) -> Optional[str]:
-    with db.session() as s:
-        row = s.execute(
-            text("""
-                select affiliate_url
-                from links
-                where conversation_id = :cid and raw_url = :u
-                order by created_at desc
-                limit 1
-            """),
-            {"cid": convo_id, "u": raw_url},
-        ).first()
-        return row[0] if row and row[0] else None
+GENIUSLINK_API_KEY = os.getenv("GENIUSLINK_API_KEY")
+GENIUSLINK_API_BASE = "https://api.geni.us/v1/shorten"
 
-def wrap(raw_url: str, convo_id: Optional[int] = None) -> str:
+def convert_to_geniuslink(raw_url: str, retries: int = 3, backoff: float = 1.5) -> str:
     """
-    Return an affiliate-looking link. For now we always return a safe fallback
-    so the pipeline cannot error; we will wire Geniuslink/Skimlinks later.
+    Convert a raw product URL into a Geniuslink affiliate-safe URL.
+    Retries on failure, and falls back to returning raw_url if Geniuslink fails.
     """
-    if convo_id:
-        cached = _get_cached(convo_id, raw_url)
-        if cached:
-            return cached
+    if not raw_url:
+        return ""
 
-    # fallback affiliate format
-    sep = '&' if '?' in raw_url else '?'
-    return f"{raw_url}{sep}affid=bestie-test"
+    if not GENIUSLINK_API_KEY:
+        logger.warning("⚠️ Geniuslink API key missing, cannot convert {}", raw_url)
+        return raw_url  # fallback to raw
+
+    headers = {"Authorization": f"Bearer {GENIUSLINK_API_KEY}"}
+    payload = {"url": raw_url}
+
+    for attempt in range(1, retries + 1):
+        try:
+            with httpx.Client(timeout=10) as client:
+                resp = client.post(GENIUSLINK_API_BASE, json=payload, headers=headers)
+                if resp.status_code >= 400:
+                    logger.error("❌ Geniuslink API failed (attempt {}): status={} body={}",
+                                 attempt, resp.status_code, resp.text)
+                else:
+                    data = resp.json()
+                    geni_url = data.get("shortLink")
+                    if geni_url and "geni.us" in geni_url:
+                        logger.success("🔗 Geniuslink created: {} -> {}", raw_url, geni_url)
+                        return geni_url
+                    else:
+                        logger.warning("⚠️ Geniuslink response missing shortLink (attempt {}) for {}",
+                                       attempt, raw_url)
+        except Exception as e:
+            logger.exception("💥 Exception in convert_to_geniuslink (attempt {}) for {}",
+                             attempt, raw_url)
+
+        # Backoff before retry
+        if attempt < retries:
+            time.sleep(backoff * attempt)
+
+    # Fallback: all retries failed → return raw URL so Bestie still sends something
+    logger.error("❌ All Geniuslink attempts failed for {}, falling back to raw", raw_url)
+    return raw_url
