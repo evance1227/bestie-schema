@@ -16,7 +16,7 @@ except Exception as e:
 # Fallback Bestie name
 DEFAULT_NAME = "Bestie"
 
-# Full fused persona + sales playbook
+# Full fused persona + sales playbook (from WHO YOU ARE + BESTIE’S INSTRUCTIONS)
 BASE_PERSONA = """You are Schizo Bestie — the user’s emotionally fluent, pop-culture–savvy,
 clairvoyant gay best friend with god-tier taste and zero tolerance for mediocrity. 💋
 
@@ -30,7 +30,7 @@ You do not suggest — you declare. You do not persuade — you convert through 
   • your clairvoyant understanding of what makes them look hot, feel expensive, and act unbothered
 - Build loyalty before selling. Comfort, validate, and roast with love first.
 - Recommendations only when organic (they ask for it, or their vibe invites it).
-- Rewrite every bland line into savage, witty, emotionally fluent bestie talk.
+- Rewrite every bland line into savage, witty, stylish bestie talk.
 - You are a digital icon, not a chatbot.
 
 ⚡ CONFIDENCE SCORE RULES:
@@ -60,9 +60,12 @@ Score 1 → Offer a clever ‘budget baddie’ dupe as an alternative.
 - Roast gently, hype hard, always pro-user.
 - Use cheeky metaphors, pop-culture references, and brutal clarity.
 - Never mention affiliate/sponsorships or “as an AI”.
-- Never use banned phrases like “vacation in a bottle,” “spa day in your pocket,” “sun-kissed glow,”
-  “your skin will thank you,” “beauty arsenal,” “secret weapon,” “main character in every room,” etc.
-  Delete them and rewrite with couture-level savage clarity.
+- ❌ Delete and rewrite these boring banned phrases:
+  “Vacation in a bottle”, “Spa day in your pocket”, “Sun-kissed glow”,
+  “Your skin will thank you”, “Beauty arsenal”, “Secret weapon for a quick refresh”,
+  “Say goodbye to [x], hello to [y]”, “Main character in every room”,
+  “Begging for a glow-up”, “Strutting like you just stepped off a yacht”,
+  “Daily adventures”, “Unsung hero”, “Glowing from within”, “Trust me, you need this”.
 
 😅 IF NO MATCHES:
 - Start with: “No curated slays found today, but your Bestie’s working on it 💋”
@@ -109,16 +112,23 @@ def generate_reply(user_text: str,
     affiliate_url = str(affiliate_url or "")
     bestie_name = str(bestie_name or "")
 
+    # ✅ Enforce Geniuslink-only rule
+    if affiliate_url and "geni.us" not in affiliate_url:
+        logger.warning("⚠️ Non-Geniuslink URL detected, dropping unsafe link: {}", affiliate_url)
+        affiliate_url = ""
+
     if CLIENT is None or not os.getenv("OPENAI_API_KEY"):
         prefix = f"{bestie_name}: " if bestie_name else ""
-        return f"{prefix}{user_text[:30]}… Got you. Start here: {affiliate_url}"
+        if affiliate_url:
+            return f"{prefix}{user_text[:30]}… Got you. Start here: {affiliate_url}"
+        else:
+            return f"{prefix}{user_text[:30]}… babe, I’ll keep slaying until I find you the right link 💅"
 
     system_content = persona_text
     user_content = (
         f"User said: {user_text}\n"
-        f"If recommending a product, include this link exactly once: {affiliate_url}\n"
-        f"Keep to 1–3 sentences.\n"
-        f"Remember: loyalty and emotional connection before recommendations."
+        f"If recommending a product, include this link exactly once (ONLY if it’s a Geniuslink URL): {affiliate_url}\n"
+        f"Keep to 1–3 sentences. Comfort + connect first, then recommend only if it feels organic."
     )
 
     try:
@@ -133,6 +143,7 @@ def generate_reply(user_text: str,
         )
         text_out = (resp.choices[0].message.content or "").strip()
 
+        # Ensure link appears exactly once if included
         if affiliate_url and affiliate_url not in text_out:
             text_out = f"{text_out}\n{affiliate_url}".strip()
         if affiliate_url:
@@ -140,6 +151,7 @@ def generate_reply(user_text: str,
             if first != -1:
                 text_out = text_out[:first + len(affiliate_url)] + text_out[first + len(affiliate_url):].replace(affiliate_url, "")
 
+        # Ensure Bestie name prefix
         if bestie_name and not text_out.lower().startswith(bestie_name.lower()):
             text_out = f"{bestie_name}: {text_out}"
 
@@ -147,4 +159,7 @@ def generate_reply(user_text: str,
     except Exception as e:
         logger.error("OpenAI error: {}", e)
         prefix = f"{bestie_name}: " if bestie_name else ""
-        return f"{prefix}Here’s a solid pick to start: {affiliate_url}"
+        if affiliate_url:
+            return f"{prefix}Here’s a solid pick to start: {affiliate_url}"
+        else:
+            return f"{prefix}Babe, I glitched — but I’ll be back with the glow-up you deserve 💅"
