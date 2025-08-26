@@ -48,7 +48,7 @@ def generate_reply_job(convo_id: int, user_id: int, text_val: str):
     - Runs Bestie AI
     - Saves outbound message + sends via LeadConnector
     """
-    logger.info("[Worker][Start] 🚀 New job started: convo_id={} user_id={} text={}", convo_id, user_id, text_val)
+    logger.info("[Worker][Start] 🚀 Job started: convo_id={} user_id={} text={}", convo_id, user_id, text_val)
 
     try:
         reply = None
@@ -59,7 +59,7 @@ def generate_reply_job(convo_id: int, user_id: int, text_val: str):
             reply = rename_reply
             logger.info("[Worker][Rename] Reply triggered by rename: {}", reply)
         else:
-            # Step 2: Prepare product candidates (pipeline can inject later)
+            # Step 2: Prepare product candidates (placeholder for pipeline logic)
             product_candidates: List[Dict] = []
 
             # Step 3: Call AI
@@ -75,8 +75,11 @@ def generate_reply_job(convo_id: int, user_id: int, text_val: str):
 
     except Exception as e:
         logger.exception("💥 [Worker][Job] Unhandled exception in generate_reply_job: {}", e)
-        _store_and_send(user_id, convo_id,
-                        "Bestie: Babe, I glitched — but I’ll be back to drag you properly 💅")
+        _store_and_send(
+            user_id,
+            convo_id,
+            "Bestie: Babe, I glitched — but I’ll be back to drag you properly 💅"
+        )
 
 def _store_and_send(user_id: int, convo_id: int, text_val: str):
     """
@@ -103,3 +106,19 @@ def _store_and_send(user_id: int, convo_id: int, text_val: str):
 def debug_job(convo_id: int, user_id: int, text_val: str):
     logger.info("[Worker][Debug] 🐛 Debug job: convo_id={} user_id={} text={}", convo_id, user_id, text_val)
     return f"Debug reply: got text='{text_val}'"
+
+# -------------------- Re-engagement job -------------------- #
+def send_reengagement_job():
+    """
+    Placeholder re-engagement task.
+    Eventually: query DB for inactive users (>48h silence), enqueue nudges.
+    For now: just log + safe no-op.
+    """
+    try:
+        logger.info("[Worker][Reengage] 🔔 Running re-engagement job")
+        # TODO: Add DB query to find inactive users and enqueue nudges
+        # Example: inactive = db.find_inactive_users(hours=48)
+        # for u in inactive: enqueue_generate_reply(convo.id, u.id, "Hey babe, miss me?")
+        logger.info("[Worker][Reengage] ✅ Re-engagement job completed (stub)")
+    except Exception as e:
+        logger.exception("💥 [Worker][Reengage] Exception in re-engagement job: {}", e)
