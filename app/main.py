@@ -10,14 +10,10 @@ from .task_queue import enqueue_generate_reply
 app = FastAPI(title="Bestie Backend")
 
 def process_incoming(message_id: str, user_phone: str, text_val: str, raw_body: dict):
-    """Run DB + enqueue safely in background after GHL gets 200."""
+    """Run DB insert + enqueue safely in background after GHL gets 200."""
     try:
         with db.session() as s:
-            existing = s.execute(models.select_message_by_external_id(message_id)).first()
-            if existing:
-                logger.info("Duplicate message ignored: {}", message_id)
-                return
-
+            # ✅ Don’t block follow-ups as duplicates — every inbound should be unique
             user = models.get_or_create_user_by_phone(s, user_phone)
             convo = models.get_or_create_conversation(s, user.id)
             models.insert_message(s, convo.id, "in", message_id, text_val)
@@ -48,7 +44,7 @@ async def incoming_message_any(req: Request, background_tasks: BackgroundTasks):
     cd = body.get("customData") or body.get("custom_data")
     payload = cd if isinstance(cd, dict) else {}
 
-    # Generate message_id (append timestamp to avoid dup collisions)
+    # ✅ Always force unique message_id by appending timestamp
     base_id = (
         payload.get("message_id")
         or body.get("message_id")
