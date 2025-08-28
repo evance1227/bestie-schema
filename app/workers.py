@@ -200,6 +200,11 @@ def generate_reply_job(convo_id: int, user_id: int, text_val: str):
                 ).first()
                 is_vip = bool(profile and profile[0])
                 has_quiz = bool(profile and profile[1])
+                 # Step 3.5: Quiz/VIP-aware context
+            context = {
+                "is_vip": is_vip,
+                "has_completed_quiz": has_quiz
+            }
 
             # Step 4: GPT system prompt
             system_prompt = """
@@ -256,11 +261,6 @@ If the user has already joined VIP or completed the quiz, NEVER suggest they do 
                 _store_and_send(user_id, convo_id, reply)
                 return
             
-            # Step 5: Quiz/VIP-aware context
-            context = {
-                "is_vip": is_vip,
-                "has_completed_quiz": has_quiz
-            }
             
             # Step 6: CTA fallback lines
             cta_lines = [
