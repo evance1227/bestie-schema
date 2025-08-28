@@ -44,16 +44,12 @@ async def incoming_message_any(req: Request, background_tasks: BackgroundTasks):
         logger.info("[API][Webhook] >>> Incoming webhook hit! Raw body: {}", body)
     except Exception:
         logger.exception("[API][Webhook] Invalid JSON received")
-        # ✅ Always ACK to prevent GHL retry loop
         return JSONResponse(status_code=200, content={"ok": True, "error": "invalid json"})
 
     try:
         # ✅ Use customData if present, else fallback to body
         cd = body.get("customData") or body.get("custom_data")
-        if cd and isinstance(cd, dict):
-            payload = cd
-        else:
-            payload = body
+        payload = cd if cd and isinstance(cd, dict) else body
 
         # ✅ Always force unique message_id by appending timestamp
         base_id = (
@@ -64,7 +60,7 @@ async def incoming_message_any(req: Request, background_tasks: BackgroundTasks):
         message_id = f"{base_id}-{int(time.time())}"
         logger.info("[API][Webhook] Generated unique message_id={}", message_id)
 
-        # Extract phone + normalize
+        # Extract and normalize phone number
         user_phone = (
             payload.get("user_phone")
             or body.get("user_phone")
@@ -79,7 +75,7 @@ async def incoming_message_any(req: Request, background_tasks: BackgroundTasks):
                 user_phone = "+" + digits
         logger.info("[API][Webhook] Normalized phone={}", user_phone)
 
-        # Extract text value
+        # Extract text
         text_val = (
             payload.get("text")
             or body.get("text")
@@ -87,6 +83,21 @@ async def incoming_message_any(req: Request, background_tasks: BackgroundTasks):
             or body.get("activity", {}).get("body")
             or body.get("contact", {}).get("last_message")
         )
+
+        # ✅ Detect image/audio attachments
+        attachments = body.get("message", {}).get("attachments", [])
+        if attachments:
+            for a in attachments:
+                url = a.get("url") or a.get("file_url")
+                filetype = a.get("type", "").lower()
+                if url:
+                    if filetype == "image":
+                        text_val += f"\n[User sent an image: {url}]"
+                    elif filetype == "audio":
+                        text_val += f"\n[User sent a voice note: {url}]"
+                    else:
+                        text_val += f"\n[User sent a file: {url}]"
+
         logger.info("[API][Webhook] Extracted text={}", text_val)
 
         if not user_phone or not text_val:
@@ -106,7 +117,11 @@ async def incoming_message_any(req: Request, background_tasks: BackgroundTasks):
 
     # ✅ Always ACK immediately, even if processing failed
     logger.info("[API][Webhook] ✅ Final ACK sent to GHL")
-    return {"ok": True, "message_id": locals().get("message_id", "fallback"), "echo_text": locals().get("text_val", "")}
+    return {
+        "ok": True,
+        "message_id": locals().get("message_id", "fallback"),
+        "echo_text": locals().get("text_val", "")
+    }
 
 # -------------------- Re-engagement endpoint -------------------- #
 @app.post("/tasks/trigger_reengagement")

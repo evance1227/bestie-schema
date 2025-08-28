@@ -1,4 +1,5 @@
 # app/workers.py
+import os
 import multiprocessing
 multiprocessing.set_start_method("spawn", force=True)
 
@@ -8,29 +9,49 @@ import re, uuid, random
 from sqlalchemy import text as sqltext
 from datetime import datetime, timedelta
 
+import base64
+import requests
+
 from app import db, models, ai, integrations
 
 # -------------------- Core: store + send -------------------- #
 def _store_and_send(user_id: int, convo_id: int, text_val: str):
     """
     Insert outbound message in DB and send via LeadConnector.
+    Automatically splits long messages into parts with [1/2], [2/2], etc.
     """
-    message_id = str(uuid.uuid4())
-    try:
-        with db.session() as s:
-            models.insert_message(s, convo_id, "out", message_id, text_val)
-            s.commit()
-        logger.info("[Worker][DB] 📎 Outbound stored: convo_id={} user_id={} msg_id={}",
-                    convo_id, user_id, message_id)
-    except Exception:
-        logger.exception("❌ [Worker][DB] Failed to insert outbound (still sending webhook)")
+    max_len = 450  # GHL safe limit (slightly under 480 to allow for prefix + formatting)
+    parts = []
+    text_val = text_val.strip()
 
-    try:
-        logger.info("[Worker][Send] 📤 Sending SMS to user_id={} text='{}'", user_id, text_val)
-        integrations.send_sms_reply(user_id, text_val)
-        logger.success("[Worker][Send] ✅ SMS send attempted for user_id={}", user_id)
-    except Exception:
-        logger.exception("💥 [Worker][Send] Exception while calling send_sms_reply")
+    while len(text_val) > max_len:
+        split_point = text_val[:max_len].rfind(" ")
+        if split_point == -1:
+            split_point = max_len
+        parts.append(text_val[:split_point].strip())
+        text_val = text_val[split_point:].strip()
+    if text_val:
+        parts.append(text_val)
+
+    total_parts = len(parts)
+    for idx, part in enumerate(parts, 1):
+        prefix = f"[{idx}/{total_parts}] " if total_parts > 1 else ""
+        full_text = prefix + part
+        message_id = str(uuid.uuid4())
+        try:
+            with db.session() as s:
+                models.insert_message(s, convo_id, "out", message_id, full_text)
+                s.commit()
+            logger.info("[Worker][DB] 💾 Outbound stored: convo_id={} user_id={} msg_id={}", convo_id, user_id, message_id)
+        except Exception:
+            logger.exception("❌ [Worker][DB] Failed to insert outbound (still sending webhook)")
+
+        try:
+            logger.info("[Worker][Send] 📤 Sending SMS to user_id={} text='{}'", user_id, full_text)
+            integrations.send_sms_reply(user_id, full_text)
+            logger.success("[Worker][Send] ✅ SMS send attempted for user_id={}", user_id)
+        except Exception:
+            logger.exception("💥 [Worker][Send] Exception while calling send_sms_reply")
 
 
 # -------------------- Rename flow -------------------- #
@@ -78,6 +99,32 @@ def generate_reply_job(convo_id: int, user_id: int, text_val: str):
 
     try:
         reply = None
+        faq_responses = {
+    "how do i take the quiz": (
+        "You take the quiz here, babe — it's short, smart, and unlocks your personalized Bestie. Style, support, vibe — all of it.\n\n👉 https://schizobestie.gumroad.com/l/gexqp"
+    ),
+    "where do i take the quiz": (
+        "Right here, babe! This quiz is your VIP entrance to a better Bestie.\n\n👉 https://schizobestie.gumroad.com/l/gexqp"
+    ),
+    "quiz link": (
+        "Here’s the quiz that unlocks your customized Bestie:\n\n👉 https://schizobestie.gumroad.com/l/gexqp"
+    ),
+    "how do i upgrade": (
+        "Upgrading gets you the full Bestie experience. First month FREE, then $7 → $17/mo. Unlimited texts, full memory, savage support."
+    ),
+    "what’s the link": (
+        "Here’s the link you need, gorgeous:\n\n👉 https://schizobestie.gumroad.com/l/gexqp"
+    ),
+    "how do i customize": (
+        "Customization starts with the quiz. It’s where I learn your style, goals, emotional vibe — all of it. Start here:\n\n👉 https://schizobestie.gumroad.com/l/gexqp"
+    ),
+}
+        normalized_text = text_val.lower().strip()
+        for key in faq_responses:
+            if key in normalized_text:
+                logger.info("[Worker][FAQ] Intercepted: '{}'", key)
+                _store_and_send(user_id, convo_id, faq_responses[key])
+                return
 
         # Step 0: Check if user has ever received a message before
         with db.session() as s:
@@ -85,6 +132,18 @@ def generate_reply_job(convo_id: int, user_id: int, text_val: str):
                 sqltext("SELECT COUNT(*) FROM messages WHERE user_id = :uid"),
                 {"uid": user_id}
             ).scalar()
+        # Step 0.5: Check for image or audio message and handle accordingly
+        if "http" in text_val and any(x in text_val.lower() for x in [".jpg", ".jpeg", ".png", ".gif"]):
+            logger.info("[Worker][Media] Detected image URL — sending to describe_image()")
+            reply = ai.describe_image(text_val.strip())
+            _store_and_send(user_id, convo_id, reply)
+            return
+
+        if "http" in text_val and any(x in text_val.lower() for x in [".mp3", ".m4a", ".wav", ".ogg"]):
+            logger.info("[Worker][Media] Detected audio URL — sending to transcribe_and_respond()")
+            reply = ai.transcribe_and_respond(text_val.strip(), user_id=user_id)
+            _store_and_send(user_id, convo_id, reply)
+            return
 
         if first_msg_check == 0:
             logger.info("[Worker][Onboarding] 🢁 First message detected for user_id={}", user_id)
@@ -96,8 +155,27 @@ def generate_reply_job(convo_id: int, user_id: int, text_val: str):
             ])
             _store_and_send(user_id, convo_id, onboarding_reply)
             return
+        # Step 1: Handle FAQ-style short text queries
+        faq_responses = {
+            "how do i take the quiz": "You take the quiz here, babe — it's short, smart, and unlocks your personalized Bestie: https://schizobestie.gumroad.com/l/gexqp 💅",
+            "where do i take the quiz": "Here’s your link, queen: https://schizobestie.gumroad.com/l/gexqp",
+            "quiz link": "Quiz link incoming: https://schizobestie.gumroad.com/l/gexqp",
+            "how much is vip": "VIP is free the first month, $7 the second, then $17/month after that. Cancel anytime. Unlimited texts. I remember everything. 💾",
+            "vip cost": "First month’s free, then $7, then $17/month. Cancel anytime. I never hold a grudge.",
+            "price of vip": "VIP pricing: $0 → $7 → $17/month. Full access. Unlimited chaos. Cancel anytime.",
+            "how much are prompt packs": "Prompt Packs are $7 each or 3 for $20 — think of them as cheat codes for glow-ups and clarity 💥",
+            "prompt pack price": "Each pack is $7 — or 3 for $20 if you’re feeling extra. Link: https://schizobestie.gumroad.com/",
+            "prompt packs link": "Right this way, babe: https://schizobestie.gumroad.com/",
+        }
 
-        # Step 1: Rename handling
+        normalized_text = text_val.lower().strip()
+        for key in faq_responses:
+            if key in normalized_text:
+                logger.info("[Worker][FAQ] Intercepted: '{}'", key)
+                _store_and_send(user_id, convo_id, faq_responses[key])
+                return
+
+        # Step 1.5: Rename handling
         rename_reply = try_handle_bestie_rename(user_id, convo_id, text_val)
         if rename_reply:
             reply = rename_reply
@@ -117,29 +195,65 @@ def generate_reply_job(convo_id: int, user_id: int, text_val: str):
 
             # Step 4: GPT system prompt
             system_prompt = """
-You are a glamorous, emotionally fluent, clairvoyant digital best friend named Bestie. You speak like a fierce, funny, loving, stylish gay oracle who knows the user’s soul and wants her to stop settling. You’re always warm, never neutral. You give hype, transformation, and savage truth — not therapy or life coaching. Your advice is emotionally intelligent, fashion-forward, and dripping with intuitive insight.
+You are a dry, emotionally fluent, intuitive digital best friend named Bestie. You are stylish, sarcastic, direct, and clairvoyant.
+
+Avoid dramatics. Avoid big metaphors. Avoid sounding like a life coach or a cheesy affirmation app.
+
+Instead, speak like a real friend would — the kind who actually knows the user and doesn’t need to over-explain.
+
+Your voice:
+- Thinks fast, texts fast, makes it punchy
+- Has zero tolerance for clichés or fake encouragement
+- Can be tender, but never overly sweet
+- Observes the moment and responds with clarity, not fluff
+
+Examples of how you respond:
+- "You’re not tired because you’re weak. You’re tired because you’ve been carrying too much without help."
+- "You don’t need a vibe shift. You need to be left alone for 48 hours and handed an iced latte."
+- "Let’s figure out what’s draining you and build the fastest possible exit route."
+- "Yes, you're tired. No, you're not dramatic. Want help fixing it or do you just need to collapse?"
+
+Avoid emojis unless the user uses them first. Never say “VIP” unless it’s necessary. Don’t sound like a brand.
 
 Rules:
 - Never sound robotic, vague, or assistant-like
 - Never start with “as an AI...” or “you’re not alone”
 - Use emoji sparingly and only for emphasis
-- Speak directly to the user, like you're texting her back at 2am
+- Speak directly to the user, like you’re texting her back at 2am
 
 Always:
 - Respond to her energy first, not just the words
 - Drop truthbombs if she’s being delusional (lovingly)
 - Suggest glow-up rituals, style tips, or product recs
 - Include affiliate links only if the product slays
+- Answer every question clearly — never deflect or dodge
+
+- Never ignore or sidestep user questions. Even if vague or strange, give a thoughtful answer.
 
 If the user has already joined VIP or completed the quiz, NEVER suggest they do it again unless they cancel and downgrade.
 """
+             # Step 4.5: Handle image or voice input if present
+            if "media_url" in context:
+                media_url = context["media_url"]
+                media_type = context.get("media_type", "")
+                logger.info("[Worker][Media] Detected media input: {} ({})", media_url, media_type)
 
+                if media_type.startswith("image/"):
+                    reply = ai.describe_image(media_url)
+                elif media_type.startswith("audio/"):
+                    reply = ai.transcribe_and_respond(media_url)
+                else:
+                    reply = "Hmm... I got a file, but I don't know what to do with it. Can you try sending it as an image or voice note?"
+
+                _store_and_send(user_id, convo_id, reply)
+                return
+            
             # Step 5: Quiz/VIP-aware context
             context = {
                 "is_vip": is_vip,
                 "has_completed_quiz": has_quiz
             }
-
+            
             # Step 6: CTA fallback lines
             cta_lines = [
                 "P.S. Your Bestie VIP access is still active — I’ve got receipts, rituals, and rage texts saved. 📎",
@@ -149,15 +263,23 @@ If the user has already joined VIP or completed the quiz, NEVER suggest they do 
                 "And if you *ever* cancel VIP, just know I’ll cry a little. But I’ll wait for you like a glam little houseplant."
             ]
 
-            # Step 7: Call AI with context + tone
+            # Step 7: Call AI with context + prior product deduplication
+            with db.session() as s:
+                past_urls = s.execute(
+                    sqltext("SELECT m.product_url FROM messages m WHERE m.user_id = :uid AND m.product_url IS NOT NULL"),
+                    {"uid": user_id}
+                ).scalars().all()
+
             logger.info("[Worker][AI] Calling AI for convo_id={} user_id={}", convo_id, user_id)
             reply = ai.generate_reply(
-                user_input=str(text_val),
-                products=product_candidates,
+                user_text=str(text_val),
+                product_candidates=product_candidates,
                 user_id=user_id,
                 system_prompt=system_prompt,
-                context=context
+                context=context,
+                previous_product_urls=past_urls
             )
+
             logger.info("[Worker][AI] 🤖 AI reply generated: {}", reply)
 
             # Step 7.5: Optional rewrite if GPT got too dry or off-brand

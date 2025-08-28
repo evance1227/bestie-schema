@@ -1,4 +1,5 @@
 # app/integrations.py
+
 import os, httpx
 from loguru import logger
 from app import db
@@ -32,6 +33,10 @@ def send_sms_reply(user_id: int, text: str):
     Send outbound SMS via LeadConnector webhook.
     Posts to the configured GHL webhook with {phone, message}.
     """
+    # ✅ Soft patch: strip "Bestie: " if accidentally included
+    if text.strip().lower().startswith("bestie:"):
+        text = text.partition(":")[2].strip()
+
     logger.info("[Integrations][Send] 🚦 Preparing to send SMS: user_id={} text='{}'", user_id, text)
 
     phone = _get_phone(user_id)
