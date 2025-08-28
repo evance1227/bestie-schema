@@ -1,18 +1,34 @@
-# app/main.py
+import os
+import time, re
 from fastapi import FastAPI, Request, BackgroundTasks
 from fastapi.responses import JSONResponse
 from loguru import logger
-import time, re
-import os
+
+# ✅ init app first
+app = FastAPI(title="Bestie Backend")
 logger.info("[API][Boot] Using REDIS_URL={}", os.getenv("REDIS_URL"))
 
+# -------------------- DEBUG: queue probe -------------------- #
+from redis import Redis
+from rq import Queue
 
-# ✅ Use relative imports so "app" doesn’t break
+@app.get("/debug/queue")
+def debug_queue():
+    url = os.getenv("REDIS_URL")
+    r = Redis.from_url(url)
+    q = Queue("bestie_queue", connection=r)
+    jobs = q.jobs
+    return {
+        "redis_url": url,
+        "queue": q.name,
+        "queued_count": len(jobs),
+        "sample_job_ids": [j.id for j in jobs[:5]],
+    }
+
+# ✅ Use package-relative imports
 from . import db, models
 from .task_queue import enqueue_generate_reply
-from app.workers import send_reengagement_job
-
-app = FastAPI(title="Bestie Backend")
+from .workers import send_reengagement_job
 
 # -------------------- Core processing -------------------- #
 def process_incoming(message_id: str, user_phone: str, text_val: str, raw_body: dict):

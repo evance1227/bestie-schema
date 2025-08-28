@@ -1,8 +1,8 @@
-# app/task_queue.py
 from dotenv import load_dotenv
 load_dotenv()
 
 import os
+from urllib.parse import urlparse
 from loguru import logger
 from rq import Queue
 from redis import Redis
@@ -14,16 +14,14 @@ if not REDIS_URL:
 redis = Redis.from_url(REDIS_URL)
 q = Queue("bestie_queue", connection=redis)
 
-# Boot visibility
+# Boot visibility (safe now that REDIS_URL & q exist)
+host = urlparse(REDIS_URL).hostname
+logger.info("[API][QueueBoot] Host={} Queue={}", host, q.name)
 logger.info("[API][QueueBoot] Using REDIS_URL={} queue={}", REDIS_URL, q.name)
 
 def enqueue_generate_reply(convo_id: int, user_id: int, text: str):
-    """
-    Always enqueue the GPT reply job — no deduplication logic.
-    """
-    # IMPORTANT: use import-path string so the worker imports the callable itself
     job = q.enqueue(
-        "app.workers.generate_reply_job",
+        "app.workers.generate_reply_job",   # import-path string
         convo_id,
         user_id,
         text,
