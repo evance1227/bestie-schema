@@ -8,7 +8,7 @@ from . import workers
 
 logging.basicConfig(level=logging.DEBUG)
 
-redis_url = os.getenv("REDIS_URL", "rediss://default:...@clever-lion-42257.upstash.io:6379")
+redis_url = os.getenv("REDIS_URL")
 print(f"🔗 Using Redis URL: {redis_url}")
 conn = Redis.from_url(redis_url)
 

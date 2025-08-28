@@ -256,8 +256,7 @@ def generate_reply(user_text: str,
         product_context = "\nHere are product candidates (already Geniuslink-converted):\n"
         for p in safe_products:
             product_context += f"- {p['name']} (Category: {p['category']}) | {p['url']} | Review: {p['review']}\n"
-
-    # Set prompt source
+  
     # Pull user quiz data if available
     quiz_profile = ""
     try:
@@ -269,7 +268,7 @@ def generate_reply(user_text: str,
             quiz_profile = row[0].strip()
     except Exception as e:
         logger.warning("[AI][Quiz] Failed to fetch quiz profile for user_id={}: {}", user_id, e)
-
+  # Set prompt source
     system_content = system_prompt.strip() if system_prompt else persona_text
     if quiz_profile:
         system_content += f"\n\nUser Quiz Profile:\n{quiz_profile}"
@@ -292,6 +291,15 @@ Your job:
 - Use the exact name to match the correct link. Never use the generic Gumroad shop link.
 - Never ignore or sidestep user questions. Even if vague or strange, give a thoughtful answer.
 """
+    # 🔍 Step: Ask qualifying questions if user seems vague
+    vague_cues = ["something", "any", "idk", "recommend", "need help", "what should i", "looking for", "ideas", "suggest"]
+    if not product_candidates and any(cue in user_text.lower() for cue in vague_cues):
+        logger.info("[AI][Clarify] Detected vague input — triggering qualifying questions")
+        return (
+            "Got it — but help me help you: Are you looking for skincare, style, something emotional, or just a vibe shift?"
+            "\n\nTell me what you *actually* want to feel right now. I’ll handle the rest."
+        )
+    logger.info("[AI][Prompt] System:\n{}\n\nUser:\n{}", system_content, user_content)
 
     try:
         resp = CLIENT.chat.completions.create(
@@ -321,7 +329,8 @@ def describe_image(image_url: str) -> str:
     try:
         logger.info("[AI][Image] 📸 Analyzing image at: {}", image_url)
         response = CLIENT.chat.completions.create(
-            model="gpt-4o",
+            model=os.getenv("OPENAI_MODEL", "gpt-4")
+,
             messages=[
                 {
                     "role": "system",
