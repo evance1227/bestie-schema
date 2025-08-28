@@ -12,6 +12,7 @@ from datetime import datetime, timedelta
 import base64
 import requests
 
+from app import ai_intent, product_search
 from app import db, models, ai, integrations
 
 # -------------------- Core: store + send -------------------- #
@@ -182,7 +183,14 @@ def generate_reply_job(convo_id: int, user_id: int, text_val: str):
             logger.info("[Worker][Rename] Reply triggered by rename: {}", reply)
         else:
             # Step 2: Prepare product candidates (placeholder for pipeline logic)
-            product_candidates: List[Dict] = []
+            # Try to extract product intent from vague messages
+            intent_data = ai_intent.extract_product_intent(text_val)
+            logger.info("[Intent] GPT intent response: {}", intent_data)
+
+            product_candidates = []
+            if intent_data.get("intent"):
+                product_candidates = product_search.fetch_products(intent_data["intent"])
+
 
             # Step 3: Load user context (VIP, quiz status)
             with db.session() as s:
