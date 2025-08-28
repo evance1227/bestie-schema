@@ -3,6 +3,9 @@ from fastapi import FastAPI, Request, BackgroundTasks
 from fastapi.responses import JSONResponse
 from loguru import logger
 import time, re
+import os
+logger.info("[API][Boot] Using REDIS_URL={}", os.getenv("REDIS_URL"))
+
 
 # ✅ Use relative imports so "app" doesn’t break
 from . import db, models

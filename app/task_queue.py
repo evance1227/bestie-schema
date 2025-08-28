@@ -1,38 +1,47 @@
 # app/task_queue.py
-
 from dotenv import load_dotenv
 load_dotenv()
 
 import os
+from loguru import logger
 from rq import Queue
 from redis import Redis
 
-from app import workers
+REDIS_URL = os.environ.get("REDIS_URL")  # must match in BOTH services
+if not REDIS_URL:
+    raise RuntimeError("REDIS_URL is not set")
 
-redis = Redis.from_url(os.environ.get("REDIS_URL"))
+redis = Redis.from_url(REDIS_URL)
 q = Queue("bestie_queue", connection=redis)
+
+# Boot visibility
+logger.info("[API][QueueBoot] Using REDIS_URL={} queue={}", REDIS_URL, q.name)
 
 def enqueue_generate_reply(convo_id: int, user_id: int, text: str):
     """
     Always enqueue the GPT reply job — no deduplication logic.
-    Even repeated or similar messages will generate new replies.
     """
-    from app.workers import generate_reply_job
-    return q.enqueue(
-        generate_reply_job,
+    # IMPORTANT: use import-path string so the worker imports the callable itself
+    job = q.enqueue(
+        "app.workers.generate_reply_job",
         convo_id,
         user_id,
         text,
         job_timeout=120,
-        result_ttl=500
+        result_ttl=500,
     )
+    logger.info("[API][Queue] Enqueued job_id={} -> queue='{}' redis='{}'",
+                job.id, q.name, REDIS_URL)
+    return job
 
 def enqueue_wrap_link(convo_id: int, raw_url: str, campaign: str = "default"):
-    from app.workers import wrap_link_job
-    return q.enqueue(
-        wrap_link_job,
+    job = q.enqueue(
+        "app.workers.wrap_link_job",
         convo_id,
         raw_url,
         campaign,
-        job_timeout=60
+        job_timeout=60,
     )
+    logger.info("[API][Queue] Enqueued wrap_link job_id={} -> queue='{}' redis='{}'",
+                job.id, q.name, REDIS_URL)
+    return job
