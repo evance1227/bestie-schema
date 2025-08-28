@@ -12,15 +12,22 @@ def main():
     if not REDIS_URL:
         raise RuntimeError("REDIS_URL is not set. Configure it in Render on BOTH services.")
 
+    # 🔊 prove the right file is running
+    logger.info("[Worker][BOOTMARK] start_worker v3 running pid={} cwd={}", os.getpid(), os.getcwd())
+
     host = urlparse(REDIS_URL).hostname
     logger.info("[Worker][Boot] Host={} Queue={}", host, QUEUE_NAME)
 
     redis_conn = Redis.from_url(REDIS_URL)
     with Connection(redis_conn):
-        q = Queue(QUEUE_NAME)
+        # bind to the same connection everywhere
+        q = Queue(QUEUE_NAME, connection=redis_conn)
         logger.info("[Worker][Boot] Using REDIS_URL={} queue='{}'", REDIS_URL, q.name)
 
-        # Heartbeat: show queue depth every 5s
+        # make sure RQ can resolve "app.workers.generate_reply_job"
+        from app import workers  # noqa: F401
+
+        # heartbeat: log queue depth every 5s
         def heartbeat():
             while True:
                 try:
@@ -32,7 +39,7 @@ def main():
         import threading
         threading.Thread(target=heartbeat, daemon=True).start()
 
-        worker = Worker([q], name="bestie-worker")
+        worker = Worker([q], connection=redis_conn, name="bestie-worker")
         logger.info("🚀 bestie-worker is online, listening on '{}'…", q.name)
         worker.work(logging_level="INFO")
 
