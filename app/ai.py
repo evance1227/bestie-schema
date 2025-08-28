@@ -315,12 +315,17 @@ Your job:
         return text_out
 
     except Exception as e:
-        logger.exception("💥 [AI][Generate] OpenAI error: {}", e)
-        if safe_products:
-            p = safe_products[0]
-            return f"Here’s your glow-up starter: {p['name']} ({p['category']})\n{p['url']}"
-        else:
-            return "Babe, I glitched — but I’ll be back with the vibe you deserve 💅"
+            logger.exception("💥 [AI][Generate] OpenAI error: {}", e)
+            import traceback
+            logger.error("⚠️ GPT ERROR: {}", e)
+            traceback.print_exc()
+
+            if safe_products:
+                p = safe_products[0]
+                return f"Here’s your glow-up starter: {p['name']} ({p['category']})\n{p['url']}"
+            else:
+                return "Babe, I glitched — but I’ll be back with the vibe you deserve 💅"
+            
 def describe_image(image_url: str) -> str:
     """Use GPT-4o to analyze an image and return a stylish response."""
     if CLIENT is None or not os.getenv("OPENAI_API_KEY"):
