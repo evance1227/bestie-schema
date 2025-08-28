@@ -93,23 +93,10 @@ def try_handle_bestie_rename(user_id: int, convo_id: int, text_val: str) -> Opti
 
 
 # -------------------- Worker job -------------------- #
+from rq.decorators import job
+
+@job('bestie_queue')
 def generate_reply_job(convo_id: int, user_id: int, text_val: str):
-    try:
-        reply = ai.generate_reply(
-            user_text=str(text_val),
-            product_candidates=product_candidates,
-            user_id=user_id,
-            system_prompt=system_prompt,
-            context=context,
-            previous_product_urls=past_urls
-        )
-        logger.info("[Worker][Checkpoint] Finished ai.generate_reply")
-
-    except Exception as e:
-        logger.exception("🔥 [Worker][AI] generate_reply crashed with exception: {}", e)
-        reply = "⚠️ Babe, I glitched again — and I’m chasing down the bug 💅"
-
-    
     """
     Main worker entrypoint:
     - Checks rename flow
