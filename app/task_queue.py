@@ -3,10 +3,11 @@ from dotenv import load_dotenv
 load_dotenv()
 
 import os
+from app.linkwrap import wrap_link_job
 from urllib.parse import urlparse
 from loguru import logger
-from redis import Redis
 from rq import Queue
+from redis import Redis
 
 REDIS_URL = os.environ.get("REDIS_URL")
 if not REDIS_URL:
@@ -15,36 +16,33 @@ if not REDIS_URL:
 redis = Redis.from_url(REDIS_URL)
 q = Queue("bestie_queue", connection=redis)
 
+# Boot visibility
 host = urlparse(REDIS_URL).hostname
 logger.info("[API][QueueBoot] Host={} Queue={}", host, q.name)
 logger.info("[API][QueueBoot] Using REDIS_URL={} queue={}", REDIS_URL, q.name)
 
 def enqueue_generate_reply(convo_id: int, user_id: int, text: str):
-    # ⬇️ Lazy import avoids circulars and startup ImportError
-    from app.workers import generate_reply_job
+    """Enqueue the GPT reply job. Import lazily to avoid circular imports."""
+    from app.workers import generate_reply_job  # <-- lazy import fixes circular import
     job = q.enqueue(
-        generate_reply_job,          # function object, NOT a string
+        generate_reply_job,            # pass the callable (NOT a string)
         convo_id,
         user_id,
         text,
         job_timeout=120,
         result_ttl=500,
     )
-    logger.info("[API][Queue] Enqueued job_id={} -> queue='{}' redis='{}'", job.id, q.name, REDIS_URL)
+    logger.info("[API][Queue] Enqueued job_id={} -> queue='{}' redis='{}'",
+                job.id, q.name, REDIS_URL)
     return job
 
 def enqueue_wrap_link(convo_id: int, raw_url: str, campaign: str = "default"):
-    # Only import when needed; pick the module where wrap_link_job actually lives.
+    """If you use a link wrapper job, import it lazily too."""
     try:
-        from app.linkwrap import wrap_link_job
+        from app.linkwrap import wrap_link_job  # adjust if your function lives elsewhere
     except Exception:
-        from app.workers import wrap_link_job
-    job = q.enqueue(
-        wrap_link_job,
-        convo_id,
-        raw_url,
-        campaign,
-        job_timeout=60,
-    )
-    logger.info("[API][Queue] Enqueued wrap_link job_id={} -> queue='{}' redis='{}'", job.id, q.name, REDIS_URL)
-    return job
+        # If you don't have this job yet, skip importing to avoid crashes.
+        logger.warning("[API][Queue] wrap_link_job not found; skipping enqueue.")
+        return None
+
+    return q.enqueue(wrap_link_job, convo_id, raw_url, campaign, job_timeout=60)
