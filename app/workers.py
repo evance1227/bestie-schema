@@ -93,10 +93,6 @@ def try_handle_bestie_rename(user_id: int, convo_id: int, text_val: str) -> Opti
 
 
 # -------------------- Worker job -------------------- #
-from rq.decorators import job
-
-@job('bestie_queue')
-def generate_reply_job(convo_id: int, user_id: int, text_val: str):
     """
     Main worker entrypoint:
     - Checks rename flow
@@ -293,7 +289,6 @@ If the user has already joined VIP or completed the quiz, NEVER suggest they do 
                 user_id=user_id,
                 system_prompt=system_prompt,
                 context=context,
-                previous_product_urls=past_urls
             )
 
             logger.info("[Worker][AI] 🤖 AI reply generated: {}", reply)
