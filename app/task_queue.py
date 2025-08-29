@@ -1,4 +1,3 @@
-# app/task_queue.py
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -21,19 +20,14 @@ logger.info("[API][QueueBoot] Host={} Queue={}", host, q.name)
 logger.info("[API][QueueBoot] Using REDIS_URL={} queue={}", REDIS_URL, q.name)
 
 def enqueue_generate_reply(convo_id: int, user_id: int, text: str):
-    """Enqueue the GPT reply job (lazy import avoids circulars)."""
     from app.workers import generate_reply_job
-    job = q.enqueue(
-        generate_reply_job,  # pass the callable
-        convo_id, user_id, text,
-        job_timeout=120, result_ttl=500,
-    )
+    job = q.enqueue(generate_reply_job, convo_id, user_id, text,
+                    job_timeout=120, result_ttl=500)
     logger.info("[API][Queue] Enqueued job_id={} -> queue='{}' redis='{}'",
                 job.id, q.name, REDIS_URL)
     return job
 
 def enqueue_wrap_link(convo_id: int, raw_url: str, campaign: str = "default"):
-    """Optional link wrapper job — import lazily."""
     try:
         from app.linkwrap import wrap_link_job
     except Exception:
