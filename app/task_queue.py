@@ -3,7 +3,6 @@ from dotenv import load_dotenv
 load_dotenv()
 
 import os
-from app.linkwrap import wrap_link_job
 from urllib.parse import urlparse
 from loguru import logger
 from rq import Queue
@@ -22,27 +21,22 @@ logger.info("[API][QueueBoot] Host={} Queue={}", host, q.name)
 logger.info("[API][QueueBoot] Using REDIS_URL={} queue={}", REDIS_URL, q.name)
 
 def enqueue_generate_reply(convo_id: int, user_id: int, text: str):
-    """Enqueue the GPT reply job. Import lazily to avoid circular imports."""
-    from app.workers import generate_reply_job  # <-- lazy import fixes circular import
+    """Enqueue the GPT reply job (lazy import avoids circulars)."""
+    from app.workers import generate_reply_job
     job = q.enqueue(
-        generate_reply_job,            # pass the callable (NOT a string)
-        convo_id,
-        user_id,
-        text,
-        job_timeout=120,
-        result_ttl=500,
+        generate_reply_job,  # pass the callable
+        convo_id, user_id, text,
+        job_timeout=120, result_ttl=500,
     )
     logger.info("[API][Queue] Enqueued job_id={} -> queue='{}' redis='{}'",
                 job.id, q.name, REDIS_URL)
     return job
 
 def enqueue_wrap_link(convo_id: int, raw_url: str, campaign: str = "default"):
-    """If you use a link wrapper job, import it lazily too."""
+    """Optional link wrapper job — import lazily."""
     try:
-        from app.linkwrap import wrap_link_job  # adjust if your function lives elsewhere
+        from app.linkwrap import wrap_link_job
     except Exception:
-        # If you don't have this job yet, skip importing to avoid crashes.
         logger.warning("[API][Queue] wrap_link_job not found; skipping enqueue.")
         return None
-
     return q.enqueue(wrap_link_job, convo_id, raw_url, campaign, job_timeout=60)
