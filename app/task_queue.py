@@ -28,9 +28,12 @@ def enqueue_generate_reply(convo_id: int, user_id: int, text: str):
     return job
 
 def enqueue_wrap_link(convo_id: int, raw_url: str, campaign: str = "default"):
+    """If you use a link wrapper job, import it lazily too."""
     try:
         from app.linkwrap import wrap_link_job
     except Exception:
         logger.warning("[API][Queue] wrap_link_job not found; skipping enqueue.")
         return None
+
     return q.enqueue(wrap_link_job, convo_id, raw_url, campaign, job_timeout=60)
+

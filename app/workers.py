@@ -93,7 +93,7 @@ def try_handle_bestie_rename(user_id: int, convo_id: int, text_val: str) -> Opti
 
 
 # -------------------- Worker job -------------------- #
-def generate_reply_job(convo_id: int, user_id: int, text_val: str):
+def generate_reply_job(convo_id: int, user_id: int, text_val: str) -> None:
     """
     Main worker entrypoint:
     - Checks rename flow
@@ -105,6 +105,8 @@ def generate_reply_job(convo_id: int, user_id: int, text_val: str):
 
     try:
         reply = None
+
+        # Quick FAQ intercepts (v1)
         faq_responses = {
             "how do i take the quiz": (
                 "You take the quiz here, babe — it's short, smart, and unlocks your personalized Bestie. Style, support, vibe — all of it.\n\n👉 https://schizobestie.gumroad.com/l/gexqp"
@@ -125,7 +127,6 @@ def generate_reply_job(convo_id: int, user_id: int, text_val: str):
                 "Customization starts with the quiz. It’s where I learn your style, goals, emotional vibe — all of it. Start here:\n\n👉 https://schizobestie.gumroad.com/l/gexqp"
             ),
         }
-
         normalized_text = text_val.lower().strip()
         for key in faq_responses:
             if key in normalized_text:
@@ -133,28 +134,29 @@ def generate_reply_job(convo_id: int, user_id: int, text_val: str):
                 _store_and_send(user_id, convo_id, faq_responses[key])
                 return
 
-        # Step 0: Has user ever received a message?
+        # Step 0: first-message check
         with db.session() as s:
             first_msg_check = s.execute(
                 sqltext("SELECT COUNT(*) FROM messages WHERE user_id = :uid"),
                 {"uid": user_id}
             ).scalar()
 
-        # Step 0.5: media handling
-        if "http" in text_val and any(x in text_val.lower() for x in [".jpg", ".jpeg", ".png", ".gif"]):
+        # Step 0.5: simple media detectors
+        if "http" in text_val and any(x in normalized_text for x in [".jpg", ".jpeg", ".png", ".gif"]):
             logger.info("[Worker][Media] Detected image URL — sending to describe_image()")
             reply = ai.describe_image(text_val.strip())
             _store_and_send(user_id, convo_id, reply)
             return
 
-        if "http" in text_val and any(x in text_val.lower() for x in [".mp3", ".m4a", ".wav", ".ogg"]):
+        if "http" in text_val and any(x in normalized_text for x in [".mp3", ".m4a", ".wav", ".ogg"]):
             logger.info("[Worker][Media] Detected audio URL — sending to transcribe_and_respond()")
             reply = ai.transcribe_and_respond(text_val.strip(), user_id=user_id)
             _store_and_send(user_id, convo_id, reply)
             return
 
+        # Step 0.75: onboarding on the very first inbound
         if first_msg_check == 0:
-            logger.info("[Worker][Onboarding] 🢁 First message detected for user_id={}", user_id)
+            logger.info("[Worker][Onboarding] 🢁 First message for user_id={}", user_id)
             onboarding_reply = random.choice([
                 "OMG — you made it. Welcome to chaos, clarity, and couture-level glow-ups. Text me anything, babe. I’m ready. 💅",
                 "Hi. I’m Bestie. I don’t do small talk. I do savage insight, glow-up tips, and emotionally intelligent chaos. Let’s begin. ✨",
@@ -164,16 +166,16 @@ def generate_reply_job(convo_id: int, user_id: int, text_val: str):
             _store_and_send(user_id, convo_id, onboarding_reply)
             return
 
-        # Step 1: more FAQ short-cuts
+        # Step 1: more FAQ intercepts (v2)
         faq_responses = {
             "how do i take the quiz": "You take the quiz here, babe — it's short, smart, and unlocks your personalized Bestie: https://schizobestie.gumroad.com/l/gexqp 💅",
             "where do i take the quiz": "Here’s your link, queen: https://schizobestie.gumroad.com/l/gexqp",
             "quiz link": "Quiz link incoming: https://schizobestie.gumroad.com/l/gexqp",
             "how much is vip": "VIP is free the first month, $7 the second, then $17/month after that. Cancel anytime. Unlimited texts. I remember everything. 💾",
-            "vip cost": "First month’s free, then $7, then $17/month. Cancel anytime. I never hold a grudge.",
-            "price of vip": "VIP pricing: $0 → $7 → $17/month. Full access. Unlimited chaos. Cancel anytime.",
-            "how much are prompt packs": "Prompt Packs are $7 each or 3 for $20 — think of them as cheat codes for glow-ups and clarity 💥",
-            "prompt pack price": "Each pack is $7 — or 3 for $20 if you’re feeling extra. Link: https://schizobestie.gumroad.com/",
+            "vip cost": "First month’s free, then $7, then $17/month. Cancel anytime.",
+            "price of vip": "VIP pricing: $0 → $7 → $17/month. Full access. Cancel anytime.",
+            "how much are prompt packs": "Prompt Packs are $7 each or 3 for $20 — cheat codes for glow-ups 💥",
+            "prompt pack price": "Each pack is $7 — or 3 for $20. Link: https://schizobestie.gumroad.com/",
             "prompt packs link": "Right this way, babe: https://schizobestie.gumroad.com/",
         }
         for key in faq_responses:
@@ -182,58 +184,46 @@ def generate_reply_job(convo_id: int, user_id: int, text_val: str):
                 _store_and_send(user_id, convo_id, faq_responses[key])
                 return
 
-        # Step 1.5: rename
+        # Step 1.5: rename flow
         rename_reply = try_handle_bestie_rename(user_id, convo_id, text_val)
         if rename_reply:
             reply = rename_reply
             logger.info("[Worker][Rename] Reply triggered by rename: {}", reply)
         else:
-            # Step 2: intent → products
+            # Step 2: product intent
             intent_data = ai_intent.extract_product_intent(text_val)
             logger.info("[Intent] GPT intent response: {}", intent_data)
-
             product_candidates = []
             if intent_data.get("intent"):
                 product_candidates = product_search.fetch_products(intent_data["intent"])
 
-            # Step 3: user context
+            # Step 3: user context (VIP / quiz flags)
             with db.session() as s:
                 profile = s.execute(
                     sqltext("SELECT is_vip, has_completed_quiz FROM user_profiles WHERE user_id = :uid"),
                     {"uid": user_id}
                 ).first()
-                is_vip = bool(profile and profile[0])
-                has_quiz = bool(profile and profile[1])
-
+            is_vip = bool(profile and profile[0])
+            has_quiz = bool(profile and profile[1])
             context = {"is_vip": is_vip, "has_completed_quiz": has_quiz}
 
             # Step 4: system prompt
-            system_prompt = """[TRUNCATED FOR BREVITY — keep your existing prompt text here]"""
+            system_prompt = """
+You are a dry, emotionally fluent, intuitive digital best friend named Bestie. You are stylish, sarcastic, direct, and clairvoyant.
+Avoid dramatics. Avoid big metaphors. Avoid sounding like a life coach or a cheesy affirmation app.
+[...trimmed for brevity...]
+"""
 
-            # Optional media handling via context (if you later add it)
-            if "media_url" in context:
-                media_url = context["media_url"]
-                media_type = context.get("media_type", "")
-                logger.info("[Worker][Media] Detected media input: {} ({})", media_url, media_type)
-                if media_type.startswith("image/"):
-                    reply = ai.describe_image(media_url)
-                elif media_type.startswith("audio/"):
-                    reply = ai.transcribe_and_respond(media_url)
-                else:
-                    reply = "Hmm... I got a file, but I don't know what to do with it. Can you try sending it as an image or voice note?"
-                _store_and_send(user_id, convo_id, reply)
-                return
-
-            # Step 6: CTA fallbacks
+            # Step 6: CTA fallback lines
             cta_lines = [
                 "P.S. Your Bestie VIP access is still active — I’ve got receipts, rituals, and rage texts saved. 📎",
-                "You're already on the VIP list, babe. That means I remember everything. Even the shade you threw last Thursday.",
-                "VIP mode is ON. First month’s free. After that, it’s $7/month — cancel anytime, but why would you?",
-                "You already joined the soft launch, so we’re building from here. No more ‘starting over’ energy.",
-                "And if you *ever* cancel VIP, just know I’ll cry a little. But I’ll wait for you like a glam little houseplant.",
+                "You're already on the VIP list, babe. That means I remember everything.",
+                "VIP mode is ON. First month’s free. After that, it’s $7/month — cancel anytime.",
+                "You already joined the soft launch, so we’re building from here.",
+                "And if you *ever* cancel VIP, I’ll cry a little… then wait like a glam houseplant.",
             ]
 
-            # Step 7: generate reply
+            # Step 7: call AI
             logger.info("[Worker][AI] Calling AI for convo_id={} user_id={}", convo_id, user_id)
             reply = ai.generate_reply(
                 user_text=str(text_val),
@@ -244,13 +234,13 @@ def generate_reply_job(convo_id: int, user_id: int, text_val: str):
             )
             logger.info("[Worker][AI] 🤖 AI reply generated: {}", reply)
 
-            # Step 7.5: rewrite if needed
+            # optional rewrite
             rewritten = ai.rewrite_if_cringe(reply)
             if rewritten != reply:
                 logger.info("[Worker][AI] 🔁 Reply was rewritten to improve tone")
                 reply = rewritten
 
-            # Step 8: ensure CTA if no links
+            # Step 8: ensure some CTA if no link present
             if not any(x in reply.lower() for x in ["http", "geniuslink", "amazon.com"]):
                 reply = reply.strip() + "\n\n" + random.choice(cta_lines)
 
