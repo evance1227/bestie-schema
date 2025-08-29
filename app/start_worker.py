@@ -39,7 +39,10 @@ def main():
         import threading
         threading.Thread(target=heartbeat, daemon=True).start()
 
-        worker = Worker([q], connection=redis_conn, name="bestie-worker")
+        worker = Worker(
+    [q],
+    name=f"bestie-worker-{os.getenv('RENDER_INSTANCE_ID', os.getpid())}"
+)
         logger.info("🚀 bestie-worker is online, listening on '{}'…", q.name)
         worker.work(logging_level="INFO")
 

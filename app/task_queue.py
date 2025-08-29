@@ -2,6 +2,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 import os
+from app.workers import generate_reply_job, wrap_link_job
 from urllib.parse import urlparse
 from loguru import logger
 from rq import Queue
@@ -20,28 +21,25 @@ logger.info("[API][QueueBoot] Host={} Queue={}", host, q.name)
 logger.info("[API][QueueBoot] Using REDIS_URL={} queue={}", REDIS_URL, q.name)
 
 def enqueue_generate_reply(convo_id: int, user_id: int, text: str):
-    """
-    Always enqueue the GPT reply job — no deduplication logic.
-    """
     job = q.enqueue(
-        "app.workers:generate_reply_job",  # module:function (colon) path
+        generate_reply_job,   # <- function object, not a string
         convo_id,
         user_id,
         text,
         job_timeout=120,
         result_ttl=500,
     )
-    logger.info("[API][Queue] Enqueued job_id={} -> queue='{}' redis='{}'",
-                job.id, q.name, REDIS_URL)
+    logger.info("[API][Queue] Enqueued job_id={} -> queue='{}' redis='{}'", job.id, q.name, REDIS_URL)
     return job
+
+
 def enqueue_wrap_link(convo_id: int, raw_url: str, campaign: str = "default"):
     job = q.enqueue(
-        "app.workers:wrap_link_job",  # <- this is where that line goes
+        wrap_link_job,        # <- function object, not a string
         convo_id,
         raw_url,
         campaign,
         job_timeout=60,
     )
-    logger.info("[API][Queue] Enqueued wrap_link job_id={} -> queue='{}' redis='{}'",
-                job.id, q.name, REDIS_URL)
+    logger.info("[API][Queue] Enqueued wrap_link job_id={} -> queue='{}' redis='{}'", job.id, q.name, REDIS_URL)
     return job
