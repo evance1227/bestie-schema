@@ -15,6 +15,7 @@ from datetime import datetime, timedelta
 import base64
 import requests
 
+from app.linkwrap import convert_to_geniuslink
 from app import ai_intent, product_search
 from app import db, models, ai, integrations
 
@@ -134,12 +135,12 @@ def generate_reply_job(convo_id: int, user_id: int, text_val: str) -> None:
                 _store_and_send(user_id, convo_id, faq_responses[key])
                 return
 
-        # Step 0: first-message check
+            # Step 0: Check if this conversation has any messages yet
         with db.session() as s:
             first_msg_check = s.execute(
-                sqltext("SELECT COUNT(*) FROM messages WHERE user_id = :uid"),
-                {"uid": user_id}
-            ).scalar()
+                sqltext("SELECT COUNT(*) FROM messages WHERE conversation_id = :cid"),
+                {"cid": convo_id},
+            ).scalar() or 0
 
         # Step 0.5: simple media detectors
         if "http" in text_val and any(x in normalized_text for x in [".jpg", ".jpeg", ".png", ".gif"]):
@@ -239,6 +240,17 @@ Avoid dramatics. Avoid big metaphors. Avoid sounding like a life coach or a chee
             if rewritten != reply:
                 logger.info("[Worker][AI] 🔁 Reply was rewritten to improve tone")
                 reply = rewritten
+                
+            # Step 7.2: convert any product links in the reply to Geniuslinks
+            for raw_url in re.findall(r'https?://\S+', reply):
+                if "geni.us" in raw_url:
+                    continue  # already wrapped
+                try:
+                    short = convert_to_geniuslink(raw_url)
+                    if short and short != raw_url:
+                        reply = reply.replace(raw_url, short)
+                except Exception:
+                    logger.exception("[Linkwrap] Failed to wrap {}", raw_url)
 
             # Step 8: ensure some CTA if no link present
             if not any(x in reply.lower() for x in ["http", "geniuslink", "amazon.com"]):
