@@ -1,14 +1,14 @@
 services:
   - type: web
-    name: bestie-backend
+    name: bestie_backend
     runtime: python
     plan: starter
     buildCommand: pip install -r requirements.txt
     startCommand: uvicorn app.main:app --host 0.0.0.0 --port 8000
 
   - type: worker
-    name: bestie-worker
+    name: bestie_worker
     runtime: python
     plan: starter
     buildCommand: pip install -r requirements.txt
-    startCommand: python app/start_worker.py
+    startCommand: python -m app.start_worker  
