@@ -202,6 +202,16 @@ def generate_reply_job(convo_id: int, user_id: int, text_val: str) -> None:
             logger.info("[Worker][Rename] Reply triggered by rename: {}", reply)
         else:
             # Step 2: product intent
+            # before: intent_data = ai_intent.extract_product_intent(text_val)
+
+            intent_data = None
+            try:
+                from app import ai_intent  # import lazily/safely
+                if hasattr(ai_intent, "extract_product_intent"):
+                    intent_data = ai_intent.extract_product_intent(text_val)
+            except Exception as e:
+                logger.warning("[Worker][Intent] extractor unavailable or failed: {}", e)
+
             intent_data = ai_intent.extract_product_intent(text_val)
             logger.info("[Intent] GPT intent response: {}", intent_data)
             product_candidates = []
