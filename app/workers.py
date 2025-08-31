@@ -15,6 +15,7 @@ from datetime import datetime, timedelta
 import base64
 import requests
 
+from app import product_search
 from app.linkwrap import convert_to_geniuslink
 from app import ai_intent, product_search
 from app import db, models, ai, integrations
@@ -201,21 +202,21 @@ def generate_reply_job(convo_id: int, user_id: int, text_val: str) -> None:
             reply = rename_reply
             logger.info("[Worker][Rename] Reply triggered by rename: {}", reply)
         else:
-            # Step 2: product intent
-            # before: intent_data = ai_intent.extract_product_intent(text_val)
-
+        # Step 2: product intent (optional)
             intent_data = None
             try:
                 from app import ai_intent  # import lazily/safely
                 if hasattr(ai_intent, "extract_product_intent"):
                     intent_data = ai_intent.extract_product_intent(text_val)
+                else:
+                    logger.info("[Intent] No extractor defined; skipping product search")
             except Exception as e:
                 logger.warning("[Worker][Intent] extractor unavailable or failed: {}", e)
 
-            intent_data = ai_intent.extract_product_intent(text_val)
-            logger.info("[Intent] GPT intent response: {}", intent_data)
+            logger.info("[Intent] intent_data: {}", intent_data)
+
             product_candidates = []
-            if intent_data.get("intent"):
+            if intent_data and intent_data.get("intent"):
                 product_candidates = product_search.fetch_products(intent_data["intent"])
 
             # Step 3: user context (VIP / quiz flags)
