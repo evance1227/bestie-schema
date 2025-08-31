@@ -92,6 +92,16 @@ def try_handle_bestie_rename(user_id: int, convo_id: int, text_val: str) -> Opti
         return ai.witty_rename_response(new_name)
     return None
 
+_URL_RE = re.compile(r'(https?://\S+)')
+
+def _wrap_affiliate_links(text: str) -> str:
+    def _repl(m):
+        try:
+            return convert_to_geniuslink(m.group(1))
+        except Exception:
+            return m.group(1)  # fall back to the raw URL
+    return _URL_RE.sub(_repl, text)
+
 
 # -------------------- Worker job -------------------- #
 def generate_reply_job(convo_id: int, user_id: int, text_val: str) -> None:
@@ -234,13 +244,14 @@ Avoid dramatics. Avoid big metaphors. Avoid sounding like a life coach or a chee
                 context=context,
             )
             logger.info("[Worker][AI] 🤖 AI reply generated: {}", reply)
+            reply = _wrap_affiliate_links(reply)
 
             # optional rewrite
             rewritten = ai.rewrite_if_cringe(reply)
             if rewritten != reply:
                 logger.info("[Worker][AI] 🔁 Reply was rewritten to improve tone")
                 reply = rewritten
-                
+
             # Step 7.2: convert any product links in the reply to Geniuslinks
             for raw_url in re.findall(r'https?://\S+', reply):
                 if "geni.us" in raw_url:
