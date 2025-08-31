@@ -1,105 +1,62 @@
 # app/linkwrap.py
 import os
-import json
-from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse, quote
-import logging
-import requests
-
-log = logging.getLogger(__name__)
+import re
+from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
 
 AMAZON_TAG = os.getenv("AMAZON_ASSOC_TAG", "").strip()
-GENIUS_API = os.getenv("GENIUSLINK_API_KEY", "").strip()
-SKIMLINKS_SITE_ID = os.getenv("SKIMLINKS_SITE_ID", "").strip()  # for later
 
-_AMAZON_HOST_PARTS = (
-    "amazon.com", "amazon.co.uk", "amazon.ca", "amazon.de", "amazon.fr",
-    "amazon.es", "amazon.it", "amazon.com.au", "amazon.co.jp", "amazon.in",
-    "amazon.com.mx", "amazon.com.br", "amazon.nl", "amazon.se", "amazon.sg",
-    "amazon.ae", "amazon.sa", "amazon.pl", "amazon.com.tr",
-)
+_URL_RE = re.compile(r'https?://[^\s)]+')
 
-def _host(h: str) -> str:
-    return (h or "").lower()
-
-def is_amazon(url: str) -> bool:
-    try:
-        h = _host(urlparse(url).hostname)
-        if not h:
-            return False
-        if h == "amzn.to":
-            return True
-        return any(h.endswith(dom) for dom in _AMAZON_HOST_PARTS)
-    except Exception:
-        return False
-
-def _ensure_amazon_tag(url: str, tag: str) -> str:
-    """Add ?tag= to Amazon URLs if missing. Leave amzn.to alone."""
-    try:
-        p = urlparse(url)
-        if p.hostname and p.hostname.lower() == "amzn.to":
-            return url  # can't modify short link; it already carries your tag via redirect rules
-        q = dict(parse_qsl(p.query, keep_blank_values=True))
-        if tag and not q.get("tag"):
-            q["tag"] = tag
-        new_q = urlencode(q, doseq=True)
-        return urlunparse(p._replace(query=new_q))
-    except Exception as e:
-        log.warning("linkwrap: failed to tag amazon url: %s (%s)", url, e)
-        return url
-
-def _try_genius_shorten(dest_url: str) -> str | None:
-    """Optional nicety: if GENIUSLINK_API_KEY is set, try to shorten.
-    If anything fails, return None and the caller will fall back."""
-    if not GENIUS_API:
-        return None
-    try:
-        # Geniuslink API shape can vary by account; this endpoint works for most accounts.
-        # If your account uses a different path, no worries—we’ll just fall back.
-        r = requests.post(
-            "https://api.geni.us/v1/shorten",
-            headers={"X-API-KEY": GENIUS_API, "Content-Type": "application/json"},
-            data=json.dumps({"url": dest_url}),
-            timeout=5,
-        )
-        if r.ok:
-            data = r.json()
-            # common shapes: {"shortUrl": "..."} or {"result":{"shortUrl":"..."}}
-            return data.get("shortUrl") or (data.get("result") or {}).get("shortUrl")
-    except Exception as e:
-        log.warning("linkwrap: genius shorten failed: %s", e)
-    return None
-
-def _try_skimlinks(url: str) -> str | None:
-    """(For later) Create a Skimlinks go-skim URL. If not configured or denied, return None."""
-    if not SKIMLINKS_SITE_ID:
-        return None
-    try:
-        # This format works for standard Skimlinks “go” links once your site is approved.
-        return f"https://go.skimresources.com/?id={SKIMLINKS_SITE_ID}&xs=1&url={quote(url, safe='')}"
-    except Exception as e:
-        log.warning("linkwrap: skimlinks wrap failed: %s", e)
-        return None
-
-def wrap_affiliate(url: str) -> str:
-    """Best-effort affiliate wrapper with safe fallbacks.
-    Priority today:
-      1) Amazon → add tag → (optional) Geniuslink shorten
-      2) (later) Non-Amazon → Skimlinks if available
-      3) Otherwise → return the raw URL
+def _ensure_amazon_tag(url: str) -> str:
+    """
+    If the URL is an Amazon product/search page, ensure the Associates
+    tag is present. For non-Amazon URLs, leave untouched (raw URL).
     """
     if not url:
         return url
+    try:
+        u = urlparse(url)
+        host = u.netloc.lower()
 
-    # 1) Amazon first
-    if is_amazon(url):
-        tagged = _ensure_amazon_tag(url, AMAZON_TAG) if AMAZON_TAG else url
-        short = _try_genius_shorten(tagged)
-        return short or tagged
+        # Skip Amazon shortener; we can't append query to amzn.to
+        if "amzn.to" in host:
+            return url
 
-    # 2) (Later) non-Amazon via Skimlinks if configured
-    wrapped = _try_skimlinks(url)
-    if wrapped:
-        return wrapped
+        if "amazon." not in host:
+            return url
 
-    # 3) Always fall back to raw URL
-    return url
+        if not AMAZON_TAG:
+            return url
+
+        q = dict(parse_qsl(u.query, keep_blank_values=True))
+        if q.get("tag") != AMAZON_TAG:
+            q["tag"] = AMAZON_TAG
+
+        new_u = u._replace(query=urlencode(q, doseq=True))
+        return urlunparse(new_u)
+    except Exception:
+        return url
+
+def rewrite_affiliate_links_in_text(text: str) -> str:
+    """
+    Finds all URLs in free-form text and applies _ensure_amazon_tag to each.
+    Non-Amazon links remain raw. Returns the updated text.
+    """
+    if not text:
+        return text
+
+    def _repl(m: re.Match) -> str:
+        return _ensure_amazon_tag(m.group(0))
+
+    return _URL_RE.sub(_repl, text)
+
+# Back-compat for existing imports
+def convert_to_geniuslink(url: str) -> str:
+    """
+    Temporary shim: until Skimlinks/other programs are live, we only
+    affiliate Amazon links (via tag). Everything else is returned raw.
+    """
+    return _ensure_amazon_tag(url)
+
+# New, clearer name if you want to use it:
+convert_to_affiliate_link = convert_to_geniuslink

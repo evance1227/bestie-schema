@@ -15,8 +15,8 @@ from datetime import datetime, timedelta
 import base64
 import requests
 
-from app.product_search import build_product_candidates
-from app.linkwrap import convert_to_geniuslink, prefer_amazon_first
+from app.product_search import build_product_candidates, prefer_amazon_first
+from app.linkwrap import rewrite_affiliate_links_in_text
 from app import ai_intent, product_search
 from app import db, models, ai, integrations
 
@@ -34,6 +34,9 @@ def render_products_for_sms(products, limit=3):
 # -------------------- Core: store + send -------------------- #
 def _store_and_send(user_id: int, convo_id: int, text_val: str):
     logger.info("[Worker][Checkpoint] Finished _store_and_send")
+    # Always affiliate-ize links once, in one place
+    text_val = rewrite_affiliate_links_in_text(text_val or "").strip()
+
 
     """
     Insert outbound message in DB and send via LeadConnector.
@@ -105,15 +108,6 @@ def try_handle_bestie_rename(user_id: int, convo_id: int, text_val: str) -> Opti
     return None
 
 _URL_RE = re.compile(r'(https?://\S+)')
-
-def _wrap_affiliate_links(text: str) -> str:
-    def _repl(m):
-        try:
-            return convert_to_geniuslink(m.group(1))
-        except Exception:
-            return m.group(1)  # fall back to the raw URL
-    return _URL_RE.sub(_repl, text)
-
 
 # -------------------- Worker job -------------------- #
 def generate_reply_job(convo_id: int, user_id: int, text_val: str) -> None:
@@ -230,12 +224,20 @@ def generate_reply_job(convo_id: int, user_id: int, text_val: str) -> None:
 
             # Prefer Amazon first
             product_candidates = prefer_amazon_first(product_candidates)
-
-            # Always wrap links (Amazon gets ?tag=, others stay raw)
-            for c in product_candidates:
-                c["url"] = convert_to_geniuslink(c["url"])
+                     
+            if product_candidates:
+                reply = render_products_for_sms(product_candidates, limit=3)
+                _store_and_send(user_id, convo_id, reply)
+                return
             # Turn candidates into an SMS-friendly block
             products_block = render_products_for_sms(product_candidates, limit=3)
+            if products_block:
+                reply = (
+                    "Here are a few picks I think you’ll love:\n\n"
+                    f"{products_block}"
+                )
+                _store_and_send(user_id, convo_id, reply)
+                return
 
             if products_block:
                 reply = (
@@ -243,7 +245,7 @@ def generate_reply_job(convo_id: int, user_id: int, text_val: str) -> None:
                     f"{products_block}"
                 )
                 _store_and_send(user_id, convo_id, reply)
-                return  # we’re done
+                return  
 
             # Step 3: user context (VIP / quiz flags)
             with db.session() as s:
@@ -257,10 +259,10 @@ def generate_reply_job(convo_id: int, user_id: int, text_val: str) -> None:
 
             # Step 4: system prompt
             system_prompt = """
-You are a dry, emotionally fluent, intuitive digital best friend named Bestie. You are stylish, sarcastic, direct, and clairvoyant.
-Avoid dramatics. Avoid big metaphors. Avoid sounding like a life coach or a cheesy affirmation app.
-[...trimmed for brevity...]
-"""
+            You are a dry, emotionally fluent, intuitive digital best friend named Bestie. You are stylish, sarcastic, direct, and clairvoyant.
+            Avoid dramatics. Avoid big metaphors. Avoid sounding like a life coach or a cheesy affirmation app.
+            [...trimmed for brevity...]
+            """
 
             # Step 6: CTA fallback lines
             cta_lines = [
@@ -281,37 +283,27 @@ Avoid dramatics. Avoid big metaphors. Avoid sounding like a life coach or a chee
                 context=context,
             )
             logger.info("[Worker][AI] 🤖 AI reply generated: {}", reply)
-            reply = _wrap_affiliate_links(reply)
-
+            
             # optional rewrite
             rewritten = ai.rewrite_if_cringe(reply)
             if rewritten != reply:
                 logger.info("[Worker][AI] 🔁 Reply was rewritten to improve tone")
                 reply = rewritten
 
-            # Step 7.2: convert any product links in the reply to Geniuslinks
-            for raw_url in re.findall(r'https?://\S+', reply):
-                if "geni.us" in raw_url:
-                    continue  # already wrapped
-                try:
-                    short = convert_to_geniuslink(raw_url)
-                    if short and short != raw_url:
-                        reply = reply.replace(raw_url, short)
-                except Exception:
-                    logger.exception("[Linkwrap] Failed to wrap {}", raw_url)
-
-            # Step 8: ensure some CTA if no link present
+             # Step 8: ensure some CTA if no link present
             if not any(x in reply.lower() for x in ["http", "geniuslink", "amazon.com"]):
                 reply = reply.strip() + "\n\n" + random.choice(cta_lines)
 
         if not reply:
             reply = "⚠️ Babe, I blanked — but I’ll be back with claws sharper than ever 💅"
             logger.warning("[Worker][AI] No reply generated, sending fallback")
-
+   
+        
         _store_and_send(user_id, convo_id, reply)
 
     except Exception as e:
         logger.exception("💥 [Worker][Job] Unhandled exception in generate_reply_job: {}", e)
+        
         _store_and_send(user_id, convo_id, "Babe, I glitched — but I’ll be back to drag you properly 💅")
 
 # -------------------- Debug job -------------------- #
