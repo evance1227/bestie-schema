@@ -15,10 +15,21 @@ from datetime import datetime, timedelta
 import base64
 import requests
 
-from app import product_search
-from app.linkwrap import convert_to_geniuslink
+from app.product_search import build_product_candidates
+from app.linkwrap import convert_to_geniuslink, prefer_amazon_first
 from app import ai_intent, product_search
 from app import db, models, ai, integrations
+
+# ---- SMS product list renderer ----
+def render_products_for_sms(products, limit=3):
+    lines = []
+    for idx, p in enumerate(products[:limit], start=1):
+        name = (p.get("title") or "").strip()
+        if not name:
+            name = p.get("merchant") or "Product"
+        url = p["url"]
+        lines.append(f"{idx}. {name}\n   {url}")
+    return "\n\n".join(lines)
 
 # -------------------- Core: store + send -------------------- #
 def _store_and_send(user_id: int, convo_id: int, text_val: str):
@@ -215,9 +226,24 @@ def generate_reply_job(convo_id: int, user_id: int, text_val: str) -> None:
 
             logger.info("[Intent] intent_data: {}", intent_data)
 
-            product_candidates = []
-            if intent_data and intent_data.get("intent"):
-                product_candidates = product_search.fetch_products(intent_data["intent"])
+            product_candidates = build_product_candidates(intent_data)
+
+            # Prefer Amazon first
+            product_candidates = prefer_amazon_first(product_candidates)
+
+            # Always wrap links (Amazon gets ?tag=, others stay raw)
+            for c in product_candidates:
+                c["url"] = convert_to_geniuslink(c["url"])
+            # Turn candidates into an SMS-friendly block
+            products_block = render_products_for_sms(product_candidates, limit=3)
+
+            if products_block:
+                reply = (
+                    "Here are a few picks I think you’ll love:\n\n"
+                    f"{products_block}"
+                )
+                _store_and_send(user_id, convo_id, reply)
+                return  # we’re done
 
             # Step 3: user context (VIP / quiz flags)
             with db.session() as s:
