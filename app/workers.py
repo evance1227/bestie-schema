@@ -78,16 +78,37 @@ def _finalize_and_send(user_id: int, convo_id: int, text_val: str, *, add_cta: b
       - freshness enforcement
       - optional CTA (only when add_cta=True and no link is present)
     """
-    recent = _recent_outbound_texts(convo_id)
-    text = rewrite_affiliate_links_in_text(text_val or "").strip()
-    text = _enforce_freshness(text, recent)
-
-    if add_cta and ("http://" not in text.lower()) and ("https://" not in text.lower()):
-        cta = _pick_unique_cta(recent)
-        if cta:
-            text = text.strip() + "\n\n" + cta
-
-    _store_and_send(user_id, convo_id, text)
+    # Replace the whole function with this
+def _recent_outbound_texts(convo_id: int, limit: int = 12) -> list[str]:
+    """
+    Return recent outbound message texts. We try several likely column names
+    to avoid schema drift breaking the worker.
+    """
+    candidate_cols = ("text", "body", "message", "content")
+    with db.session() as s:
+        for col in candidate_cols:
+            try:
+                rows = s.execute(
+                    sqltext(f"""
+                        SELECT {col}
+                        FROM messages
+                        WHERE conversation_id = :cid AND direction = 'out'
+                        ORDER BY created_at DESC
+                        LIMIT :lim
+                    """),
+                    {"cid": convo_id, "lim": limit},
+                ).fetchall()
+                # Success if the column exists; return whatever we got (possibly empty)
+                return [r[0] for r in rows]
+            except Exception as e:
+                # Undefined column? Try the next candidate.
+                if getattr(e, "orig", None).__class__.__name__ == "UndefinedColumn" or "UndefinedColumn" in str(e):
+                    continue
+                # Any other SQL trouble: log and bail out (don’t crash the job)
+                logger.warning("[Freshness] Failed reading recent texts with column '{}': {}", col, e)
+                return []
+    logger.warning("[Freshness] No known message-content column found; skipping freshness.")
+    return []
 
 # -------------------- Rename flow -------------------- #
 RENAME_PATTERNS = [
