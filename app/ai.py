@@ -1,13 +1,14 @@
 import os
+import random
+
 from typing import Optional, List, Dict
 from loguru import logger
 from openai import OpenAI
 from sqlalchemy import text
 from sqlalchemy import text as sqltext
 from app import db, linkwrap
-from __future__ import annotations
 from typing import Optional, Dict
-import random
+
 
 # Initialize the modern OpenAI client
 CLIENT = None
