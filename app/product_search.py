@@ -23,10 +23,17 @@ def _intent_to_query(intent_data: Optional[Dict]) -> Optional[str]:
     if not intent_data:
         return None
     if isinstance(intent_data, dict):
-        # common shapes your extractor might emit
-        if intent_data.get("intent"):
-            return str(intent_data["intent"]).strip()
+        # Prefer explicit query from the extractor
+        q = intent_data.get("query")
+        if q:
+            return str(q).strip()
 
+        # Sometimes the phrase is stuffed into "intent" (but ignore control values)
+        maybe = intent_data.get("intent")
+        if maybe and str(maybe).strip().lower() not in {"find_products", "search", "product_search"}:
+            return str(maybe).strip()
+
+        # Otherwise assemble from common hints
         parts: List[str] = []
         for k in ("brand", "product", "category", "goal", "need", "skin_type", "budget", "notes"):
             v = intent_data.get(k)

@@ -5,12 +5,12 @@ import multiprocessing
 if __name__ == "__main__":
     multiprocessing.set_start_method("spawn", force=True)
 
-
+from datetime import datetime, timezone, timedelta
+from difflib import SequenceMatcher
 from loguru import logger
 from typing import Optional, List, Dict
 import re, uuid, random
 from sqlalchemy import text as sqltext
-from datetime import datetime, timedelta
 
 import base64
 import requests
@@ -33,18 +33,14 @@ def render_products_for_sms(products, limit=3):
 
 # -------------------- Core: store + send -------------------- #
 def _store_and_send(user_id: int, convo_id: int, text_val: str):
-    logger.info("[Worker][Checkpoint] Finished _store_and_send")
-    # Always affiliate-ize links once, in one place
-    text_val = rewrite_affiliate_links_in_text(text_val or "").strip()
-
-
     """
     Insert outbound message in DB and send via LeadConnector.
     Automatically splits long messages into parts with [1/2], [2/2], etc.
     """
+    logger.info("[Worker][Checkpoint] Finished _store_and_send")
     max_len = 450  # GHL safe limit (slightly under 480 to allow for prefix + formatting)
-    parts = []
-    text_val = text_val.strip()
+    parts: list[str] = []
+    text_val = (text_val or "").strip()
 
     while len(text_val) > max_len:
         split_point = text_val[:max_len].rfind(" ")
@@ -75,6 +71,23 @@ def _store_and_send(user_id: int, convo_id: int, text_val: str):
         except Exception:
             logger.exception("💥 [Worker][Send] Exception while calling send_sms_reply")
 
+def _finalize_and_send(user_id: int, convo_id: int, text_val: str, *, add_cta: bool = False):
+    """
+    One place to apply:
+      - affiliate link rewrite
+      - freshness enforcement
+      - optional CTA (only when add_cta=True and no link is present)
+    """
+    recent = _recent_outbound_texts(convo_id)
+    text = rewrite_affiliate_links_in_text(text_val or "").strip()
+    text = _enforce_freshness(text, recent)
+
+    if add_cta and ("http://" not in text.lower()) and ("https://" not in text.lower()):
+        cta = _pick_unique_cta(recent)
+        if cta:
+            text = text.strip() + "\n\n" + cta
+
+    _store_and_send(user_id, convo_id, text)
 
 # -------------------- Rename flow -------------------- #
 RENAME_PATTERNS = [
@@ -109,7 +122,55 @@ def try_handle_bestie_rename(user_id: int, convo_id: int, text_val: str) -> Opti
 
 _URL_RE = re.compile(r'(https?://\S+)')
 
-# -------------------- Worker job -------------------- #
+# --- anti-repetition helpers ---
+BANNED_STOCK_PHRASES = [
+    "I’ll cry a little… then wait like a glam houseplant",
+    "You're already on the VIP list, babe. That means I remember everything.",
+    "P.S. Your Bestie VIP access is still active — I’ve got receipts, rituals, and rage texts saved."
+]
+
+def _recent_outbound_texts(convo_id: int, limit: int = 12) -> list[str]:
+    with db.session() as s:
+        rows = s.execute(
+            sqltext("""
+                SELECT body
+                FROM messages
+                WHERE conversation_id = :cid AND direction = 'out'
+                ORDER BY created_at DESC
+                LIMIT :lim
+            """),
+            {"cid": convo_id, "lim": limit},
+        ).fetchall()
+    return [r[0] for r in rows]
+
+def _too_similar(a: str, b: str, thresh: float = 0.85) -> bool:
+    return SequenceMatcher(None, a, b).ratio() >= thresh
+
+def _enforce_freshness(reply: str, recent_texts: list[str]) -> str:
+    """If the reply repeats recent phrasing, rewrite with new wording."""
+    if any(p.lower() in reply.lower() for p in BANNED_STOCK_PHRASES) or \
+       any(_too_similar(reply, prev) for prev in recent_texts):
+        try:
+            # ask the model to rephrase with totally different wording
+            return ai.rewrite_different(
+                reply,
+                avoid="\n".join(recent_texts + BANNED_STOCK_PHRASES)
+            )
+        except Exception:
+            logger.warning("[Freshness] rewrite_different failed; sending original")
+    return reply
+
+def _pick_unique_cta(recent_texts: list[str]) -> str:
+    cta_pool = [
+        "Want me to tailor this to your routine? Give me one detail about your skin and I’ll dial it in.",
+        "If you want a deeper push, say the word and I’ll build you a tiny game plan.",
+        "If you’re stuck, describe the outcome you want and I’ll map the next 3 moves."
+    ]
+    for cta in cta_pool:
+        if all(cta not in r for r in recent_texts):
+            return cta
+    return ""  # nothing fresh left; skip
+
 def generate_reply_job(convo_id: int, user_id: int, text_val: str) -> None:
     """
     Main worker entrypoint:
@@ -121,37 +182,10 @@ def generate_reply_job(convo_id: int, user_id: int, text_val: str) -> None:
     logger.info("[Worker][Start] 🚀 Job started: convo_id={} user_id={} text={}", convo_id, user_id, text_val)
 
     try:
-        reply = None
+        reply: Optional[str] = None
+        normalized_text = (text_val or "").lower().strip()
 
-        # Quick FAQ intercepts (v1)
-        faq_responses = {
-            "how do i take the quiz": (
-                "You take the quiz here, babe — it's short, smart, and unlocks your personalized Bestie. Style, support, vibe — all of it.\n\n👉 https://schizobestie.gumroad.com/l/gexqp"
-            ),
-            "where do i take the quiz": (
-                "Right here, babe! This quiz is your VIP entrance to a better Bestie.\n\n👉 https://schizobestie.gumroad.com/l/gexqp"
-            ),
-            "quiz link": (
-                "Here’s the quiz that unlocks your customized Bestie:\n\n👉 https://schizobestie.gumroad.com/l/gexqp"
-            ),
-            "how do i upgrade": (
-                "Upgrading gets you the full Bestie experience. First month FREE, then $7 → $17/mo. Unlimited texts, full memory, savage support."
-            ),
-            "what’s the link": (
-                "Here’s the link you need, gorgeous:\n\n👉 https://schizobestie.gumroad.com/l/gexqp"
-            ),
-            "how do i customize": (
-                "Customization starts with the quiz. It’s where I learn your style, goals, emotional vibe — all of it. Start here:\n\n👉 https://schizobestie.gumroad.com/l/gexqp"
-            ),
-        }
-        normalized_text = text_val.lower().strip()
-        for key in faq_responses:
-            if key in normalized_text:
-                logger.info("[Worker][FAQ] Intercepted: '{}'", key)
-                _store_and_send(user_id, convo_id, faq_responses[key])
-                return
-
-            # Step 0: Check if this conversation has any messages yet
+        # Step 0: does this conversation have any messages yet?
         with db.session() as s:
             first_msg_check = s.execute(
                 sqltext("SELECT COUNT(*) FROM messages WHERE conversation_id = :cid"),
@@ -162,13 +196,13 @@ def generate_reply_job(convo_id: int, user_id: int, text_val: str) -> None:
         if "http" in text_val and any(x in normalized_text for x in [".jpg", ".jpeg", ".png", ".gif"]):
             logger.info("[Worker][Media] Detected image URL — sending to describe_image()")
             reply = ai.describe_image(text_val.strip())
-            _store_and_send(user_id, convo_id, reply)
+            _finalize_and_send(user_id, convo_id, reply, add_cta=False)
             return
 
         if "http" in text_val and any(x in normalized_text for x in [".mp3", ".m4a", ".wav", ".ogg"]):
             logger.info("[Worker][Media] Detected audio URL — sending to transcribe_and_respond()")
             reply = ai.transcribe_and_respond(text_val.strip(), user_id=user_id)
-            _store_and_send(user_id, convo_id, reply)
+            _finalize_and_send(user_id, convo_id, reply, add_cta=False)
             return
 
         # Step 0.75: onboarding on the very first inbound
@@ -178,12 +212,12 @@ def generate_reply_job(convo_id: int, user_id: int, text_val: str) -> None:
                 "OMG — you made it. Welcome to chaos, clarity, and couture-level glow-ups. Text me anything, babe. I’m ready. 💅",
                 "Hi. I’m Bestie. I don’t do small talk. I do savage insight, glow-up tips, and emotionally intelligent chaos. Let’s begin. ✨",
                 "You’re in. I’m your emotionally fluent, clairvoyant digital best friend. Ask me something. Or vent. I’m unshockable.",
-                "Welcome to your new favorite addiction. You talk. I text back like a glam oracle with rage issues and receipts. Let’s go."
+                "Welcome to your new favorite addiction. You talk. I text back like a glam oracle with rage issues and receipts. Let’s go.",
             ])
-            _store_and_send(user_id, convo_id, onboarding_reply)
+            _store_and_send(user_id, convo_id, onboarding_reply)  # canned -> no transforms
             return
 
-        # Step 1: more FAQ intercepts (v2)
+        # Step 1: quick FAQ intercepts
         faq_responses = {
             "how do i take the quiz": "You take the quiz here, babe — it's short, smart, and unlocks your personalized Bestie: https://schizobestie.gumroad.com/l/gexqp 💅",
             "where do i take the quiz": "Here’s your link, queen: https://schizobestie.gumroad.com/l/gexqp",
@@ -195,121 +229,97 @@ def generate_reply_job(convo_id: int, user_id: int, text_val: str) -> None:
             "prompt pack price": "Each pack is $7 — or 3 for $20. Link: https://schizobestie.gumroad.com/",
             "prompt packs link": "Right this way, babe: https://schizobestie.gumroad.com/",
         }
-        for key in faq_responses:
+        for key, canned in faq_responses.items():
             if key in normalized_text:
                 logger.info("[Worker][FAQ] Intercepted: '{}'", key)
-                _store_and_send(user_id, convo_id, faq_responses[key])
+                _store_and_send(user_id, convo_id, canned)  # canned -> no transforms
                 return
 
         # Step 1.5: rename flow
         rename_reply = try_handle_bestie_rename(user_id, convo_id, text_val)
         if rename_reply:
-            reply = rename_reply
-            logger.info("[Worker][Rename] Reply triggered by rename: {}", reply)
-        else:
-        # Step 2: product intent (optional)
-            intent_data = None
-            try:
-                from app import ai_intent  # import lazily/safely
-                if hasattr(ai_intent, "extract_product_intent"):
-                    intent_data = ai_intent.extract_product_intent(text_val)
-                else:
-                    logger.info("[Intent] No extractor defined; skipping product search")
-            except Exception as e:
-                logger.warning("[Worker][Intent] extractor unavailable or failed: {}", e)
+            _store_and_send(user_id, convo_id, rename_reply)  # canned-ish
+            return
 
-            logger.info("[Intent] intent_data: {}", intent_data)
+        # Step 2: product intent
+        intent_data = None
+        try:
+            if hasattr(ai_intent, "extract_product_intent"):
+                intent_data = ai_intent.extract_product_intent(text_val)
+            else:
+                logger.info("[Intent] No extractor defined; skipping product search")
+        except Exception as e:
+            logger.warning("[Worker][Intent] extractor unavailable or failed: {}", e)
 
-            product_candidates = build_product_candidates(intent_data)
+        logger.info("[Intent] intent_data: {}", intent_data)
 
-            # Prefer Amazon first
-            product_candidates = prefer_amazon_first(product_candidates)
-                     
-            if product_candidates:
-                reply = render_products_for_sms(product_candidates, limit=3)
-                _store_and_send(user_id, convo_id, reply)
-                return
-            # Turn candidates into an SMS-friendly block
-            products_block = render_products_for_sms(product_candidates, limit=3)
-            if products_block:
-                reply = (
-                    "Here are a few picks I think you’ll love:\n\n"
-                    f"{products_block}"
-                )
-                _store_and_send(user_id, convo_id, reply)
-                return
+        product_candidates: List[Dict] = build_product_candidates(intent_data)
+        product_candidates = prefer_amazon_first(product_candidates)
 
-            if products_block:
-                reply = (
-                    "Here are a few picks I think you’ll love:\n\n"
-                    f"{products_block}"
-                )
-                _store_and_send(user_id, convo_id, reply)
-                return  
+        if product_candidates:
+            reply = render_products_for_sms(product_candidates, limit=3)
+            _finalize_and_send(user_id, convo_id, reply, add_cta=False)  # product lists: no CTA
+            return
 
-            # Step 3: user context (VIP / quiz flags)
-            with db.session() as s:
-                profile = s.execute(
-                    sqltext("SELECT is_vip, has_completed_quiz FROM user_profiles WHERE user_id = :uid"),
-                    {"uid": user_id}
-                ).first()
-            is_vip = bool(profile and profile[0])
-            has_quiz = bool(profile and profile[1])
-            context = {"is_vip": is_vip, "has_completed_quiz": has_quiz}
+        # Step 3: user context (VIP / quiz flags)
+        with db.session() as s:
+            profile = s.execute(
+                sqltext("SELECT is_vip, has_completed_quiz FROM user_profiles WHERE user_id = :uid"),
+                {"uid": user_id}
+            ).first()
+        is_vip = bool(profile and profile[0])
+        has_quiz = bool(profile and profile[1])
+        context = {"is_vip": is_vip, "has_completed_quiz": has_quiz}
 
-            # Step 4: system prompt
-            system_prompt = """
-            You are a dry, emotionally fluent, intuitive digital best friend named Bestie. You are stylish, sarcastic, direct, and clairvoyant.
-            Avoid dramatics. Avoid big metaphors. Avoid sounding like a life coach or a cheesy affirmation app.
-            [...trimmed for brevity...]
-            """
+        # Step 4: system prompt
+        today_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        system_prompt = f"""
+You are Bestie: dry, emotionally fluent, stylish, direct.
+Today is {today_utc} (UTC). Never contradict obvious calendar facts.
+If the user says a past date is “in the past,” do not argue.
+If a question is specific enough to act on, DO NOT ask a follow-up—just help.
+For shopping requests: return 2–3 concrete options with one-sentence rationale each.
+Prefer Amazon links first; if you can’t find a good Amazon match, use the brand’s site (raw URL).
+Links must be direct (no trackers) and kept exactly as provided.
+Avoid repeating wording you’ve used in this conversation. Vary phrasing.
+""".strip()
 
-            # Step 6: CTA fallback lines
-            cta_lines = [
-                "P.S. Your Bestie VIP access is still active — I’ve got receipts, rituals, and rage texts saved. 📎",
-                "You're already on the VIP list, babe. That means I remember everything.",
-                "VIP mode is ON. First month’s free. After that, it’s $7/month — cancel anytime.",
-                "You already joined the soft launch, so we’re building from here.",
-                "And if you *ever* cancel VIP, I’ll cry a little… then wait like a glam houseplant.",
-            ]
+        # Step 7: call AI
+        logger.info("[Worker][AI] Calling AI for convo_id={} user_id={}", convo_id, user_id)
+        reply = ai.generate_reply(
+            user_text=str(text_val),
+            product_candidates=[],
+            user_id=user_id,
+            system_prompt=system_prompt,
+            context=context,
+        )
+        logger.info("[Worker][AI] 🤖 AI reply generated: {}", reply)
 
-            # Step 7: call AI
-            logger.info("[Worker][AI] Calling AI for convo_id={} user_id={}", convo_id, user_id)
-            reply = ai.generate_reply(
-                user_text=str(text_val),
-                product_candidates=product_candidates,
-                user_id=user_id,
-                system_prompt=system_prompt,
-                context=context,
-            )
-            logger.info("[Worker][AI] 🤖 AI reply generated: {}", reply)
-            
-            # optional rewrite
+        # optional tone rewrite
+        try:
             rewritten = ai.rewrite_if_cringe(reply)
-            if rewritten != reply:
+            if rewritten and rewritten != reply:
                 logger.info("[Worker][AI] 🔁 Reply was rewritten to improve tone")
                 reply = rewritten
+        except Exception:
+            logger.warning("[Worker][AI] rewrite_if_cringe failed; using original reply")
 
-             # Step 8: ensure some CTA if no link present
-            if not any(x in reply.lower() for x in ["http", "geniuslink", "amazon.com"]):
-                reply = reply.strip() + "\n\n" + random.choice(cta_lines)
-
-        if not reply:
-            reply = "⚠️ Babe, I blanked — but I’ll be back with claws sharper than ever 💅"
-            logger.warning("[Worker][AI] No reply generated, sending fallback")
-   
-        
-        _store_and_send(user_id, convo_id, reply)
+        # Step 8: finalize the general-chat reply (freshness + optional CTA)
+        _finalize_and_send(user_id, convo_id, reply, add_cta=True)
+        return
 
     except Exception as e:
         logger.exception("💥 [Worker][Job] Unhandled exception in generate_reply_job: {}", e)
-        
-        _store_and_send(user_id, convo_id, "Babe, I glitched — but I’ll be back to drag you properly 💅")
+        _finalize_and_send(
+            user_id, convo_id,
+            "Babe, I glitched — but I’ll be back to drag you properly 💅",
+            add_cta=False
+        )
 
 # -------------------- Debug job -------------------- #
 def debug_job(convo_id: int, user_id: int, text_val: str):
-    logger.info("[Worker][Debug] 🔋 Debug job: convo_id={} user_id={} text={}", convo_id, user_id, text_val)
-    return f"Debug reply: got text='{text_val}'"
+                logger.info("[Worker][Debug] 🔋 Debug job: convo_id={} user_id={} text={}", convo_id, user_id, text_val)
+                return f"Debug reply: got text='{text_val}'"
 
 
 # -------------------- Re-engagement job -------------------- #

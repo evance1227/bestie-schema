@@ -5,6 +5,8 @@ from openai import OpenAI
 from sqlalchemy import text
 from sqlalchemy import text as sqltext
 from app import db, linkwrap
+from __future__ import annotations
+from typing import Optional, Dict
 import random
 
 # Initialize the modern OpenAI client
@@ -64,6 +66,24 @@ PROMPT_PACK_LINKS = {
     "Start Your Fitness Journey": "https://240026861589.gumroad.com/l/ybqrt",
     "Am I Ready to Pull the Trigger?": "https://240026861589.gumroad.com/l/iithu"
 }
+
+PRODUCT_TRIGGERS = {
+    "recommend", "suggest", "link", "buy", "product", "shop", "send me",
+    "shampoo", "conditioner", "serum", "oil", "mask", "spray", "cleanser",
+    "sunscreen", "moisturizer", "cream", "lotion", "gel"
+}
+
+def extract_product_intent(text: str) -> Optional[Dict[str, str]]:
+    """
+    Returns {"need_product": True, "query": <user text>} when the message
+    looks like a product request; otherwise returns None.
+    """
+    if not text:
+        return None
+    t = text.lower()
+    if any(k in t for k in PRODUCT_TRIGGERS):
+        return {"need_product": True, "query": text.strip()}
+    return None
 
 # === MASTER PERSONA & PLAYBOOK ===
 BASE_PERSONA = """You are Schizo Bestie — the user’s emotionally fluent, pop-culture–savvy,
