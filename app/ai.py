@@ -1,16 +1,17 @@
-import os
-import random
+# app/ai.py
 
+import os
+import re
+import random
 from typing import Optional, List, Dict
+
 from loguru import logger
 from openai import OpenAI
-from sqlalchemy import text
 from sqlalchemy import text as sqltext
+
 from app import db, linkwrap
-from typing import Optional, Dict
 
-
-# Initialize the modern OpenAI client
+# Initialize the OpenAI client
 CLIENT = None
 try:
     CLIENT = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
@@ -65,7 +66,7 @@ PROMPT_PACK_LINKS = {
     "Navigating a Major Life Transition": "https://240026861589.gumroad.com/l/clftz",
     "Self-Care Like a Queen": "https://240026861589.gumroad.com/l/gleer",
     "Start Your Fitness Journey": "https://240026861589.gumroad.com/l/ybqrt",
-    "Am I Ready to Pull the Trigger?": "https://240026861589.gumroad.com/l/iithu"
+    "Am I Ready to Pull the Trigger?": "https://240026861589.gumroad.com/l/iithu",
 }
 
 PRODUCT_TRIGGERS = {
@@ -73,6 +74,7 @@ PRODUCT_TRIGGERS = {
     "shampoo", "conditioner", "serum", "oil", "mask", "spray", "cleanser",
     "sunscreen", "moisturizer", "cream", "lotion", "gel"
 }
+
 
 def extract_product_intent(text: str) -> Optional[Dict[str, str]]:
     """
@@ -85,6 +87,36 @@ def extract_product_intent(text: str) -> Optional[Dict[str, str]]:
     if any(k in t for k in PRODUCT_TRIGGERS):
         return {"need_product": True, "query": text.strip()}
     return None
+
+
+def _is_specific_product_intent(intent_data, user_text: str) -> bool:
+    """Return True for messages that clearly ask for product recs/dupes/cheaper alternatives."""
+    try:
+        t = (user_text or "").lower()
+        if any(k in t for k in (
+            "dupe", "dupes", "similar to", "like ", "alternative",
+            "cheaper", "less expensive", "budget", "instead of"
+        )):
+            return True
+
+        if not isinstance(intent_data, dict):
+            return False
+
+        # Obvious signals from the extractor
+        if intent_data.get("intent") in {"find_products", "buy", "compare"}:
+            return True
+        q = (intent_data.get("query") or "").lower()
+        if any(k in q for k in ("dupe", "similar", "cheaper", "less expensive", "alternative")):
+            return True
+
+        # Categories we treat as product-y by default
+        if intent_data.get("category") in {"skincare", "makeup", "hair", "fragrance", "supplements"}:
+            return True
+
+        return False
+    except Exception:
+        return False
+
 
 # === MASTER PERSONA & PLAYBOOK ===
 BASE_PERSONA = """You are Schizo Bestie — the user’s emotionally fluent, pop-culture–savvy,
@@ -150,32 +182,36 @@ Step 3: VIP & Extras
 - “The kind of thing that makes people think you ‘just wake up like this.’”
 """
 
+
 def _fetch_persona_and_name(user_id: Optional[int]):
     if not user_id:
         return BASE_PERSONA, DEFAULT_NAME
     try:
         with db.session() as s:
-                   row = s.execute(
-            sqltext("""
-                SELECT
-                    coalesce(persona, '') AS persona,
-                    coalesce(bestie_name, '') AS bestie_name,
-                    coalesce(sizes::text, '') AS sizes,
-                    coalesce(brands::text, '') AS brands,
-                    coalesce(budget_range, '') AS budget,
-                    coalesce(sensitivities::text, '') AS sensitivities,
-                    coalesce(memory_notes, '') AS memory_notes
-                FROM user_profiles
-                WHERE user_id = :uid
-            """),
-            {"uid": user_id}
-        ).first()
+            row = s.execute(
+                sqltext(
+                    """
+                    SELECT
+                        coalesce(persona, '') AS persona,
+                        coalesce(bestie_name, '') AS bestie_name,
+                        coalesce(sizes::text, '') AS sizes,
+                        coalesce(brands::text, '') AS brands,
+                        coalesce(budget_range, '') AS budget,
+                        coalesce(sensitivities::text, '') AS sensitivities,
+                        coalesce(memory_notes, '') AS memory_notes
+                    FROM user_profiles
+                    WHERE user_id = :uid
+                    """
+                ),
+                {"uid": user_id},
+            ).first()
+
         quiz_data = {
-            "Sizes": row[2],
-            "Favorite Brands": row[3],
-            "Budget Range": row[4],
-            "Topics to Avoid": row[5],
-            "Emotional Notes": row[6],
+            "Sizes": row[2] if row else "",
+            "Favorite Brands": row[3] if row else "",
+            "Budget Range": row[4] if row else "",
+            "Topics to Avoid": row[5] if row else "",
+            "Emotional Notes": row[6] if row else "",
         }
 
         quiz_profile = ""
@@ -196,6 +232,7 @@ def _fetch_persona_and_name(user_id: Optional[int]):
         logger.exception("[AI][Persona] Failed to fetch persona for user_id={}: {}", user_id, e)
         return BASE_PERSONA, DEFAULT_NAME
 
+
 def witty_rename_response(new_name: str) -> str:
     """Return a randomized, witty rename confirmation instead of generic copy."""
     options = [
@@ -203,23 +240,27 @@ def witty_rename_response(new_name: str) -> str:
         f"Fine, but don’t expect me to answer to anything less iconic than {new_name}.",
         f"Rename accepted. Consider me reborn as {new_name} — more savage than ever.",
         f"Alright, {new_name}. Let’s see if you can handle me now 😏",
-        f"{new_name}? Bold choice. Let’s make it fashion."
+        f"{new_name}? Bold choice. Let’s make it fashion.",
     ]
     return random.choice(options)
 
-def generate_reply(user_text: str,
-                   product_candidates: Optional[List[Dict]] = None,
-                   user_id: Optional[int] = None,
-                   system_prompt: Optional[str] = None,
-                   context: Optional[Dict] = None) -> str:
-    """Generate Bestie’s reply with Geniuslink conversion + personality & loyalty rules."""
-    persona_text, bestie_name = _fetch_persona_and_name(user_id)
 
+def generate_reply(
+    user_text: str,
+    product_candidates: Optional[List[Dict]] = None,
+    user_id: Optional[int] = None,
+    system_prompt: Optional[str] = None,
+    context: Optional[Dict] = None,
+) -> str:
+    """Generate Bestie’s reply with Geniuslink conversion + personality & loyalty rules."""
+
+    persona_text, bestie_name = _fetch_persona_and_name(user_id)
     user_text = str(user_text or "")
     context = context or {}
+    product_candidates = product_candidates or []
 
     # Convert all product URLs to Geniuslinks
-    safe_products = []
+    safe_products: List[Dict] = []
     if product_candidates:
         for p in product_candidates[:3]:
             raw_url = str(p.get("url") or "")
@@ -237,33 +278,37 @@ def generate_reply(user_text: str,
                 final_url = raw_url
                 is_monetized = False
 
-            safe_products.append({
-                "name": str(p.get("name") or ""),
-                "category": str(p.get("category") or ""),
-                "url": final_url,
-                "review": str(p.get("review") or ""),
-                "monetized": is_monetized
-            })
+            safe_products.append(
+                {
+                    "name": str(p.get("name") or ""),
+                    "category": str(p.get("category") or ""),
+                    "url": final_url,
+                    "review": str(p.get("review") or ""),
+                    "monetized": is_monetized,
+                }
+            )
+
     # If no safe monetized products, fallback to showing the raw links (non-Geniuslink)
-    if not safe_products:
+    if not safe_products and product_candidates:
         logger.info("[AI][Products] No monetized products. Falling back to raw URLs.")
         for p in product_candidates[:3]:
             raw_url = str(p.get("url") or "")
-            safe_products.append({
-                "name": str(p.get("name") or ""),
-                "category": str(p.get("category") or ""),
-                "url": raw_url,
-                "review": str(p.get("review") or ""),
-                "monetized": False
-            })
+            safe_products.append(
+                {
+                    "name": str(p.get("name") or ""),
+                    "category": str(p.get("category") or ""),
+                    "url": raw_url,
+                    "review": str(p.get("review") or ""),
+                    "monetized": False,
+                }
+            )
 
     # Fallback if no OpenAI client
     if CLIENT is None or not os.getenv("OPENAI_API_KEY"):
         if safe_products:
             p = safe_products[0]
             return f"Here’s your glow-up starter: {p['name']} ({p['category']})\n{p['url']}"
-        else:
-            return f"{user_text[:30]}… babe, I’ll hold space and hype you up — we’ll find the perfect rec soon 💅"
+        return f"{user_text[:30]}… babe, I’ll hold space and hype you up — we’ll find the perfect rec soon 💅"
 
     # Build context summary
     context_summary = ""
@@ -276,25 +321,36 @@ def generate_reply(user_text: str,
     if safe_products:
         product_context = "\nHere are product candidates (already Geniuslink-converted):\n"
         for p in safe_products:
-            product_context += f"- {p['name']} (Category: {p['category']}) | {p['url']} | Review: {p['review']}\n"
-  
-    # Pull user quiz data if available
+            product_context += (
+                f"- {p['name']} (Category: {p['category']}) | {p['url']} | Review: {p['review']}\n"
+            )
+
+    # Pull user quiz data if available (separate table)
     quiz_profile = ""
     try:
-        row = db.session().execute(
-            text("SELECT quiz_profile FROM user_profiles WHERE user_id = :uid"),
-            {"uid": user_id}
-        ).first()
-        if row and row[0]:
-            quiz_profile = row[0].strip()
+        if user_id:
+            with db.session() as s:
+                row = s.execute(
+                    sqltext(
+                        """
+                        SELECT profile_json
+                        FROM user_quiz_profiles
+                        WHERE user_id = :uid
+                        ORDER BY created_at DESC
+                        LIMIT 1
+                        """
+                    ),
+                    {"uid": user_id},
+                ).first()
+            if row and row[0]:
+                quiz_profile = (row[0] or "").strip()
     except Exception as e:
         logger.warning("[AI][Quiz] Failed to fetch quiz profile for user_id={}: {}", user_id, e)
-  # Set prompt source
-    system_content = system_prompt.strip() if system_prompt else persona_text
+
+    # Build the system prompt
+    system_content = (system_prompt or persona_text).strip()
     if quiz_profile:
         system_content += f"\n\nUser Quiz Profile:\n{quiz_profile}"
-
-    logger.info("[AI][Quiz] Injected user quiz profile:\n{}", quiz_profile)
 
     # Build user-facing content
     user_content = f"""User said: {user_text}
@@ -312,92 +368,110 @@ Your job:
 - Use the exact name to match the correct link. Never use the generic Gumroad shop link.
 - Never ignore or sidestep user questions. Even if vague or strange, give a thoughtful answer.
 """
-    # 🔍 Step: Ask qualifying questions if user seems vague
-    vague_cues = ["something", "any", "idk", "recommend", "need help", "what should i", "looking for", "ideas", "suggest"]
-    if not product_candidates and any(cue in user_text.lower() for cue in vague_cues):
-        logger.info("[AI][Clarify] Detected vague input — triggering qualifying questions")
+
+    # --- Ask qualifying questions only if the ask is genuinely vague ---
+    _VAGUE_REGEX = re.compile(
+        r"\b(something|anything|idk|need help|what should i|ideas?|suggestions?|looking for)\b",
+        re.IGNORECASE,
+    )
+
+    # Use our extractor + heuristic to decide if the ask is already specific
+    try:
+        intent_for_clarify = extract_product_intent(user_text)
+    except Exception:
+        intent_for_clarify = None
+
+    is_specific = _is_specific_product_intent(intent_for_clarify, user_text)
+
+    if (not product_candidates) and (not is_specific) and _VAGUE_REGEX.search(user_text or ""):
+        logger.info("[AI][Clarify] Detected genuinely vague input — asking a qualifier")
         return (
-            "Got it — but help me help you: Are you looking for skincare, style, something emotional, or just a vibe shift?"
-            "\n\nTell me what you *actually* want to feel right now. I’ll handle the rest."
+            "Quick gut-check: do you want skincare, style, something emotional, or a full vibe shift?\n\n"
+            "Give me the lane and I'll do the rest."
         )
+
     logger.info("[AI][Prompt] System:\n{}\n\nUser:\n{}", system_content, user_content)
 
+    # ---- Call the model ----
     try:
         resp = CLIENT.chat.completions.create(
-            model="gpt-4o-mini",
+            model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
             messages=[
                 {"role": "system", "content": system_content},
-                {"role": "user", "content": user_content}
+                {"role": "user", "content": user_content},
             ],
             temperature=0.9,
             max_tokens=320,
         )
         text_out = (resp.choices[0].message.content or "").strip()
         return text_out
-
     except Exception as e:
-            logger.exception("💥 [AI][Generate] OpenAI error: {}", e)
-            import traceback
-            logger.error("⚠️ GPT ERROR: {}", e)
-            traceback.print_exc()
+        logger.exception("💥 [AI][Generate] OpenAI error: {}", e)
+        if safe_products:
+            p = safe_products[0]
+            return f"Here’s your glow-up starter: {p['name']} ({p['category']})\n{p['url']}"
+        return "Babe, I glitched — but I’ll be back with the vibe you deserve 💅"
 
-            if safe_products:
-                p = safe_products[0]
-                return f"Here’s your glow-up starter: {p['name']} ({p['category']})\n{p['url']}"
-            else:
-                return "Babe, I glitched — but I’ll be back with the vibe you deserve 💅"
-            
+
 def describe_image(image_url: str) -> str:
     """Use GPT-4o to analyze an image and return a stylish response."""
+    if not image_url:
+        return "Babe, I can’t analyze an empty link. Try again with an image. 😅"
+
     if CLIENT is None or not os.getenv("OPENAI_API_KEY"):
         return "Babe, I can't analyze images right now — something's offline. 😩"
 
     try:
         logger.info("[AI][Image] 📸 Analyzing image at: {}", image_url)
         response = CLIENT.chat.completions.create(
-            model=os.getenv("OPENAI_MODEL", "gpt-4")
-,
+            model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
             messages=[
                 {
                     "role": "system",
-                    "content": "You are a glam, dry, emotionally fluent best friend who knows fashion, dogs, vibes, memes, and general culture. Look at this image and describe what you see in a sassy but intelligent tone."
+                    "content": (
+                        "You are a glam, dry, emotionally fluent best friend who knows fashion, "
+                        "dogs, vibes, memes, and general culture. Look at this image and describe "
+                        "what you see in a sassy but intelligent tone."
+                    ),
                 },
                 {
                     "role": "user",
                     "content": [
-                        {
-                            "type": "image_url",
-                            "image_url": {
-                                "url": image_url,
-                                "detail": "high"
-                            }
-                        }
-                    ]
-                }
+                        {"type": "text", "text": "Describe the image in 3–6 punchy sentences."},
+                        {"type": "image_url", "image_url": {"url": image_url, "detail": "high"}},
+                    ],
+                },
             ],
             temperature=0.8,
-            max_tokens=400
+            max_tokens=400,
         )
         result = (response.choices[0].message.content or "").strip()
         return result
     except Exception as e:
         logger.exception("💥 [AI][Image] GPT-4o image error: {}", e)
         return "I tried to look but something glitched. Re-upload or try again, babe."
+
+
 def transcribe_and_respond(audio_url: str, user_id: Optional[int] = None) -> str:
     """Transcribe a voice note and respond as Bestie."""
     import requests
+
     try:
         logger.info("[AI][Voice] 🎙️ Downloading audio from {}", audio_url)
-        audio_data = requests.get(audio_url).content
-        with open("/tmp/voice_input.mp3", "wb") as f:
-            f.write(audio_data)
+        resp = requests.get(audio_url, timeout=60)
+        resp.raise_for_status()
+
+        tmp_path = "/tmp/voice_input.mp3"
+        with open(tmp_path, "wb") as f:
+            f.write(resp.content)
 
         # Transcribe using Whisper
-        audio_file = open("/tmp/voice_input.mp3", "rb")
-        transcript = CLIENT.audio.transcriptions.create(
-            model="whisper-1",
-            file=audio_file
-        ).text.strip()
+        with open(tmp_path, "rb") as audio_file:
+            transcribed = CLIENT.audio.transcriptions.create(
+                model="whisper-1",
+                file=audio_file,
+            )
+        transcript = (getattr(transcribed, "text", "") or "").strip()
         logger.info("[AI][Voice] 📝 Transcribed text: {}", transcript)
 
         # Send to generate_reply as if user typed it
@@ -407,29 +481,41 @@ def transcribe_and_respond(audio_url: str, user_id: Optional[int] = None) -> str
         logger.exception("💥 [AI][Voice] Error transcribing/responding: {}", e)
         return "Babe, I couldn't hear that clearly — mind sending it again as a text or re-recording?"
 
+
 # 👇 FULLY OUTSIDE generate_reply()
 def rewrite_if_cringe(original_text: str) -> str:
     """Rewrite if GPT used banned language or failed tone check."""
     boring_flags = [
-        "as an ai", "i am just a", "you are not alone",
-        "i understand you are feeling", "beyoncé has flop days", "you’re still headlining"
+        "as an ai",
+        "i am just a",
+        "you are not alone",
+        "i understand you are feeling",
+        "beyoncé has flop days",
+        "you’re still headlining",
     ]
-    if any(flag in original_text.lower() for flag in boring_flags):
+    text_lc = (original_text or "").lower()
+
+    if any(flag in text_lc for flag in boring_flags):
         try:
             response = CLIENT.chat.completions.create(
                 model="gpt-4o-mini",
                 messages=[
                     {
                         "role": "system",
-                        "content": "Rewrite this in the voice of a dry, intuitive, punchy best friend. No pop-star metaphors. No robotic filler. Make it fierce, useful, and emotionally intelligent."
+                        "content": (
+                            "Rewrite this in the voice of a dry, intuitive, punchy best friend. "
+                            "No pop-star metaphors. No robotic filler. Make it fierce, useful, "
+                            "and emotionally intelligent."
+                        ),
                     },
-                    {"role": "user", "content": original_text}
+                    {"role": "user", "content": original_text},
                 ],
                 temperature=0.8,
-                max_tokens=300
+                max_tokens=300,
             )
             new_text = (response.choices[0].message.content or "").strip()
             return new_text
         except Exception as e:
             logger.warning("[AI][Rewrite] Cringe rewrite failed: {}", e)
+
     return original_text
