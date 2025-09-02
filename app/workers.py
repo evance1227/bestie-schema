@@ -59,8 +59,6 @@ def _send_dedupe_guard(conversation_id: int, text: str, ttl: int = 120) -> bool:
         logger.warning("[Dedup] Redis unavailable; skipping guard: {}", e)
         return True
 
-
-
 def _recent_outbound_texts(convo_id: int, limit: int = 12) -> list[str]:
     """
     Return recent outbound message texts. Tries several column names to avoid
@@ -98,9 +96,9 @@ def _amazon_search_url(q: str) -> str:
 
 def _ensure_amazon_links(text: str) -> str:
     """
-    Replace hallucinated product links with a safe Amazon *search* link using the
-    product name in lines like: '1. **Product Name**'.
-    Also removes any existing markdown link targets to avoid sending /dp/... that 404.
+    Replace any hallucinated product links with a safe Amazon link.
+    If a product line contains an explicit ASIN, produce /dp/ASIN.
+    Otherwise, fall back to an Amazon search link.
     """
     if not text:
         return text
@@ -108,13 +106,20 @@ def _ensure_amazon_links(text: str) -> str:
     # Strip existing markdown link targets: '](http...)' -> ']'
     text = re.sub(r"\]\(https?://[^\)]+\)", "]", text)
 
-    # After each product header line inject a clean Amazon search link
+    asin_re = re.compile(r"ASIN:\s*([A-Z0-9]{10})", re.I)
+
     def _inject(m):
+        line = m.group(0)
         name = m.group(1).strip()
-        return f"{m.group(0)}\n   [Amazon link]({_amazon_search_url(name)})"
+        asin_m = asin_re.search(line)
+        if asin_m:
+            asin = asin_m.group(1).upper()
+            return f"{line}\n    [Amazon link](https://www.amazon.com/dp/{asin})"
+        # fallback: search page
+        return f"{line}\n    [Amazon link]({_amazon_search_url(name)})"
 
+    # After each product header line inject a link
     return re.sub(r"(?m)^\s*\d+\.\s+\*\*(.+?)\*\*.*$", _inject, text)
-
 
 def _rewrite_links_to_genius(text: str) -> str:
     """
@@ -219,11 +224,48 @@ def _store_and_send(user_id: int, convo_id: int, text_val: str) -> None:
 # ---------------------------------------------------------------------------
 # Finalize + send (single path; handles freshness, links, de-dup, CTA)
 # ---------------------------------------------------------------------------
-def _finalize_and_send(user_id: int, convo_id: int, reply: str, *, add_cta: bool = False, force_send: bool = False) -> None:
+def _fix_vip_links(text: str) -> str:
+    """
+    Ensure any VIP sign-up mention includes a clickable URL.
+    - If the canonical link is missing, append it.
+    - If the model produced bracket-only anchors (e.g., [VIP Sign-Up]), replace with a real link.
+    """
+    VIP_URL = "https://schizobestie.gumroad.com/l/gexqp"
+    if not text:
+        return text
+
+    # Replace any [VIP ...] without (url) that appears alone on a line with a proper link
+    text = re.sub(
+        r"(?mi)^\s*\[(?:vip|vip\s*sign[ -]?up|vip\s*trial(?:\s*signup)?|vip\s*sign\s*up)\]\s*$",
+        f"[VIP Sign-Up]({VIP_URL})",
+        text,
+        flags=re.IGNORECASE,
+    )
+
+    # If we talk about VIP but no URL is anywhere in the message, add the link once at the end
+    if ("vip" in text.lower()) and (VIP_URL not in text):
+        if text.endswith("\n"):
+            text += VIP_URL
+        else:
+            text += "\n" + VIP_URL
+
+    return text
+
+    # Finalize + send 
+# Finalize + send (single path; handles freshness, links, de-dup, CTA)
+# -------------------------------------------------------------------
+def _finalize_and_send(
+    user_id: int,
+    convo_id: int,
+    reply: str,
+    *,
+    add_cta: bool = False,
+    force_send: bool = True,   # default True so we never silently drop first sends
+) -> None:
     """
     Final formatting + safe send to SMS (single send path).
     - Optional CTA
-    - Soft nudge if identical to last reply
+    - Soft nudge if identical to last reply (avoids duplicate drop)
     - Amazon link hygiene + Geniuslink wrap (+ optional affiliate rewrite)
     - Redis de-dupe guard (unless force_send=True)
     - Store + send once
@@ -243,36 +285,46 @@ def _finalize_and_send(user_id: int, convo_id: int, reply: str, *, add_cta: bool
     except Exception:
         pass
 
-    # Soft nudge if identical to last outbound
-    try:
-        last = next(iter(_recent_outbound_texts(convo_id, limit=1)), "")
-        if (last or "").strip() == reply:
-            reply = reply + " " + random.choice(["✨", "💫", "💕", "🌟"])
-            logger.info("[Freshness] Nudged reply to avoid duplicate drop.")
-    except Exception as e:
-        logger.warning("[Freshness] Skipping nudge due to error: {}", e)
+    # Soft nudge if identical to last outbound (only when not forcing)
+    if not force_send:
+        try:
+            last = next(iter(_recent_outbound_texts(convo_id, limit=1)), "")
+            if (last or "").strip() == reply:
+                reply = reply + " " + random.choice(["✨", "💫", "💕", "🌟"])
+                logger.info("[Freshness] Nudged reply to avoid duplicate drop.")
+        except Exception as e:
+            logger.warning("[Freshness] Skipping nudge due to error: {}", e)
 
-    # Link hygiene (1. ensure/repair, 2. Geniuslink, 3. optional site-wide affiliate rewrite)
+    # --- Link hygiene & monetization (order matters) ---
+    # 1) prefer reliable Amazon search links under each product header
     reply = _ensure_amazon_links(reply)
+    # 2) pipe any amazon URL through your Geniuslink wrapper, if configured
     reply = _rewrite_links_to_genius(reply)
+    # 3) ensure VIP anchor is always clickable (helper added above)
+    try:
+        reply = _fix_vip_links(reply)
+    except Exception:
+        pass
+    # 4) optional site-wide affiliate rewrite (safe no-op if not configured)
     try:
         aff = rewrite_affiliate_links_in_text(reply)
         if aff:
             reply = aff
     except Exception as e:
-        # It's fine if linkwrap isn't configured.
         logger.debug("[Affiliate] rewrite_affiliate_links_in_text skipped: {}", e)
 
-    # Redis de-dupe guard
+    # Redis de-dupe guard (skip only when NOT forcing)
     if not force_send and not _send_dedupe_guard(convo_id, reply):
         logger.warning("[Dedup] Skipping duplicate outbound for convo_id={}", convo_id)
         return
 
-    logger.info("[Worker][Send] → user_id={} convo_id={} chars={} preview={!r}", user_id, convo_id, len(reply), reply[:200])
+    logger.info(
+        "[Worker][Send] → user_id={} convo_id={} chars={} preview={!r}",
+        user_id, convo_id, len(reply), reply[:200]
+    )
 
     # Single send/storage
     _store_and_send(user_id, convo_id, reply)
-
 
 # ---------------------------------------------------------------------------
 # Rename flow helpers
