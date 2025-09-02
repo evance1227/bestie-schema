@@ -490,13 +490,31 @@ def generate_reply_job(convo_id: int, user_id: int, text_val: str) -> None:
 
         logger.info("[Intent] intent_data: {}", intent_data)
 
-        product_candidates: List[Dict] = build_product_candidates(intent_data)
-        product_candidates = prefer_amazon_first(product_candidates)
+        from app.product_search import get_static_matches  # add this at the top
 
-        if product_candidates:
-            reply = render_products_for_sms(product_candidates, limit=3)
-            _finalize_and_send(user_id, convo_id, reply, add_cta=False)  # product lists: no CTA
+        # Step 2: product intent
+        intent_data = None
+        try:
+            if hasattr(ai_intent, "extract_product_intent"):
+                intent_data = ai_intent.extract_product_intent(text_val)
+            else:
+                logger.info("[Intent] No extractor defined; skipping product search")
+        except Exception as e:
+            logger.warning("[Worker][Intent] extractor unavailable or failed: {}", e)
+
+        logger.info("[Intent] intent_data: {}", intent_data)
+
+        # ✅ First try static product match
+        static_matches = get_static_matches(text_val)
+        if static_matches:
+            logger.info("[Worker][Products] Found static product matches")
+            reply = render_products_for_sms(static_matches, limit=3)
+            _finalize_and_send(user_id, convo_id, reply, add_cta=False)
             return
+
+        # ❌ Skip GPT recs unless we add them manually
+        logger.info("[Worker][Products] No static match. Skipping product recs to avoid hallucinated links.")
+
 
         # Step 3: user context (VIP / quiz flags)
         with db.session() as s:
