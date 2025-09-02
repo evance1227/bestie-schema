@@ -37,6 +37,7 @@ LOWER_PRICE_WORDS = {
 # Patterns that try to pull a canonical "target" after phrasing like
 # "dupe of X", "similar to X", "like X but cheaper", or "X dupe"
 SIMILAR_PATTERNS = [
+    r"(?:dupe|alternative|similar|like).*(?:\bfor\b|\bof\b|\bis\b)?\s*([^,.;\n]+)",
     r"(?:similar|like|alternative|alt|dupe|dupes?)\s+(?:to|for)\s+([^,.;\n]+)",
     r"(?:cheaper|less\s+expensive|budget|affordable)\s+(?:version|option)\s+of\s+([^,.;\n]+)",
     r"(?:like)\s+([^,.;\n]+)\s+(?:but|only)\s+(?:cheaper|less\s+expensive|more\s+affordable)",

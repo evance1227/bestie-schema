@@ -383,7 +383,15 @@ def generate_reply(
 
     is_specific = _is_specific_product_intent(intent_for_clarify, user_text)
 
-    if (not product_candidates) and (not is_specific) and _VAGUE_REGEX.search(user_text or ""):
+    # --- Ask clarifying questions only if the message is *truly* vague (e.g., "idk") ---
+    should_clarify = (
+        not safe_products
+        and not is_specific
+        and len(user_text.strip()) < 25
+        and _VAGUE_REGEX.search(user_text or "")
+    )
+
+    if should_clarify:
         logger.info("[AI][Clarify] Genuinely vague input — sending clarifier.")
         CLARIFY_LINES = [
             "Tell me the lane: skincare, style, pep talk, or full vibe reset?",
@@ -392,9 +400,11 @@ def generate_reply(
         ]
         return random.choice(CLARIFY_LINES)
 
+
     logger.info("[AI][Prompt] System:\n{}\n\nUser:\n{}", system_content, user_content)
 
     # --- Call OpenAI
+    logger.info("[AI][Sending to GPT]\nSystem Prompt:\n{}\n\nUser Message:\n{}", system_content, user_content)
     try:
         resp = CLIENT.chat.completions.create(
             model="gpt-4o-mini",
