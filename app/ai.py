@@ -325,57 +325,57 @@ def generate_reply(
                 f"- {p['name']} (Category: {p['category']}) | {p['url']} | Review: {p['review']}\n"
             )
 
-    # Pull user quiz data if available (separate table)
+        # Pull user quiz data if available
     quiz_profile = ""
     try:
-        if user_id:
-            with db.session() as s:
-                row = s.execute(
-                    sqltext(
-                        """
-                        SELECT profile_json
-                        FROM user_quiz_profiles
-                        WHERE user_id = :uid
-                        ORDER BY created_at DESC
-                        LIMIT 1
-                        """
-                    ),
-                    {"uid": user_id},
-                ).first()
-            if row and row[0]:
-                quiz_profile = (row[0] or "").strip()
+        with db.session() as s:
+            row = s.execute(
+                sqltext("""
+                    SELECT profile_json
+                    FROM user_quiz_profiles
+                    WHERE user_id = :uid
+                    ORDER BY created_at DESC
+                    LIMIT 1
+                """),
+                {"uid": user_id},
+            ).first()
+        if row and row[0]:
+            quiz_profile = (row[0] or "").strip()
     except Exception as e:
         logger.warning("[AI][Quiz] Failed to fetch quiz profile for user_id={}: {}", user_id, e)
+        quiz_profile = ""
 
-    # Build the system prompt
-    system_content = (system_prompt or persona_text).strip()
+    # Build the system prompt (persona + optional quiz profile)
+    system_content = system_prompt.strip() if system_prompt else persona_text
     if quiz_profile:
         system_content += f"\n\nUser Quiz Profile:\n{quiz_profile}"
 
-    # Build user-facing content
+    # Build user-facing content for the model
     user_content = f"""User said: {user_text}
-{context_summary}
-{product_context}
-Your job:
-- If venting/tired/sad → comfort + sass templates, no products.
-- If explicitly asked for products → recommend max 3 with Geniuslink URLs.
-- Product blurbs must use PRODUCT ONE-LINER TEMPLATE BANK.
-- Pitch VIP trial ($0 → $7 → $17) and Prompt Packs organically, never pushy.
-- Always comfort first, sass second, product last.
-- If promoting VIP, always include signup link: https://schizobestie.gumroad.com/l/gexqp
-- If promoting a specific Prompt Pack, always include its exact Gumroad URL based on this lookup:
-  Example: 'Confidence Cleanse' → https://240026861589.gumroad.com/l/ymraq
-- Use the exact name to match the correct link. Never use the generic Gumroad shop link.
-- Never ignore or sidestep user questions. Even if vague or strange, give a thoughtful answer.
-"""
+    {context_summary}{product_context}
+    Your job:
+    - If venting/tired/sad → comfort + sass templates, no products.
+    - If explicitly asked for products → recommend max 3 with Geniuslink URLs.
+    - Product blurbs must use PRODUCT ONE-LINER TEMPLATE BANK.
+    - Pitch VIP trial ($0 → $7 → $17) and Prompt Packs organically, never pushy.
+    - Always comfort first, sass second, product last.
+    - If promoting VIP, always include signup link: https://schizobestie.gumroad.com/l/gexqp
+    - If promoting a specific Prompt Pack, always include its exact Gumroad URL based on this lookup:
+    Example: 'Confidence Cleanse' → https://240026861589.gumroad.com/l/ymrag
+    - Use the exact name to match the correct link. Never use the generic Gumroad shop link.
+    - Never ignore or sidestep user questions. Even if vague or strange, give a thoughtful answer.
+    """
 
     # --- Ask qualifying questions only if the ask is genuinely vague ---
+    import re, random
+
+    # important: no "recommend" here; we only catch truly vague language
     _VAGUE_REGEX = re.compile(
         r"\b(something|anything|idk|need help|what should i|ideas?|suggestions?|looking for)\b",
         re.IGNORECASE,
     )
 
-    # Use our extractor + heuristic to decide if the ask is already specific
+    # Decide if the message is already specific (dupes/alternatives/price/etc.)
     try:
         intent_for_clarify = extract_product_intent(user_text)
     except Exception:
@@ -384,18 +384,20 @@ Your job:
     is_specific = _is_specific_product_intent(intent_for_clarify, user_text)
 
     if (not product_candidates) and (not is_specific) and _VAGUE_REGEX.search(user_text or ""):
-        logger.info("[AI][Clarify] Detected genuinely vague input — asking a qualifier")
-        return (
-            "Quick gut-check: do you want skincare, style, something emotional, or a full vibe shift?\n\n"
-            "Give me the lane and I'll do the rest."
-        )
+        logger.info("[AI][Clarify] Genuinely vague input — sending clarifier.")
+        CLARIFY_LINES = [
+            "Tell me the lane: skincare, style, pep talk, or full vibe reset?",
+            "Product recs, style advice, or an emotional tune-up — what are we doing?",
+            "Pick your flavor: skincare, fashion, feelings, or a plan I can boss you through.",
+        ]
+        return random.choice(CLARIFY_LINES)
 
     logger.info("[AI][Prompt] System:\n{}\n\nUser:\n{}", system_content, user_content)
 
-    # ---- Call the model ----
+    # --- Call OpenAI
     try:
         resp = CLIENT.chat.completions.create(
-            model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+            model="gpt-4o-mini",
             messages=[
                 {"role": "system", "content": system_content},
                 {"role": "user", "content": user_content},
@@ -405,13 +407,18 @@ Your job:
         )
         text_out = (resp.choices[0].message.content or "").strip()
         return text_out
+
     except Exception as e:
         logger.exception("💥 [AI][Generate] OpenAI error: {}", e)
+        import traceback
+        logger.error("⚠️ GPT ERROR: {}", e)
+        traceback.print_exc()
+
         if safe_products:
             p = safe_products[0]
             return f"Here’s your glow-up starter: {p['name']} ({p['category']})\n{p['url']}"
-        return "Babe, I glitched — but I’ll be back with the vibe you deserve 💅"
-
+        else:
+            return "Babe, I glitched — but I’ll be back with the vibe you deserve 💅"
 
 def describe_image(image_url: str) -> str:
     """Use GPT-4o to analyze an image and return a stylish response."""

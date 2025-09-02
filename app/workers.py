@@ -78,10 +78,15 @@ def _finalize_and_send(user_id: int, convo_id: int, text_val: str, *, add_cta: b
       - freshness enforcement
       - optional CTA (only when add_cta=True and no link is present)
     """
-    # Replace the whole function with this
+# workers.py
+import random
+from loguru import logger
+from sqlalchemy import text as sqltext
+from app import db, integrations
+
 def _recent_outbound_texts(convo_id: int, limit: int = 12) -> list[str]:
     """
-    Return recent outbound message texts. We try several likely column names
+    Return recent outbound message texts. Try several likely column names
     to avoid schema drift breaking the worker.
     """
     candidate_cols = ("text", "body", "message", "content")
@@ -98,17 +103,33 @@ def _recent_outbound_texts(convo_id: int, limit: int = 12) -> list[str]:
                     """),
                     {"cid": convo_id, "lim": limit},
                 ).fetchall()
-                # Success if the column exists; return whatever we got (possibly empty)
                 return [r[0] for r in rows]
             except Exception as e:
                 # Undefined column? Try the next candidate.
-                if getattr(e, "orig", None).__class__.__name__ == "UndefinedColumn" or "UndefinedColumn" in str(e):
+                if "UndefinedColumn" in str(e):
                     continue
-                # Any other SQL trouble: log and bail out (don’t crash the job)
                 logger.warning("[Freshness] Failed reading recent texts with column '{}': {}", col, e)
                 return []
     logger.warning("[Freshness] No known message-content column found; skipping freshness.")
     return []
+
+def _finalize_and_send(user_id: int, convo_id: int, reply: str, add_cta: bool = False) -> None:
+    reply = (reply or "").strip()
+    if not reply:
+        logger.warning("[Send] Empty reply; nothing to send.")
+        return
+
+    # Soft dedup: if identical to the last message, nudge instead of dropping.
+    try:
+        last = next(iter(_recent_outbound_texts(convo_id, limit=1)), "")
+        if (last or "").strip() == reply:
+            reply = reply + " " + random.choice(["✨", "💫", "💕", "🌟"])
+            logger.info("[Freshness] Nudged reply to avoid duplicate drop.")
+    except Exception as e:
+        logger.warning("[Freshness] Skipping dedup due to error: {}", e)
+
+    # Actually send via your integration
+    integrations.send_sms(user_id=user_id, convo_id=convo_id, text=reply)
 
 # -------------------- Rename flow -------------------- #
 RENAME_PATTERNS = [
