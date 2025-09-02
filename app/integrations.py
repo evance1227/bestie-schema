@@ -80,6 +80,11 @@ def _phone_from_users(user_id: int) -> Optional[str]:
         return None
 
 
+# Back-compat alias used by existing code paths
+def _get_phone(user_id: int) -> Optional[str]:
+    return _phone_from_users(user_id)
+
+
 def _phone_from_messages(convo_id: int) -> Optional[str]:
     """
     Try to derive a phone from the most recent inbound message.
@@ -175,45 +180,51 @@ def _post_to_leadconnector(phone: str, message: str) -> None:
 
 # ---------- public API (called by worker) ----------
 
-def send_sms(*, user_id: int, convo_id: int, text: str) -> None:
-    """GHL-only sender used by workers._finalize_and_send(...)."""
-    msg = _strip_bestie_prefix((text or "").strip())
-    if not msg:
-        logger.warning("[Integrations][Send] Skipping empty message (user_id=%s convo_id=%s)", user_id, convo_id)
-        return
+def send_sms_reply(user_id: int, text: str):
+    """
+    Send outbound SMS via LeadConnector webhook.
+    Posts to the configured GHL webhook with {phone, message}.
+    Returns a small dict with ok/status so callers can log intelligently.
+    """
+    # normalize & defensively strip accidental "Bestie:" prefixes (we do NOT add it)
+    msg = (text or "").strip()
+    if msg.lower().startswith("bestie:"):
+        msg = msg.split(":", 1)[-1].strip()
 
-    phone = _resolve_phone(user_id, convo_id)
-    logger.info("[Integrations][Send] Resolved phone user_id=%s convo_id=%s -> %s", user_id, convo_id, phone)
+    logger.info("[Integrations][Send] 🚦 Preparing to send SMS: user_id={} text='{}'", user_id, msg)
+
+    phone = _get_phone(user_id)
     if not phone:
-        logger.error(
-            "[Integrations][Send] ❌ No phone found; cannot send (user_id=%s convo_id=%s)",
-            user_id,
-            convo_id,
-        )
-        return
+        logger.error("[Integrations][Send] ❌ No phone found for user_id={}, aborting send", user_id)
+        return {"ok": False, "reason": "no_phone"}
+
+    if not LC_URL:
+        logger.error("[Integrations][Send] ❌ No GHL_OUTBOUND_WEBHOOK_URL configured, cannot send message")
+        return {"ok": False, "reason": "no_webhook"}
+
+    payload = {"phone": phone, "message": msg}
+    headers = {"Content-Type": "application/json"}
+
+    logger.info("[Integrations][Send] 📤 Sending to LeadConnector: URL={} | Payload={}", LC_URL, payload)
 
     try:
-        _post_to_leadconnector(phone, msg)
-    except Exception:
+        with httpx.Client(timeout=8) as client:
+            r = client.post(LC_URL, json=payload, headers=headers)
+        if r.status_code >= 400:
+            logger.error("[Integrations][Send] ❌ Failed! status={} body={}", r.status_code, r.text)
+            return {"ok": False, "status": r.status_code, "body": r.text}
+        logger.success("[Integrations][Send] ✅ Success for phone={} body={}", phone, r.text)
+        return {"ok": True, "status": r.status_code, "body": r.text}
+    except Exception as e:
         logger.exception("💥 [Integrations][Send] Exception while posting to LeadConnector")
+        return {"ok": False, "exception": str(e)}
 
 
-def send_sms_reply(user_id: int, text: str) -> None:
+# --- Compatibility adapter for legacy worker calls ---
+def send_sms(user_id: int, convo_id: int, text: str):
     """
-    Back-compat for any legacy code still calling send_sms_reply(user_id, text).
-    Uses users.phone only (no convo_id available here).
+    Adapter to keep existing worker code working.
+    We ignore convo_id here (GHL send only needs phone + message).
     """
-    msg = _strip_bestie_prefix((text or "").strip())
-    if not msg:
-        logger.warning("[Integrations][SendLegacy] Empty text for user_id=%s", user_id)
-        return
-
-    phone = _phone_from_users(user_id)
-    if not phone:
-        logger.error("[Integrations][SendLegacy] ❌ No phone found for user_id=%s", user_id)
-        return
-
-    try:
-        _post_to_leadconnector(_normalize_phone(phone), msg)
-    except Exception:
-        logger.exception("💥 [Integrations][SendLegacy] Exception posting to LeadConnector")
+    logger.warning("[Integrations][Compat] send_sms() called; forwarding to send_sms_reply()")
+    return send_sms_reply(user_id=user_id, text=text)
