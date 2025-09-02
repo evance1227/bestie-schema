@@ -1,119 +1,63 @@
 # app/workers.py
 import os
 import multiprocessing
-
-if __name__ == "__main__":
-    multiprocessing.set_start_method("spawn", force=True)
-
+import re
+import urllib.parse
+import hashlib
+import uuid
+import random
 from datetime import datetime, timezone, timedelta
 from difflib import SequenceMatcher
-from loguru import logger
 from typing import Optional, List, Dict
-import re, uuid, random
+
+from loguru import logger
 from sqlalchemy import text as sqltext
 
-import base64
-import requests
+import base64  # (ok if unused for now)
+import requests  # (ok if unused for now)
+import redis     # already present as an RQ dep
 
 from app.product_search import build_product_candidates, prefer_amazon_first
 from app.linkwrap import rewrite_affiliate_links_in_text
 from app import ai_intent, product_search
 from app import db, models, ai, integrations
 
-import os, re, hashlib
-import redis  # already present as an RQ dep
 
+# ---------------------------------------------------------------------------
+# Multiprocessing – ensure RQ workers don't fork with "fork" on some hosts
+# ---------------------------------------------------------------------------
+if __name__ == "__main__":
+    multiprocessing.set_start_method("spawn", force=True)
+
+
+# ---------------------------------------------------------------------------
+# Environment / globals
+# ---------------------------------------------------------------------------
 REDIS_URL = os.getenv("REDIS_URL", "")
 _rds = redis.from_url(REDIS_URL, decode_responses=True, ssl=True) if REDIS_URL else None
 
+# Geniuslink configuration
 GENIUSLINK_DOMAIN = os.getenv("GENIUSLINK_DOMAIN", "").strip()
+GENIUSLINK_WRAP = os.getenv("GENIUSLINK_WRAP", "").strip()  # e.g. https://geni.us/redirect?url={url}
 GL_REWRITE = os.getenv("GL_REWRITE", "1").lower() not in ("0", "false", "")
 
+# Amazon URL detector
+_AMZN_RE = re.compile(r"https?://(?:www\.)?amazon\.[^\s)\]]+", re.I)
+
+
+# ---------------------------------------------------------------------------
+# Helpers: Redis de-dup key, recent outbound fetch, link hygiene
+# ---------------------------------------------------------------------------
 def _send_dedupe_guard(conversation_id: int, text: str, ttl: int = 120) -> bool:
-    """Return True if we should send; False if an identical message was sent recently."""
+    """
+    Return True if we should send; False if an identical message was sent recently.
+    Uses Redis SET NX with a short TTL keyed by convo + text hash.
+    """
     if not _rds:
         return True
     key = f"dedup:out:{conversation_id}:{hashlib.sha1(text.encode('utf-8')).hexdigest()}"
     return bool(_rds.set(key, "1", ex=ttl, nx=True))
 
-def _rewrite_links_to_genius(msg: str) -> str:
-    """Rewrite Amazon links to Geniuslink shortlinks (keeps everything else intact)."""
-    if not (GL_REWRITE and GENIUSLINK_DOMAIN):
-        return msg
-    host = GENIUSLINK_DOMAIN.rstrip("/")
-
-    def repl(m):
-        asin = m.group(1)
-        return f"https://{host}/{asin}"
-
-    # …/dp/ASIN[…]
-    msg = re.sub(r"https?://(?:www\.)?amazon\.[^/\s]+/[^)\s]*?/dp/([A-Z0-9]{10})", repl, msg)
-    msg = re.sub(r"https?://(?:www\.)?amazon\.[^/\s]+/dp/([A-Z0-9]{10})", repl, msg)
-    return msg
-
-# ---- SMS product list renderer ----
-def render_products_for_sms(products, limit=3):
-    lines = []
-    for idx, p in enumerate(products[:limit], start=1):
-        name = (p.get("title") or "").strip()
-        if not name:
-            name = p.get("merchant") or "Product"
-        url = p["url"]
-        lines.append(f"{idx}. {name}\n   {url}")
-    return "\n\n".join(lines)
-
-# -------------------- Core: store + send -------------------- #
-def _store_and_send(user_id: int, convo_id: int, text_val: str):
-    """
-    Insert outbound message in DB and send via LeadConnector.
-    Automatically splits long messages into parts with [1/2], [2/2], etc.
-    """
-    logger.info("[Worker][Checkpoint] Finished _store_and_send")
-    max_len = 450  # GHL safe limit (slightly under 480 to allow for prefix + formatting)
-    parts: list[str] = []
-    text_val = (text_val or "").strip()
-
-    while len(text_val) > max_len:
-        split_point = text_val[:max_len].rfind(" ")
-        if split_point == -1:
-            split_point = max_len
-        parts.append(text_val[:split_point].strip())
-        text_val = text_val[split_point:].strip()
-    if text_val:
-        parts.append(text_val)
-
-    total_parts = len(parts)
-    for idx, part in enumerate(parts, 1):
-        prefix = f"[{idx}/{total_parts}] " if total_parts > 1 else ""
-        full_text = prefix + part
-        message_id = str(uuid.uuid4())
-        try:
-            with db.session() as s:
-                models.insert_message(s, convo_id, "out", message_id, full_text)
-                s.commit()
-            logger.info("[Worker][DB] 💾 Outbound stored: convo_id={} user_id={} msg_id={}", convo_id, user_id, message_id)
-        except Exception:
-            logger.exception("❌ [Worker][DB] Failed to insert outbound (still sending webhook)")
-
-        try:
-            logger.info("[Worker][Send] 📤 Sending SMS to user_id={} text='{}'", user_id, full_text)
-            integrations.send_sms_reply(user_id, full_text)
-            logger.success("[Worker][Send] ✅ SMS send attempted for user_id={}", user_id)
-        except Exception:
-            logger.exception("💥 [Worker][Send] Exception while calling send_sms_reply")
-
-def _finalize_and_send(user_id: int, convo_id: int, text_val: str, *, add_cta: bool = False):
-    """
-    One place to apply:
-      - affiliate link rewrite
-      - freshness enforcement
-      - optional CTA (only when add_cta=True and no link is present)
-    """
-# workers.py
-import random
-from loguru import logger
-from sqlalchemy import text as sqltext
-from app import db, integrations
 
 def _recent_outbound_texts(convo_id: int, limit: int = 12) -> list[str]:
     """
@@ -145,19 +89,150 @@ def _recent_outbound_texts(convo_id: int, limit: int = 12) -> list[str]:
     return []
 
 
-def _finalize_and_send(user_id: int, convo_id: int, reply: str, add_cta: bool = False, force_send: bool = True) -> None:
+def _amazon_search_url(q: str) -> str:
+    """Return a safe Amazon search URL for the given product name."""
+    return f"https://www.amazon.com/s?k={urllib.parse.quote_plus(q.strip())}"
+
+
+def _ensure_amazon_links(text: str) -> str:
     """
-    Final formatting + safe send to SMS. When force_send=True, we skip hard dedup
-    so messages never get silently dropped.
+    Replace hallucinated product links with a safe Amazon *search* link using the
+    product name in lines like: '1. **Product Name**'.
+    Also removes any existing markdown link targets to avoid sending /dp/... that 404.
+    """
+    if not text:
+        return text
+
+    # Strip existing markdown link targets: '](http...)' -> ']'
+    text = re.sub(r"\]\(https?://[^\)]+\)", "]", text)
+
+    # After each product header line inject a clean Amazon search link
+    def _inject(m):
+        name = m.group(1).strip()
+        return f"{m.group(0)}\n   [Amazon link]({_amazon_search_url(name)})"
+
+    return re.sub(r"(?m)^\s*\d+\.\s+\*\*(.+?)\*\*.*$", _inject, text)
+
+
+def _rewrite_links_to_genius(text: str) -> str:
+    """
+    Wrap Amazon URLs through Geniuslink.
+
+    Priority:
+      1) If GENIUSLINK_WRAP is set (e.g., https://geni.us/redirect?url={url}),
+         wrap each Amazon URL with that template.
+      2) Else, if GL_REWRITE and GENIUSLINK_DOMAIN are set, convert /dp/ASIN →
+         https://{GENIUSLINK_DOMAIN}/{ASIN}
+    """
+    # Wrapper style: https://geni.us/redirect?url={url}
+    if GENIUSLINK_WRAP:
+        def _wrap(url: str) -> str:
+            return GENIUSLINK_WRAP.format(url=urllib.parse.quote(url, safe=""))
+        # raw URLs
+        text = re.sub(_AMZN_RE, lambda m: _wrap(m.group(0)), text)
+        # markdown [label](url)
+        def _md_repl(m):
+            label, url = m.group(1), m.group(2)
+            if _AMZN_RE.match(url):
+                return f"[{label}]({_wrap(url)})"
+            return m.group(0)
+        return re.sub(r"\[([^\]]+)\]\((https?://[^\)]+)\)", _md_repl, text)
+
+    # Short domain style: https://domain/ASIN
+    if GL_REWRITE and GENIUSLINK_DOMAIN:
+        host = GENIUSLINK_DOMAIN.rstrip("/")
+
+        def repl(m):
+            url = m.group(0)
+            m_asin = re.search(r"/dp/([A-Z0-9]{10})", url, re.I)
+            return f"https://{host}/{m_asin.group(1)}" if m_asin else url
+
+        return re.sub(_AMZN_RE, repl, text)
+
+    return text
+
+
+# ---------------------------------------------------------------------------
+# SMS product list renderer
+# ---------------------------------------------------------------------------
+def render_products_for_sms(products, limit: int = 3) -> str:
+    """
+    Render a compact, SMS-friendly list. Bold product name lines so our
+    Amazon-search injection can add safe links when needed.
+    """
+    lines: List[str] = []
+    for idx, p in enumerate(products[:limit], start=1):
+        name = (p.get("title") or "").strip() or (p.get("merchant") or "Product")
+        url = p.get("url", "").strip()
+        if url:
+            lines.append(f"{idx}. **{name}**\n   {url}")
+        else:
+            lines.append(f"{idx}. **{name}**")
+    return "\n\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Core: store + send (splits long messages; inserts outbound row; calls integration)
+# ---------------------------------------------------------------------------
+def _store_and_send(user_id: int, convo_id: int, text_val: str) -> None:
+    """
+    Insert outbound message in DB and send via LeadConnector.
+    Automatically splits long messages into parts with [1/2], [2/2], etc.
+    """
+    max_len = 450  # slightly under typical 480 limits to allow for prefixes
+    parts: List[str] = []
+    text_val = (text_val or "").strip()
+
+    # Split on spaces to avoid cutting words
+    while len(text_val) > max_len:
+        split_point = text_val[:max_len].rfind(" ")
+        if split_point == -1:
+            split_point = max_len
+        parts.append(text_val[:split_point].strip())
+        text_val = text_val[split_point:].strip()
+    if text_val:
+        parts.append(text_val)
+
+    total_parts = len(parts)
+    for idx, part in enumerate(parts, 1):
+        prefix = f"[{idx}/{total_parts}] " if total_parts > 1 else ""
+        full_text = prefix + part
+        message_id = str(uuid.uuid4())
+        try:
+            with db.session() as s:
+                models.insert_message(s, convo_id, "out", message_id, full_text)
+                s.commit()
+            logger.info("[Worker][DB] 💾 Outbound stored: convo_id={} user_id={} msg_id={}", convo_id, user_id, message_id)
+        except Exception:
+            logger.exception("❌ [Worker][DB] Failed to insert outbound (still attempting send)")
+
+        try:
+            logger.info("[Worker][Send] 📤 Sending SMS to user_id={} text='{}'", user_id, full_text)
+            integrations.send_sms_reply(user_id, full_text)
+            logger.success("[Worker][Send] ✅ SMS send attempted for user_id={}", user_id)
+        except Exception:
+            logger.exception("💥 [Worker][Send] Exception while calling send_sms_reply")
+
+
+# ---------------------------------------------------------------------------
+# Finalize + send (single path; handles freshness, links, de-dup, CTA)
+# ---------------------------------------------------------------------------
+def _finalize_and_send(user_id: int, convo_id: int, reply: str, *, add_cta: bool = False, force_send: bool = False) -> None:
+    """
+    Final formatting + safe send to SMS (single send path).
+    - Optional CTA
+    - Soft nudge if identical to last reply
+    - Amazon link hygiene + Geniuslink wrap (+ optional affiliate rewrite)
+    - Redis de-dupe guard (unless force_send=True)
+    - Store + send once
     """
     reply = (reply or "").strip()
     if not reply:
         logger.warning("[Worker][Send] Empty reply; nothing to send.")
         return
 
-    # Optional CTA toggleable via env
+    # Optional CTA, gated by env
     try:
-        import os  # local import to avoid top-of-file churn
         if add_cta and os.getenv("BESTIE_APPEND_CTA") == "1":
             reply += (
                 "\n\nBabe, your VIP is open: first month FREE, $7 your second, then $17/mo. "
@@ -166,79 +241,47 @@ def _finalize_and_send(user_id: int, convo_id: int, reply: str, add_cta: bool = 
     except Exception:
         pass
 
-    # Soft de-dup only if NOT forcing send
-    if not force_send:
-        try:
-            last = next(iter(_recent_outbound_texts(convo_id, limit=1)), "")
-            if (last or "").strip() == reply:
-                reply = reply + " ✨"
-                logger.info("[Freshness] Nudged reply to avoid duplicate drop.")
-        except Exception as e:
-            logger.warning("[Freshness] Skipping dedup due to error: {}", e)
-
-    logger.info("[Worker][Send] → user_id={} convo_id={} chars={} preview={!r}", user_id, convo_id, len(reply), reply[:200])
-
-    # Send with loud success/failure logging
-    try:
-        # 1) enforce Geniuslink, 2) suppress dupes, 3) send
-        final_text = _rewrite_links_to_genius(reply)
-
-        if not force_send and not _send_dedupe_guard(convo_id, final_text):
-            logger.warning("[Dedup] Skipping duplicate outbound for convo_id=%s", convo_id)
-            return
-        # === Monetization: rewrite outbound links (Geniuslink) ===
-        try:
-            from app.monetization import rewrite_affiliate_links as _rewrite_aff
-            _rewritten = _rewrite_aff(reply)
-            if _rewritten:
-                reply = _rewritten
-            logger.info("[Monetization] Affiliate links rewritten.")
-        except Exception as e:
-            logger.warning("[Monetization] rewrite_affiliate_links unavailable or failed: {}", e)
-
-            resp = integrations.send_sms(user_id=user_id, convo_id=convo_id, text=final_text)
-
-
-        # Try to surface response metadata if available
-        status = None
-        sid = None
-        try:
-            status = getattr(resp, "status", None) or getattr(resp, "status_code", None)
-        except Exception:
-            pass
-        try:
-            sid = getattr(resp, "sid", None)
-        except Exception:
-            pass
-
-        if status:
-            logger.info("[Worker][Send][OK] status={} sid={}", status, sid)
-        else:
-            logger.info("[Worker][Send][OK] (no response metadata)")
-    except Exception as e:
-        logger.exception("[Worker][Send][FAIL] {}", e)
-        # Re-raise so the job is marked failed (visible in logs/dash)
-        raise
-
-    # Soft dedup: if identical to the last message, nudge instead of dropping.
+    # Soft nudge if identical to last outbound
     try:
         last = next(iter(_recent_outbound_texts(convo_id, limit=1)), "")
         if (last or "").strip() == reply:
             reply = reply + " " + random.choice(["✨", "💫", "💕", "🌟"])
             logger.info("[Freshness] Nudged reply to avoid duplicate drop.")
     except Exception as e:
-        logger.warning("[Freshness] Skipping dedup due to error: {}", e)
+        logger.warning("[Freshness] Skipping nudge due to error: {}", e)
 
-    # Actually send via your integration
-    integrations.send_sms(user_id=user_id, convo_id=convo_id, text=reply)
+    # Link hygiene (1. ensure/repair, 2. Geniuslink, 3. optional site-wide affiliate rewrite)
+    reply = _ensure_amazon_links(reply)
+    reply = _rewrite_links_to_genius(reply)
+    try:
+        aff = rewrite_affiliate_links_in_text(reply)
+        if aff:
+            reply = aff
+    except Exception as e:
+        # It's fine if linkwrap isn't configured.
+        logger.debug("[Affiliate] rewrite_affiliate_links_in_text skipped: {}", e)
 
-# -------------------- Rename flow -------------------- #
+    # Redis de-dupe guard
+    if not force_send and not _send_dedupe_guard(convo_id, reply):
+        logger.warning("[Dedup] Skipping duplicate outbound for convo_id={}", convo_id)
+        return
+
+    logger.info("[Worker][Send] → user_id={} convo_id={} chars={} preview={!r}", user_id, convo_id, len(reply), reply[:200])
+
+    # Single send/storage
+    _store_and_send(user_id, convo_id, reply)
+
+
+# ---------------------------------------------------------------------------
+# Rename flow helpers
+# ---------------------------------------------------------------------------
 RENAME_PATTERNS = [
     r"\bname\s+you\s+are\s+['\"]?([A-Za-z0-9\- _]{2,32})['\"]?",
     r"\bi(?:'|)ll\s+call\s+you\s+['\"]?([A-Za-z0-9\- _]{2,32})['\"]?",
     r"\byour\s+name\s+is\s+['\"]?([A-Za-z0-9\- _]{2,32})['\"]?",
     r"\bfrom\s+now\s+on\s+you\s+are\s+['\"]?([A-Za-z0-9\- _]{2,32})['\"]?",
 ]
+
 
 def try_handle_bestie_rename(user_id: int, convo_id: int, text_val: str) -> Optional[str]:
     """
@@ -263,64 +306,61 @@ def try_handle_bestie_rename(user_id: int, convo_id: int, text_val: str) -> Opti
         return ai.witty_rename_response(new_name)
     return None
 
-_URL_RE = re.compile(r'(https?://\S+)')
 
-# --- anti-repetition helpers ---
+# ---------------------------------------------------------------------------
+# Freshness / repetition controls for free-form chat
+# ---------------------------------------------------------------------------
+_URL_RE = re.compile(r"(https?://\S+)")
+
 BANNED_STOCK_PHRASES = [
     "I’ll cry a little… then wait like a glam houseplant",
     "You're already on the VIP list, babe. That means I remember everything.",
-    "P.S. Your Bestie VIP access is still active — I’ve got receipts, rituals, and rage texts saved."
+    "P.S. Your Bestie VIP access is still active — I’ve got receipts, rituals, and rage texts saved.",
 ]
 
-def _recent_outbound_texts(convo_id: int, limit: int = 12) -> list[str]:
-    with db.session() as s:
-        rows = s.execute(
-            sqltext("""
-                SELECT text
-                FROM messages
-                WHERE conversation_id = :cid AND direction = 'out'
-                ORDER BY created_at DESC
-                LIMIT :lim
-            """),
-            {"cid": convo_id, "lim": limit},
-        ).fetchall()
-    return [r[0] for r in rows]
 
 def _too_similar(a: str, b: str, thresh: float = 0.85) -> bool:
     return SequenceMatcher(None, a, b).ratio() >= thresh
+
 
 def _enforce_freshness(reply: str, recent_texts: list[str]) -> str:
     """If the reply repeats recent phrasing, rewrite with new wording."""
     if any(p.lower() in reply.lower() for p in BANNED_STOCK_PHRASES) or \
        any(_too_similar(reply, prev) for prev in recent_texts):
         try:
-            # ask the model to rephrase with totally different wording
+            # Ask the model to rephrase with totally different wording
             return ai.rewrite_different(
                 reply,
-                avoid="\n".join(recent_texts + BANNED_STOCK_PHRASES)
+                avoid="\n".join(recent_texts + BANNED_STOCK_PHRASES),
             )
         except Exception:
             logger.warning("[Freshness] rewrite_different failed; sending original")
     return reply
 
+
 def _pick_unique_cta(recent_texts: list[str]) -> str:
     cta_pool = [
         "Want me to tailor this to your routine? Give me one detail about your skin and I’ll dial it in.",
         "If you want a deeper push, say the word and I’ll build you a tiny game plan.",
-        "If you’re stuck, describe the outcome you want and I’ll map the next 3 moves."
+        "If you’re stuck, describe the outcome you want and I’ll map the next 3 moves.",
     ]
     for cta in cta_pool:
         if all(cta not in r for r in recent_texts):
             return cta
     return ""  # nothing fresh left; skip
 
+
+# ---------------------------------------------------------------------------
+# Main worker job
+# ---------------------------------------------------------------------------
 def generate_reply_job(convo_id: int, user_id: int, text_val: str) -> None:
     """
     Main worker entrypoint:
     - Checks rename flow
     - Sends onboarding if it's the user's first message
-    - Runs Bestie AI
-    - Saves outbound message + sends via LeadConnector
+    - Tries product intent/search first
+    - Falls back to Bestie AI
+    - Finalizes (dedupe + links) and sends once
     """
     logger.info("[Worker][Start] 🚀 Job started: convo_id={} user_id={} text={}", convo_id, user_id, text_val)
 
@@ -437,9 +477,8 @@ Avoid repeating wording you’ve used in this conversation. Vary phrasing.
             context=context,
         )
         logger.info("[Worker][AI] 🤖 AI reply generated: {}", reply)
-        _finalize_and_send(user_id, convo_id, reply, add_cta=True, force_send=True)
 
-        # optional tone rewrite
+        # Optional tone rewrite
         try:
             rewritten = ai.rewrite_if_cringe(reply)
             if rewritten and rewritten != reply:
@@ -455,18 +494,25 @@ Avoid repeating wording you’ve used in this conversation. Vary phrasing.
     except Exception as e:
         logger.exception("💥 [Worker][Job] Unhandled exception in generate_reply_job: {}", e)
         _finalize_and_send(
-            user_id, convo_id,
+            user_id,
+            convo_id,
             "Babe, I glitched — but I’ll be back to drag you properly 💅",
-            add_cta=False
+            add_cta=False,
+            force_send=True,  # ensure the fallback always goes out once
         )
 
-# -------------------- Debug job -------------------- #
+
+# ---------------------------------------------------------------------------
+# Debug job
+# ---------------------------------------------------------------------------
 def debug_job(convo_id: int, user_id: int, text_val: str):
-                logger.info("[Worker][Debug] 🔋 Debug job: convo_id={} user_id={} text={}", convo_id, user_id, text_val)
-                return f"Debug reply: got text='{text_val}'"
+    logger.info("[Worker][Debug] 🔋 Debug job: convo_id={} user_id={} text={}", convo_id, user_id, text_val)
+    return f"Debug reply: got text='{text_val}'"
 
 
-# -------------------- Re-engagement job -------------------- #
+# ---------------------------------------------------------------------------
+# Re-engagement job (48h quiet; once per 24h)
+# ---------------------------------------------------------------------------
 def send_reengagement_job():
     """
     Query DB for inactive users (>48h silence) and send engaging nudges.
@@ -498,7 +544,7 @@ def send_reengagement_job():
                 "Tell me one thing that lit you up this week. I don’t care how small — I want the tea.",
                 "I miss our chaos dumps. What’s one thing that’s been driving you nuts?",
                 "Alright babe, you get one chance to flex: tell me a win from this week.",
-                "I know you’ve got a story. Spill one ridiculous detail from the last 48 hours."
+                "I know you’ve got a story. Spill one ridiculous detail from the last 48 hours.",
             ]
 
             for convo_id, user_id, phone, last_message_at in rows:
