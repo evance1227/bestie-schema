@@ -3,6 +3,44 @@ from typing import List, Dict, Optional
 from urllib.parse import urlparse
 from loguru import logger
 
+# app/product_search.py
+from urllib.parse import quote_plus
+
+def _amz_search_link(name: str) -> str:
+    # search links don’t 404 and still monetize via Geniuslink rewrite if you want
+    q = quote_plus(name)
+    return f"https://www.amazon.com/s?k={q}"
+
+def fetch_products(query: str, category: str | None = None, constraints: dict | None = None):
+    q = (query or "").lower()
+    out = []
+
+    # Curated fallback for: IS Clinical Youth Intensive Cream
+    if "youth intensive cream" in q or "is clinical youth" in q:
+        out = [
+            {
+                "title": "L'Oréal Revitalift Triple Power Anti-Aging Moisturizer",
+                "reason": "Retinol + Vitamin C + HA combo for firming/plumping; rich texture; usually <$35.",
+                "url": _amz_search_link("L'Oreal Revitalift Triple Power Anti-Aging Moisturizer"),
+            },
+            {
+                "title": "Olay Regenerist Micro-Sculpting Cream (Fragrance-Free)",
+                "reason": "Peptides + niacinamide + HA for bounce and barrier support; typically $25–35.",
+                "url": _amz_search_link("Olay Regenerist Micro-Sculpting Cream fragrance free"),
+            },
+            {
+                "title": "RoC Retinol Correxion Max Daily Hydration Cream",
+                "reason": "Retinol for smoothing + glycerin for cushion; commonly <$35.",
+                "url": _amz_search_link("RoC Retinol Correxion Max Daily Hydration Cream"),
+            },
+        ]
+
+    return out
+
+def build_product_candidates(query: str, category: str | None = None, constraints: dict | None = None):
+    # Pass-through to keep your worker code unchanged
+    return fetch_products(query, category, constraints)
+
 ############################################################
 # Legacy hook (optional): if you already had a real search
 # implemented, keep/replace this function with your own.

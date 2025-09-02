@@ -20,6 +20,37 @@ from app.linkwrap import rewrite_affiliate_links_in_text
 from app import ai_intent, product_search
 from app import db, models, ai, integrations
 
+import os, re, hashlib
+import redis  # already present as an RQ dep
+
+REDIS_URL = os.getenv("REDIS_URL", "")
+_rds = redis.from_url(REDIS_URL, decode_responses=True, ssl=True) if REDIS_URL else None
+
+GENIUSLINK_DOMAIN = os.getenv("GENIUSLINK_DOMAIN", "").strip()
+GL_REWRITE = os.getenv("GL_REWRITE", "1").lower() not in ("0", "false", "")
+
+def _send_dedupe_guard(conversation_id: int, text: str, ttl: int = 120) -> bool:
+    """Return True if we should send; False if an identical message was sent recently."""
+    if not _rds:
+        return True
+    key = f"dedup:out:{conversation_id}:{hashlib.sha1(text.encode('utf-8')).hexdigest()}"
+    return bool(_rds.set(key, "1", ex=ttl, nx=True))
+
+def _rewrite_links_to_genius(msg: str) -> str:
+    """Rewrite Amazon links to Geniuslink shortlinks (keeps everything else intact)."""
+    if not (GL_REWRITE and GENIUSLINK_DOMAIN):
+        return msg
+    host = GENIUSLINK_DOMAIN.rstrip("/")
+
+    def repl(m):
+        asin = m.group(1)
+        return f"https://{host}/{asin}"
+
+    # …/dp/ASIN[…]
+    msg = re.sub(r"https?://(?:www\.)?amazon\.[^/\s]+/[^)\s]*?/dp/([A-Z0-9]{10})", repl, msg)
+    msg = re.sub(r"https?://(?:www\.)?amazon\.[^/\s]+/dp/([A-Z0-9]{10})", repl, msg)
+    return msg
+
 # ---- SMS product list renderer ----
 def render_products_for_sms(products, limit=3):
     lines = []
@@ -149,7 +180,15 @@ def _finalize_and_send(user_id: int, convo_id: int, reply: str, add_cta: bool = 
 
     # Send with loud success/failure logging
     try:
-        resp = integrations.send_sms(user_id=user_id, convo_id=convo_id, text=reply)
+        # 1) enforce Geniuslink, 2) suppress dupes, 3) send
+        final_text = _rewrite_links_to_genius(reply)
+
+        if not force_send and not _send_dedupe_guard(convo_id, final_text):
+            logger.warning("[Dedup] Skipping duplicate outbound for convo_id=%s", convo_id)
+            return
+
+        resp = integrations.send_sms(user_id=user_id, convo_id=convo_id, text=final_text)
+
 
         # Try to surface response metadata if available
         status = None
@@ -228,7 +267,7 @@ def _recent_outbound_texts(convo_id: int, limit: int = 12) -> list[str]:
     with db.session() as s:
         rows = s.execute(
             sqltext("""
-                SELECT body
+                SELECT text
                 FROM messages
                 WHERE conversation_id = :cid AND direction = 'out'
                 ORDER BY created_at DESC
