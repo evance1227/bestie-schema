@@ -86,8 +86,8 @@ from app import db, integrations
 
 def _recent_outbound_texts(convo_id: int, limit: int = 12) -> list[str]:
     """
-    Return recent outbound message texts. Try several likely column names
-    to avoid schema drift breaking the worker.
+    Return recent outbound message texts. Tries several column names to avoid
+    schema mismatches (text/body/message/content).
     """
     candidate_cols = ("text", "body", "message", "content")
     with db.session() as s:
@@ -105,7 +105,7 @@ def _recent_outbound_texts(convo_id: int, limit: int = 12) -> list[str]:
                 ).fetchall()
                 return [r[0] for r in rows]
             except Exception as e:
-                # Undefined column? Try the next candidate.
+                # If the column doesn't exist, try the next candidate.
                 if "UndefinedColumn" in str(e):
                     continue
                 logger.warning("[Freshness] Failed reading recent texts with column '{}': {}", col, e)
@@ -113,11 +113,64 @@ def _recent_outbound_texts(convo_id: int, limit: int = 12) -> list[str]:
     logger.warning("[Freshness] No known message-content column found; skipping freshness.")
     return []
 
-def _finalize_and_send(user_id: int, convo_id: int, reply: str, add_cta: bool = False) -> None:
+
+def _finalize_and_send(user_id: int, convo_id: int, reply: str, add_cta: bool = False, force_send: bool = True) -> None:
+    """
+    Final formatting + safe send to SMS. When force_send=True, we skip hard dedup
+    so messages never get silently dropped.
+    """
     reply = (reply or "").strip()
     if not reply:
-        logger.warning("[Send] Empty reply; nothing to send.")
+        logger.warning("[Worker][Send] Empty reply; nothing to send.")
         return
+
+    # Optional CTA toggleable via env
+    try:
+        import os  # local import to avoid top-of-file churn
+        if add_cta and os.getenv("BESTIE_APPEND_CTA") == "1":
+            reply += (
+                "\n\nBabe, your VIP is open: first month FREE, $7 your second, then $17/mo. "
+                "Unlimited texts. https://schizobestie.gumroad.com/l/gexqp"
+            )
+    except Exception:
+        pass
+
+    # Soft de-dup only if NOT forcing send
+    if not force_send:
+        try:
+            last = next(iter(_recent_outbound_texts(convo_id, limit=1)), "")
+            if (last or "").strip() == reply:
+                reply = reply + " ✨"
+                logger.info("[Freshness] Nudged reply to avoid duplicate drop.")
+        except Exception as e:
+            logger.warning("[Freshness] Skipping dedup due to error: {}", e)
+
+    logger.info("[Worker][Send] → user_id={} convo_id={} chars={} preview={!r}", user_id, convo_id, len(reply), reply[:200])
+
+    # Send with loud success/failure logging
+    try:
+        resp = integrations.send_sms(user_id=user_id, convo_id=convo_id, text=reply)
+
+        # Try to surface response metadata if available
+        status = None
+        sid = None
+        try:
+            status = getattr(resp, "status", None) or getattr(resp, "status_code", None)
+        except Exception:
+            pass
+        try:
+            sid = getattr(resp, "sid", None)
+        except Exception:
+            pass
+
+        if status:
+            logger.info("[Worker][Send][OK] status={} sid={}", status, sid)
+        else:
+            logger.info("[Worker][Send][OK] (no response metadata)")
+    except Exception as e:
+        logger.exception("[Worker][Send][FAIL] {}", e)
+        # Re-raise so the job is marked failed (visible in logs/dash)
+        raise
 
     # Soft dedup: if identical to the last message, nudge instead of dropping.
     try:
@@ -336,6 +389,7 @@ Avoid repeating wording you’ve used in this conversation. Vary phrasing.
             context=context,
         )
         logger.info("[Worker][AI] 🤖 AI reply generated: {}", reply)
+        _finalize_and_send(user_id, convo_id, reply, add_cta=True, force_send=True)
 
         # optional tone rewrite
         try:
