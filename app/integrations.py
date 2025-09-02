@@ -1,64 +1,219 @@
 # app/integrations.py
 
-import os, httpx
+import os
+import re
+import httpx
+from typing import Optional
 from loguru import logger
 from app import db
 from sqlalchemy import text
 
-# Default to your provided GHL webhook, can be overridden in .env
+# Default to your provided GHL webhook; can be overridden via env
 LC_URL = os.getenv(
     "GHL_OUTBOUND_WEBHOOK_URL",
-    "https://services.leadconnectorhq.com/hooks/oQvU5iYAEPQwj7sQq3h0/webhook-trigger/3f7b89d3-afa3-4657-844f-eb5cd25eb3e4"
+    "https://services.leadconnectorhq.com/hooks/oQvU5iYAEPQwj7sQq3h0/webhook-trigger/3f7b89d3-afa3-4657-844f-eb5cd25eb3e4",
 ).strip()
 
+__all__ = ["send_sms", "send_sms_reply"]
 
-def _get_phone(user_id: int) -> str:
-    """Look up phone number for given user_id from DB."""
+
+# ---------- helpers ----------
+
+def _col_exists(table: str, col: str) -> bool:
     try:
         with db.session() as s:
             row = s.execute(
-                text("select phone from users where id=:uid"),
-                {"uid": user_id}
+                text(
+                    """
+                    SELECT 1
+                      FROM information_schema.columns
+                     WHERE table_name = :t AND column_name = :c
+                     LIMIT 1
+                    """
+                ),
+                {"t": table, "c": col},
             ).first()
-            phone = row[0] if row and row[0] else ""
-            logger.info("[Integrations][Lookup] 📞 user_id={} -> phone={}", user_id, phone)
-            return phone
-    except Exception as e:
-        logger.exception("💥 [Integrations][Lookup] Exception looking up phone for user_id={}", user_id)
+        return bool(row)
+    except Exception:
+        logger.exception("[Integrations] Column existence check failed for %s.%s", table, col)
+        return False
+
+
+def _normalize_phone(raw: Optional[str]) -> str:
+    """Normalize to E.164 (assume US if 10 digits)."""
+    if not raw:
         return ""
+    s = str(raw).strip()
+    digits = re.sub(r"\D", "", s)
+    if not digits:
+        return ""
+    if s.startswith("+"):
+        return "+" + digits
+    if len(digits) == 11 and digits.startswith("1"):
+        return "+" + digits
+    if len(digits) == 10:
+        return "+1" + digits
+    return "+" + digits  # last resort
 
 
-def send_sms_reply(user_id: int, text: str):
+def _strip_bestie_prefix(msg: str) -> str:
     """
-    Send outbound SMS via LeadConnector webhook.
-    Posts to the configured GHL webhook with {phone, message}.
+    Remove any leading 'Bestie' label like:
+      'Bestie:', 'Bestie -', 'Bestie —', 'Bestie –', 'Bestie,'
+    (case-insensitive, trims following space).
     """
-    # ✅ Soft patch: strip "Bestie: " if accidentally included
-    if text.strip().lower().startswith("bestie:"):
-        text = text.partition(":")[2].strip()
+    if not msg:
+        return ""
+    return re.sub(r"^\s*bestie\s*[:,\-–—]\s*", "", msg, flags=re.IGNORECASE)
 
-    logger.info("[Integrations][Send] 🚦 Preparing to send SMS: user_id={} text='{}'", user_id, text)
 
-    phone = _get_phone(user_id)
-    if not phone:
-        logger.error("[Integrations][Send] ❌ No phone found for user_id={}, aborting send", user_id)
-        return
+def _phone_from_users(user_id: int) -> Optional[str]:
+    try:
+        with db.session() as s:
+            row = s.execute(
+                text("SELECT phone FROM users WHERE id = :uid"),
+                {"uid": user_id},
+            ).first()
+        return row[0] if row and row[0] else None
+    except Exception:
+        logger.exception("💥 [Integrations][Lookup] users.phone lookup failed (user_id=%s)", user_id)
+        return None
 
+
+def _phone_from_messages(convo_id: int) -> Optional[str]:
+    """
+    Try to derive a phone from the most recent inbound message.
+    Checks messages.phone first (if exists), then messages.meta JSON.
+    """
+    try:
+        # messages.phone
+        if _col_exists("messages", "phone"):
+            with db.session() as s:
+                r = s.execute(
+                    text(
+                        """
+                        SELECT phone
+                          FROM messages
+                         WHERE conversation_id = :cid AND direction = 'in'
+                      ORDER BY created_at DESC
+                         LIMIT 1
+                        """
+                    ),
+                    {"cid": convo_id},
+                ).first()
+            if r and r[0]:
+                return r[0]
+
+        # messages.meta JSON
+        if _col_exists("messages", "meta"):
+            with db.session() as s:
+                r = s.execute(
+                    text(
+                        """
+                        SELECT meta
+                          FROM messages
+                         WHERE conversation_id = :cid AND direction = 'in'
+                      ORDER BY created_at DESC
+                         LIMIT 1
+                        """
+                    ),
+                    {"cid": convo_id},
+                ).first()
+            meta = r[0] if r else None
+            if isinstance(meta, dict):
+                for k in ("phone", "user_phone", "userPhone", "UserPhone"):
+                    v = meta.get(k)
+                    if v:
+                        return v
+                contact = meta.get("contact") or {}
+                v = (
+                    contact.get("phone")
+                    or contact.get("phoneNumber")
+                    or contact.get("Phone")
+                )
+                if v:
+                    return v
+    except Exception:
+        logger.exception("💥 [Integrations][Lookup] messages-derived phone lookup failed (convo_id=%s)", convo_id)
+
+    return None
+
+
+def _resolve_phone(user_id: int, convo_id: int) -> Optional[str]:
+    """Prefer users.phone; fallback to latest inbound message metadata."""
+    p = _phone_from_users(user_id)
+    if p:
+        return _normalize_phone(p)
+
+    p = _phone_from_messages(convo_id)
+    if p:
+        return _normalize_phone(p)
+
+    return None
+
+
+def _post_to_leadconnector(phone: str, message: str) -> None:
     if not LC_URL:
-        logger.error("[Integrations][Send] ❌ No GHL_OUTBOUND_WEBHOOK_URL configured, cannot send message")
-        return
+        raise RuntimeError("GHL_OUTBOUND_WEBHOOK_URL is not configured")
 
-    payload = {"phone": phone, "message": text}
+    payload = {"phone": phone, "message": message}
     headers = {"Content-Type": "application/json"}
 
-    logger.info("[Integrations][Send] 📤 Sending to LeadConnector: URL={} | Payload={}", LC_URL, payload)
+    logger.info("[Integrations][Send] 📤 LeadConnector POST url={} payload={}", LC_URL, payload)
+    with httpx.Client(timeout=15) as client:
+        r = client.post(LC_URL, json=payload, headers=headers)
+        if r.status_code // 100 != 2:
+            logger.error(
+                "[Integrations][Send] ❌ LeadConnector failed status=%s body=%s",
+                r.status_code,
+                r.text,
+            )
+            r.raise_for_status()
+
+    logger.success("[Integrations][Send] ✅ Delivered to %s (%d chars)", phone, len(message))
+
+
+# ---------- public API (called by worker) ----------
+
+def send_sms(*, user_id: int, convo_id: int, text: str) -> None:
+    """GHL-only sender used by workers._finalize_and_send(...)."""
+    msg = _strip_bestie_prefix((text or "").strip())
+    if not msg:
+        logger.warning("[Integrations][Send] Skipping empty message (user_id=%s convo_id=%s)", user_id, convo_id)
+        return
+
+    phone = _resolve_phone(user_id, convo_id)
+    logger.info("[Integrations][Send] Resolved phone user_id=%s convo_id=%s -> %s", user_id, convo_id, phone)
+    if not phone:
+        logger.error(
+            "[Integrations][Send] ❌ No phone found; cannot send (user_id=%s convo_id=%s)",
+            user_id,
+            convo_id,
+        )
+        return
 
     try:
-        with httpx.Client(timeout=8) as client:
-            r = client.post(LC_URL, json=payload, headers=headers)
-            if r.status_code >= 400:
-                logger.error("[Integrations][Send] ❌ Failed! status={} body={}", r.status_code, r.text)
-            else:
-                logger.success("[Integrations][Send] ✅ Success for phone={} body={}", phone, r.text)
+        _post_to_leadconnector(phone, msg)
     except Exception:
         logger.exception("💥 [Integrations][Send] Exception while posting to LeadConnector")
+
+
+def send_sms_reply(user_id: int, text: str) -> None:
+    """
+    Back-compat for any legacy code still calling send_sms_reply(user_id, text).
+    Uses users.phone only (no convo_id available here).
+    """
+    msg = _strip_bestie_prefix((text or "").strip())
+    if not msg:
+        logger.warning("[Integrations][SendLegacy] Empty text for user_id=%s", user_id)
+        return
+
+    phone = _phone_from_users(user_id)
+    if not phone:
+        logger.error("[Integrations][SendLegacy] ❌ No phone found for user_id=%s", user_id)
+        return
+
+    try:
+        _post_to_leadconnector(_normalize_phone(phone), msg)
+    except Exception:
+        logger.exception("💥 [Integrations][SendLegacy] Exception posting to LeadConnector")
