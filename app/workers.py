@@ -486,8 +486,6 @@ def generate_reply_job(convo_id: int, user_id: int, text_val: str) -> None:
 
         logger.info("[Intent] intent_data: {}", intent_data)
 
-        from app.product_search import get_static_matches  # add this at the top
-
         # Step 2: product intent
         intent_data = None
         try:
@@ -540,15 +538,7 @@ def generate_reply_job(convo_id: int, user_id: int, text_val: str) -> None:
             _finalize_and_send(user_id, convo_id, reply, add_cta=False)
             return
 
-        # ✅ First try static product match
-        static_matches = get_static_matches(text_val)
-        if static_matches:
-            logger.info("[Worker][Products] Found static product matches")
-            reply = render_products_for_sms(static_matches, limit=3)
-            _finalize_and_send(user_id, convo_id, reply, add_cta=False)
-            return
-
-        # ❌ Skip GPT recs unless we add them manually
+              # ❌ Skip GPT recs unless we add them manually
         logger.info("[Worker][Products] No static match. Skipping product recs to avoid hallucinated links.")
 
         # Step 3: user context (VIP / quiz flags)
