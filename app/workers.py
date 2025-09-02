@@ -34,7 +34,7 @@ if __name__ == "__main__":
 # Environment / globals
 # ---------------------------------------------------------------------------
 REDIS_URL = os.getenv("REDIS_URL", "")
-_rds = redis.from_url(REDIS_URL, decode_responses=True, ssl=True) if REDIS_URL else None
+_rds = redis.from_url(REDIS_URL, decode_responses=True) if REDIS_URL else None
 
 # Geniuslink configuration
 GENIUSLINK_DOMAIN = os.getenv("GENIUSLINK_DOMAIN", "").strip()
@@ -49,14 +49,16 @@ _AMZN_RE = re.compile(r"https?://(?:www\.)?amazon\.[^\s)\]]+", re.I)
 # Helpers: Redis de-dup key, recent outbound fetch, link hygiene
 # ---------------------------------------------------------------------------
 def _send_dedupe_guard(conversation_id: int, text: str, ttl: int = 120) -> bool:
-    """
-    Return True if we should send; False if an identical message was sent recently.
-    Uses Redis SET NX with a short TTL keyed by convo + text hash.
-    """
+    """Return True if we should send; False if an identical message was sent recently."""
     if not _rds:
         return True
-    key = f"dedup:out:{conversation_id}:{hashlib.sha1(text.encode('utf-8')).hexdigest()}"
-    return bool(_rds.set(key, "1", ex=ttl, nx=True))
+    try:
+        key = f"dedup:out:{conversation_id}:{hashlib.sha1(text.encode('utf-8')).hexdigest()}"
+        return bool(_rds.set(key, "1", ex=ttl, nx=True))
+    except Exception as e:
+        logger.warning("[Dedup] Redis unavailable; skipping guard: {}", e)
+        return True
+
 
 
 def _recent_outbound_texts(convo_id: int, limit: int = 12) -> list[str]:
