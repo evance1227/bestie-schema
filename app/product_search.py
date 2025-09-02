@@ -4,38 +4,52 @@ from urllib.parse import urlparse
 from loguru import logger
 
 # app/product_search.py
-from urllib.parse import quote_plus
+import re, urllib.parse
+from loguru import logger
 
-def _amz_search_link(name: str) -> str:
-    # search links don’t 404 and still monetize via Geniuslink rewrite if you want
-    q = quote_plus(name)
-    return f"https://www.amazon.com/s?k={q}"
+def _amz_search_url(q: str) -> str:
+    # Use Amazon search URLs (they never 404); your monetization layer will rewrite them
+    return "https://www.amazon.com/s?k=" + urllib.parse.quote_plus(q)
 
 def fetch_products(query: str, category: str | None = None, constraints: dict | None = None):
+    """
+    Minimal curated results so the LLM doesn't invent products or dead dp links.
+    Returns a list of dicts the builder can consume. Keys are generic and safe.
+    """
     q = (query or "").lower()
-    out = []
+    wants_lower = False
+    if constraints and str(constraints.get("price", "")).lower() == "lower":
+        wants_lower = True
+    if any(w in q for w in ("cheap", "cheaper", "less expensive", "budget", "under", "dupe", "alternative")):
+        wants_lower = True
 
-    # Curated fallback for: IS Clinical Youth Intensive Cream
-    if "youth intensive cream" in q or "is clinical youth" in q:
-        out = [
+    # Specific curated case: iS Clinical Youth Intensive Cream → cheaper alternatives
+    if re.search(r"\bis\s*clinical\b.*youth\s+intensive\s+cream", q, re.I) or "is clinical youth intensive cream" in q:
+        products = [
             {
-                "title": "L'Oréal Revitalift Triple Power Anti-Aging Moisturizer",
-                "reason": "Retinol + Vitamin C + HA combo for firming/plumping; rich texture; usually <$35.",
-                "url": _amz_search_link("L'Oreal Revitalift Triple Power Anti-Aging Moisturizer"),
+                "title": "Naturium Multi-Peptide Moisturizer",
+                "url": _amz_search_url("Naturium Multi-Peptide Moisturizer"),
+                "one_liner": "Peptide-rich hydrator for firmness at a budget price.",
+                "price_hint": "$20–$30",
             },
             {
                 "title": "Olay Regenerist Micro-Sculpting Cream (Fragrance-Free)",
-                "reason": "Peptides + niacinamide + HA for bounce and barrier support; typically $25–35.",
-                "url": _amz_search_link("Olay Regenerist Micro-Sculpting Cream fragrance free"),
+                "url": _amz_search_url("Olay Regenerist Micro-Sculpting Cream fragrance free"),
+                "one_liner": "Amino-peptides + niacinamide for smoothing and bounce.",
+                "price_hint": "$25–$35",
             },
             {
-                "title": "RoC Retinol Correxion Max Daily Hydration Cream",
-                "reason": "Retinol for smoothing + glycerin for cushion; commonly <$35.",
-                "url": _amz_search_link("RoC Retinol Correxion Max Daily Hydration Cream"),
+                "title": "La Roche-Posay Hyaluronic Acid B5 Moisturizer",
+                "url": _amz_search_url("La Roche-Posay Hyaluronic Acid B5 moisturizer"),
+                "one_liner": "Triple-HA plumping hydration with a luxe feel.",
+                "price_hint": "$25–$35",
             },
         ]
+        return products
 
-    return out
+    # Unknown query → let the LLM handle it (but we logged it)
+    logger.warning("[ProductSearch] No curated match for query=%r; returning empty list", query)
+    return []
 
 def build_product_candidates(query: str, category: str | None = None, constraints: dict | None = None):
     # Pass-through to keep your worker code unchanged

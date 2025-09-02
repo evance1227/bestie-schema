@@ -186,8 +186,17 @@ def _finalize_and_send(user_id: int, convo_id: int, reply: str, add_cta: bool = 
         if not force_send and not _send_dedupe_guard(convo_id, final_text):
             logger.warning("[Dedup] Skipping duplicate outbound for convo_id=%s", convo_id)
             return
+        # === Monetization: rewrite outbound links (Geniuslink) ===
+        try:
+            from app.monetization import rewrite_affiliate_links as _rewrite_aff
+            _rewritten = _rewrite_aff(reply)
+            if _rewritten:
+                reply = _rewritten
+            logger.info("[Monetization] Affiliate links rewritten.")
+        except Exception as e:
+            logger.warning("[Monetization] rewrite_affiliate_links unavailable or failed: {}", e)
 
-        resp = integrations.send_sms(user_id=user_id, convo_id=convo_id, text=final_text)
+            resp = integrations.send_sms(user_id=user_id, convo_id=convo_id, text=final_text)
 
 
         # Try to surface response metadata if available
