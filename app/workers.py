@@ -538,8 +538,7 @@ def generate_reply_job(convo_id: int, user_id: int, text_val: str) -> None:
             _finalize_and_send(user_id, convo_id, reply, add_cta=False)
             return
 
-              # ❌ Skip GPT recs unless we add them manually
-        logger.info("[Worker][Products] No static match. Skipping product recs to avoid hallucinated links.")
+        # ✅ Proceeding with dynamic GPT-powered product suggestions using real-time search.
 
         # Step 3: user context (VIP / quiz flags)
         with db.session() as s:
