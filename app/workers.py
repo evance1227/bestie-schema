@@ -96,29 +96,25 @@ def _amazon_search_url(q: str) -> str:
 
 def _ensure_amazon_links(text: str) -> str:
     """
-    Replace any hallucinated product links with a safe Amazon link.
-    If a product line contains an explicit ASIN, produce /dp/ASIN.
-    Otherwise, fall back to an Amazon search link.
+    Only inject Amazon links when there are NO links present.
+    Never touch existing /dp/ links and never strip markdown URLs.
     """
     if not text:
         return text
 
-    # Strip existing markdown link targets: '](http...)' -> ']'
-    text = re.sub(r"\]\(https?://[^\)]+\)", "]", text)
+    # If message already contains a direct Amazon product link, leave it alone.
+    if "amazon.com/dp/" in text.lower():
+        return text
 
-    asin_re = re.compile(r"ASIN:\s*([A-Z0-9]{10})", re.I)
+    # If message already contains any URL at all, do not alter it.
+    if re.search(r"https?://\S+", text):
+        return text
 
+    # Otherwise, inject a generic Amazon search link under numbered product headers.
     def _inject(m):
-        line = m.group(0)
         name = m.group(1).strip()
-        asin_m = asin_re.search(line)
-        if asin_m:
-            asin = asin_m.group(1).upper()
-            return f"{line}\n    [Amazon link](https://www.amazon.com/dp/{asin})"
-        # fallback: search page
-        return f"{line}\n    [Amazon link]({_amazon_search_url(name)})"
+        return f"{m.group(0)}\n    [Amazon link](https://www.amazon.com/s?k={urllib.parse.quote_plus(name)})"
 
-    # After each product header line inject a link
     return re.sub(r"(?m)^\s*\d+\.\s+\*\*(.+?)\*\*.*$", _inject, text)
 
 def _rewrite_links_to_genius(text: str) -> str:
@@ -503,6 +499,46 @@ def generate_reply_job(convo_id: int, user_id: int, text_val: str) -> None:
             logger.warning("[Worker][Intent] extractor unavailable or failed: {}", e)
 
         logger.info("[Intent] intent_data: {}", intent_data)
+        # --- Build dynamic product candidates (DP links only via Rainforest) ---
+        product_candidates: List[Dict] = build_product_candidates(intent_data)
+        product_candidates = prefer_amazon_first(product_candidates)
+
+        if product_candidates:
+            # Normalize for GPT
+            gpt_products = []
+            for c in product_candidates[:3]:
+                gpt_products.append({
+                    "name": c.get("title") or c.get("name") or "Product",
+                    "category": (intent_data or {}).get("category", ""),
+                    "url": c.get("url", ""),
+                    "review": c.get("review", "")
+                })
+
+            # Pull VIP/quiz flags for tone/CTA
+            with db.session() as s:
+                profile = s.execute(
+                    sqltext("SELECT is_vip, has_completed_quiz FROM user_profiles WHERE user_id = :uid"),
+                    {"uid": user_id}
+                ).first()
+            context = {
+                "is_vip": bool(profile and profile[0]),
+                "has_completed_quiz": bool(profile and profile[1]),
+            }
+
+            # Let GPT write the personable Bestie reply. DO NOT alter URLs.
+            reply = ai.generate_reply(
+                user_text=str(text_val),
+                product_candidates=gpt_products,
+                user_id=user_id,
+                system_prompt=(
+                    "You are Bestie. Use the provided product candidates (already monetized DP URLs). "
+                    "Write one tight, friendly reply (aim ~450 chars) with 1–3 options and a one-liner why each fits. "
+                    "Do not alter or replace URLs. No qualifiers — start helpful immediately."
+                ),
+                context=context,
+            )
+            _finalize_and_send(user_id, convo_id, reply, add_cta=False)
+            return
 
         # ✅ First try static product match
         static_matches = get_static_matches(text_val)
@@ -514,7 +550,6 @@ def generate_reply_job(convo_id: int, user_id: int, text_val: str) -> None:
 
         # ❌ Skip GPT recs unless we add them manually
         logger.info("[Worker][Products] No static match. Skipping product recs to avoid hallucinated links.")
-
 
         # Step 3: user context (VIP / quiz flags)
         with db.session() as s:
