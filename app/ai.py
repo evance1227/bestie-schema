@@ -4,7 +4,7 @@ import os
 import re
 import random
 from typing import Optional, List, Dict
-
+from app.personas.bestie_altare import BESTIE_SYSTEM_PROMPT
 from loguru import logger
 from openai import OpenAI
 from sqlalchemy import text as sqltext
@@ -75,6 +75,26 @@ PRODUCT_TRIGGERS = {
     "sunscreen", "moisturizer", "cream", "lotion", "gel"
 }
 
+def _bestie_system_text(mode: str = "default") -> str:
+    sys_text = BESTIE_SYSTEM_PROMPT
+    if isinstance(mode, str) and mode.lower() == "altare":
+        sys_text += "\n\nRUNTIME SIGNAL: ALTARE mode requested. Increase sass. Keep clarity."
+    return sys_text
+
+def _ensure_bestie_system(messages, mode: str = "default"):
+    """
+    Prepend or replace the first system message with Bestie ALTARE persona.
+    Add-only. Does not change your existing logic otherwise.
+    """
+    sys_msg = {"role": "system", "content": _bestie_system_text(mode)}
+    if not messages:
+        return [sys_msg]
+    first = messages[0]
+    if isinstance(first, dict) and first.get("role") == "system":
+        msgs = list(messages)
+        msgs[0] = sys_msg
+        return msgs
+    return [sys_msg] + list(messages)
 
 def extract_product_intent(text: str) -> Optional[Dict[str, str]]:
     """
@@ -88,6 +108,13 @@ def extract_product_intent(text: str) -> Optional[Dict[str, str]]:
         return {"need_product": True, "query": text.strip()}
     return None
 
+def _sentiment_hint(user_text: str) -> str:
+    t = (user_text or "").lower()
+    if any(x in t for x in ["angry", "annoyed", "pissed", "frustrated", "wtf", "broken", "hate this"]):
+        return "User is frustrated. Be decisive and brief, skip therapy tone."
+    if any(x in t for x in ["excited", "love", "omg", "obsessed"]):
+        return "User is excited. Match energy and lean into enthusiasm."
+    return ""
 
 def _is_specific_product_intent(intent_data, user_text: str) -> bool:
     """Return True for messages that clearly ask for product recs/dupes/cheaper alternatives."""
@@ -117,6 +144,33 @@ def _is_specific_product_intent(intent_data, user_text: str) -> bool:
     except Exception:
         return False
 
+import re
+
+_IMG_TAG = re.compile(r"\[IMG:([^\]]+)\]")
+
+def _extract_img_urls(text: str) -> tuple[str, list[str]]:
+    """Return (text_without_tags, [urls])."""
+    urls: list[str] = []
+    def _cap(m):
+        urls.append(m.group(1).strip())
+        return ""  # remove the tag from the text
+    clean = _IMG_TAG.sub(_cap, text or "")
+    return clean.strip(), urls
+
+def _to_mm_user_content(text: str) -> list:
+    """
+    Build OpenAI multimodal user content. If IMG tags exist, return a list with
+    a text chunk and image_url chunks. Else return a single text chunk.
+    """
+    txt, urls = _extract_img_urls(text)
+    if not urls:
+        return [{"type": "text", "text": txt}]
+    parts = []
+    if txt:
+        parts.append({"type": "text", "text": txt})
+    for u in urls:
+        parts.append({"type": "image_url", "image_url": {"url": u}})
+    return parts
 
 # === MASTER PERSONA & PLAYBOOK ===
 BASE_PERSONA = """You are Schizo Bestie — the user’s emotionally fluent, pop-culture–savvy,
@@ -244,6 +298,12 @@ def witty_rename_response(new_name: str) -> str:
     ]
     return random.choice(options)
 
+    sales_micro = (
+        "Style: Oprah’s Favorite Things meets savage bestie. "
+        "Use 2–4 lines: opener vibe, then 1 line per product with plain URL, then a light closer. "
+        "Each product line must sell the benefit in human terms. No specs dump."
+    )
+    system_prompt = (system_prompt + "\n" + sales_micro).strip()
 
 def generate_reply(
     user_text: str,
@@ -400,12 +460,44 @@ def generate_reply(
         ]
         return random.choice(CLARIFY_LINES)
 
+    # Convert the last user message to multimodal if it has [IMG:...] tags
+    if messages and isinstance(messages[-1], dict) and messages[-1].get("role") == "user":
+        last = messages[-1]
+        user_text = last.get("content") or ""
+        # If your pipeline sometimes passes list content already, normalize to str
+        if isinstance(user_text, list):
+            # join any text chunks for compatibility
+            user_text = " ".join(
+                c.get("text","") for c in user_text if isinstance(c, dict) and c.get("type")=="text"
+            )
+        last["content"] = _to_mm_user_content(user_text)
+
 
     logger.info("[AI][Prompt] System:\n{}\n\nUser:\n{}", system_content, user_content)
+    # before you call OpenAI
+    _last_user = next((m for m in reversed(messages) if m.get("role") == "user"), {})
+    _detected_mode = "altare" if "ALTARE" in (_last_user.get("content") or "") else "default"
+    messages = _ensure_bestie_system(messages, _detected_mode)
+    # Sentiment hint: append to system_content BEFORE building messages
+    hint = _sentiment_hint(user_content)
+    if hint:
+        system_content = f"{system_content}\n\nRUNTIME CONTEXT: {hint}"
+
+    # Build messages (base)
+    messages = [
+        {"role": "system", "content": system_content},
+        {"role": "user",   "content": user_content},
+    ]
+    resp = CLIENT.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=messages,   # <— use the list we just massaged
+        temperature=0.9,
+        max_tokens=320,
+    )
 
     # --- Call OpenAI
     logger.info("[AI][Sending to GPT]\nSystem Prompt:\n{}\n\nUser Message:\n{}", system_content, user_content)
-    try:
+    try:       
         resp = CLIENT.chat.completions.create(
             model="gpt-4o-mini",
             messages=[

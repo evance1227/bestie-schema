@@ -1,5 +1,6 @@
 # app/workers.py
 import os
+import os, re, datetime as dt
 import multiprocessing
 import re
 import urllib.parse
@@ -29,7 +30,6 @@ from app import db, models, ai, integrations
 if __name__ == "__main__":
     multiprocessing.set_start_method("spawn", force=True)
 
-
 # ---------------------------------------------------------------------------
 # Environment / globals
 # ---------------------------------------------------------------------------
@@ -44,10 +44,176 @@ GL_REWRITE = os.getenv("GL_REWRITE", "1").lower() not in ("0", "false", "")
 # Amazon URL detector
 _AMZN_RE = re.compile(r"https?://(?:www\.)?amazon\.[^\s)\]]+", re.I)
 
-
 # ---------------------------------------------------------------------------
 # Helpers: Redis de-dup key, recent outbound fetch, link hygiene
 # ---------------------------------------------------------------------------
+from datetime import datetime, timedelta, timezone, date
+
+VIP_URL = os.getenv("VIP_URL", "https://schizobestie.gumroad.com/l/gexqp")
+QUIZ_URL = os.getenv("QUIZ_URL", "https://tally.so/r/YOUR_QUIZ_ID")
+FREE_TRIAL_DAYS = int(os.getenv("FREE_TRIAL_DAYS", "14"))
+INTRO_DAYS = int(os.getenv("INTRO_DAYS", "14"))
+ENFORCE_SIGNUP = os.getenv("ENFORCE_SIGNUP_BEFORE_CHAT", "0") == "1"
+TRIAL_URL = os.getenv("TRIAL_URL", "https://schizobestie.gumroad.com/l/gexqp")
+FULL_URL  = os.getenv("FULL_URL",  "https://schizobestie.gumroad.com/l/ibltj")
+
+def _has_ever_started_trial(user_id: int) -> bool:
+    with db.session() as s:
+        r = s.execute(sqltext("SELECT trial_start_date FROM user_profiles WHERE user_id=:u"), {"u": user_id}).first()
+        return bool(r and r[0])
+
+def _wall_start_message(user_id: int) -> str:
+    # First time → send TRIAL; returning after any past trial → send FULL (no deal)
+    link = FULL_URL if _has_ever_started_trial(user_id) else TRIAL_URL
+    return (
+        "Before we chat, start your access so I can remember everything and tailor recs to you. "
+        f"Tap here and you’ll go straight to your quiz after signup:\n{link}\n"
+        "No refunds. Cancel anytime. 💅"
+    )
+
+def _load_user_profile_row(user_id: int):
+    with db.session() as s:
+        row = s.execute(sqltext("""
+            SELECT gumroad_customer_id, gumroad_email, plan_status, trial_start_date,
+                   plan_renews_at, is_quiz_completed, daily_msgs_used, daily_counter_date
+            FROM user_profiles WHERE user_id = :u
+        """), {"u": user_id}).first()
+    return row
+
+import os
+from datetime import datetime, timezone
+from sqlalchemy import text as sqltext
+from app import db
+
+def _user_gate_status(user_id: int) -> dict:
+    with db.session() as s:
+        row = s.execute(sqltext("""
+            SELECT
+                gumroad_customer_id, gumroad_email,
+                COALESCE(plan_status,'pending')    AS plan_status,
+                trial_start_date,
+                plan_renews_at,
+                COALESCE(is_quiz_completed,false)  AS is_quiz_completed,
+                COALESCE(daily_msgs_used,0)        AS daily_used,
+                daily_counter_date
+            FROM public.user_profiles
+            WHERE user_id = :u
+        """), {"u": user_id}).first()
+
+    if not row:
+        return {"allowed": False, "reason": "pending"}
+
+    gum_id, gum_email, plan_status, trial_start, renews_at, is_quiz, daily_used, daily_date = row
+
+    # reset daily counter on UTC day rollover
+    today = datetime.now(timezone.utc).date()
+    if daily_date != today:
+        with db.session() as s:
+            s.execute(sqltext("""
+                UPDATE public.user_profiles
+                SET daily_counter_date = CURRENT_DATE,
+                    daily_msgs_used    = 0
+                WHERE user_id = :u
+            """), {"u": user_id})
+            s.commit()
+        daily_used = 0
+
+    enforce = os.getenv("ENFORCE_SIGNUP_BEFORE_CHAT", "0") == "1"
+    if enforce and (not plan_status or plan_status == "pending"):
+        return {"allowed": False, "reason": "pending"}
+
+    free_days = int(os.getenv("FREE_TRIAL_DAYS", "14"))
+
+    if plan_status == "trial":
+        if not trial_start:
+            return {"allowed": False, "reason": "pending"}
+        days_in = (datetime.now(timezone.utc) - trial_start).days
+        if days_in >= free_days:
+            return {"allowed": False, "reason": "expired"}
+        return {"allowed": True, "reason": "trial", "days_in": days_in, "daily_used": daily_used}
+
+    if plan_status in ("intro", "active"):
+        return {"allowed": True, "reason": plan_status, "daily_used": daily_used}
+
+    if plan_status in ("expired", "canceled"):
+        return {"allowed": False, "reason": plan_status}
+
+    return {"allowed": False, "reason": "pending"}
+
+def _ensure_profile_defaults(user_id: int):
+    with db.session() as s:
+        s.execute(sqltext("""
+            UPDATE user_profiles
+            SET plan_status = COALESCE(plan_status, 'pending'),
+                daily_counter_date = COALESCE(daily_counter_date, CURRENT_DATE),
+                daily_msgs_used = COALESCE(daily_msgs_used, 0),
+                trial_msgs_used = COALESCE(trial_msgs_used, 0),
+                is_quiz_completed = COALESCE(is_quiz_completed, false)
+            WHERE user_id = :u
+        """), {"u": user_id})
+        s.commit()
+    """
+    Return a dict with entitlement gates:
+      allowed: bool -> may we answer now
+      reason:  str  -> 'pending', 'needs_quiz', 'ok', 'expired', etc.
+    """
+    row = _load_user_profile_row(user_id)
+    if not row:
+        return {"allowed": False, "reason": "pending"}
+    gum_id, gum_email, plan_status, trial_start, renews_at, is_quiz, daily_used, daily_date = row
+
+    # normalize daily counters
+    today = datetime.now(timezone.utc).date()
+    if daily_date != today:
+        with db.session() as s:
+            s.execute(sqltext("""
+                UPDATE user_profiles SET daily_counter_date = CURRENT_DATE, daily_msgs_used = 0
+                WHERE user_id = :u
+            """), {"u": user_id})
+            s.commit()
+        daily_used = 0
+
+    # paywall gate
+    if ENFORCE_SIGNUP and (plan_status is None or plan_status in ("pending", "")):
+        return {"allowed": False, "reason": "pending"}  # must start trial at VIP_URL first
+
+    # trial → intro → active window
+    if plan_status == "trial":
+        if not trial_start:
+            return {"allowed": False, "reason": "pending"}
+        days_in = (datetime.now(timezone.utc) - trial_start).days
+        if days_in >= FREE_TRIAL_DAYS:
+            return {"allowed": False, "reason": "expired"}
+        return {"allowed": True, "reason": "trial", "days_in": days_in}
+
+    if plan_status == "intro":
+        if renews_at and datetime.now(timezone.utc) >= renews_at:
+            # should be moved to active by webhook; allow anyway
+            return {"allowed": True, "reason": "active"}
+        return {"allowed": True, "reason": "intro"}
+
+    if plan_status == "active":
+        return {"allowed": True, "reason": "active"}
+
+    if plan_status in ("expired", "canceled"):
+        return {"allowed": False, "reason": plan_status}
+
+    # default
+    return {"allowed": False, "reason": "pending"}
+
+def _wall_start_trial_message() -> str:
+    return (
+        "Hey babe — before we chat, start your free 14-day VIP trial so I remember everything and tailor recs to you. "
+        f"Tap this, ‘Get Access,’ and you’ll go straight to your quiz after signup:\n{VIP_URL}\n"
+        "No refunds. Cancel anytime."
+    )
+
+def _wall_trial_expired_message() -> str:
+    return (
+        "Your free trial ended. I’m pausing the deep magic until you upgrade. "
+        f"$7 for the next 14 days, then $17/month. Cancel anytime. No refunds.\n{VIP_URL}"
+    )
+
 def _send_dedupe_guard(conversation_id: int, text: str, ttl: int = 120) -> bool:
     """Return True if we should send; False if an identical message was sent recently."""
     if not _rds:
@@ -58,6 +224,148 @@ def _send_dedupe_guard(conversation_id: int, text: str, ttl: int = 120) -> bool:
     except Exception as e:
         logger.warning("[Dedup] Redis unavailable; skipping guard: {}", e)
         return True
+VIP_URL = os.getenv("VIP_URL", "https://schizobestie.gumroad.com/l/gexqp")
+VIP_COOLDOWN_MIN = int(os.getenv("VIP_COOLDOWN_MIN", "20"))   # minutes between pitches
+VIP_DAILY_MAX = int(os.getenv("VIP_DAILY_MAX", "2"))          # max per 24h
+_VIP_STOP = re.compile(r"(stop( trying)? to sell|don'?t sell|no vip|quit selling|stop pitching)", re.I)
+
+def _recent_vip_stats_by_convo(convo_id: int, minutes: int = 1440):
+    """Return (count_24h, most_recent_ts) for VIP mentions in this convo."""
+    cutoff = datetime.utcnow() - timedelta(minutes=minutes)
+    count_24h, recent_ts = 0, None
+    try:
+        with db.session() as s:
+            rows = s.execute(sqltext("""
+                SELECT content, created_at
+                FROM messages
+                WHERE conversation_id = :cid
+                ORDER BY created_at DESC
+                LIMIT 100
+            """), {"cid": convo_id}).fetchall()
+        for content, ts in rows:
+            txt = (content or "").lower()
+            if "gumroad.com" in txt or "vip" in txt:
+                count_24h += 1
+                if ts and ts > cutoff and (recent_ts is None or ts > recent_ts):
+                    recent_ts = ts
+    except Exception:
+        pass
+    return count_24h, recent_ts
+
+def _should_soft_pitch_vip_convo(convo_id: int, user_text: str, reply_text: str) -> bool:
+    if _VIP_STOP.search(user_text or ""):
+        return False
+    # rate limits
+    count_24h, recent_ts = _recent_vip_stats_by_convo(convo_id, minutes=1440)
+    if count_24h >= VIP_DAILY_MAX:
+        return False
+    if recent_ts:
+        mins_since = (datetime.utcnow() - recent_ts).total_seconds() / 60.0
+        if mins_since < VIP_COOLDOWN_MIN:
+            return False
+    # contextual triggers
+    txt = f"{user_text} {reply_text}".lower()
+    friction = any(w in txt for w in ["overwhelmed","confused","stuck","frustrated","help","support","struggling"])
+    momentum = any(w in txt for w in ["recommend","options","compare","ideas","plan","next step","next level","upgrade","more"])
+    asked = any(w in txt for w in ["vip","membership","trial"])
+    return asked or friction or momentum
+
+def _vip_soft_line() -> str:
+    return (f"No pressure, but if you want me at full throttle, VIP will level you up. "
+            f"Free for 30 days, cancel anytime. Try it: {VIP_URL}")
+
+def _maybe_inject_vip_by_convo(reply: str, convo_id: int, user_text: str) -> str:
+    try:
+        if _should_soft_pitch_vip_convo(convo_id, user_text, reply):
+            if "gumroad.com" not in (reply or "").lower():
+                reply = (reply or "").rstrip() + "\n\n" + _vip_soft_line()
+    except Exception:
+        pass
+    return reply
+import random
+
+SALES_LINES = [
+    "It’s giving chic but practical — you’ll actually use this.",
+    "I’d toss this in my cart twice.",
+    "This is the budget twin that keeps up with the luxe pick.",
+    "Reviewers are obsessed for a reason.",
+    "Smart buy now, zero regret later.",
+    "Small footprint, big payoff.",
+    "Everyday workhorse with cute energy.",
+    "Grab it while the price is behaving.",
+    "If I lost mine, I’d rebuy immediately.",
+    "Real-life friendly, not Instagram-only."
+]
+
+def _sprinkle_sales_line(text: str) -> str:
+    # If there’s already a closing line, leave it. Otherwise add one tasteful kicker.
+    if not text or text.strip().endswith(("!", ".", "…")) is False:
+        return text
+    line = random.choice(SALES_LINES)
+    # 80% chance to add, so not every reply ends with a tag line
+    return text if random.random() < 0.2 else f"{text}\n{line}"
+    reply = _clamp_product_lines(reply, max_items=3)
+
+# phrases that mean "stop selling"
+_VIP_STOP = re.compile(r"(stop( trying)? to sell|don'?t sell|no vip|quit selling|stop pitching)", re.I)
+
+# lightweight “did we pitch recently” check using convo messages
+def _recent_vip_stats(convo, minutes: int = 1440):
+    cutoff = dt.datetime.utcnow() - dt.timedelta(minutes=minutes)
+    count_24h = 0
+    recent_ts = None
+    for m in reversed(convo.messages[-100:]):  # avoid scanning whole history
+        ts = getattr(m, "created_at", None) or getattr(m, "created", None)
+        txt = (getattr(m, "content", "") or "").lower()
+        if "gumroad.com" in txt or "vip" in txt:
+            count_24h += 1
+            if ts and ts > cutoff:
+                if recent_ts is None or ts > recent_ts:
+                    recent_ts = ts
+    return count_24h, recent_ts
+
+# when should we offer VIP?
+def _should_soft_pitch_vip(convo, user_text: str, reply_text: str) -> bool:
+    user_text = (user_text or "")
+    reply_text = (reply_text or "")
+    if _VIP_STOP.search(user_text):
+        return False
+
+    # cool down + daily cap
+    count_24h, recent_ts = _recent_vip_stats(convo, minutes=1440)
+    if count_24h >= VIP_DAILY_MAX:
+        return False
+    if recent_ts:
+        mins_since = (dt.datetime.utcnow() - recent_ts).total_seconds() / 60.0
+        if mins_since < VIP_COOLDOWN_MIN:
+            return False
+
+    # meaningful moments to suggest VIP
+    txt = f"{user_text} {reply_text}".lower()
+    friction = any(w in txt for w in [
+        "overwhelmed","confused","stuck","frustrated","help","support","struggling"
+    ])
+    momentum = any(w in txt for w in [
+        "recommend","options","compare","ideas","plan","next step","next level","upgrade","more"
+    ])
+    asked = "vip" in txt or "membership" in txt or "trial" in txt
+
+    return asked or friction or momentum
+
+def _vip_soft_line() -> str:
+    return (
+        f"No pressure, but if you want me at full throttle, VIP will level you up. "
+        f"Free for 30 days, cancel anytime. Try it: {VIP_URL}"
+    )
+
+def _maybe_inject_vip(reply: str, convo, user_text: str) -> str:
+    try:
+        if _should_soft_pitch_vip(convo, user_text, reply):
+            if "gumroad.com" not in (reply or "").lower():
+                reply = (reply or "").rstrip() + "\n\n" + _vip_soft_line()
+    except Exception:
+        pass
+    return reply
 
 def _recent_outbound_texts(convo_id: int, limit: int = 12) -> list[str]:
     """
@@ -222,32 +530,28 @@ def _store_and_send(user_id: int, convo_id: int, text_val: str) -> None:
 # ---------------------------------------------------------------------------
 def _fix_vip_links(text: str) -> str:
     """
-    Ensure any VIP sign-up mention includes a clickable URL.
-    - If the canonical link is missing, append it.
-    - If the model produced bracket-only anchors (e.g., [VIP Sign-Up]), replace with a real link.
+    Ensure any VIP mention includes a clickable URL. If the canonical link is
+    missing and we clearly mention VIP, append it once.
     """
-    VIP_URL = "https://schizobestie.gumroad.com/l/gexqp"
+    VIP_URL = os.getenv("VIP_URL", "https://schizobestie.gumroad.com/l/gexqp")
     if not text:
         return text
 
-    # Replace any [VIP ...] without (url) that appears alone on a line with a proper link
+    # Replace bracket-only anchors like [VIP Sign-Up] with a real link string
     text = re.sub(
-        r"(?mi)^\s*\[(?:vip|vip\s*sign[ -]?up|vip\s*trial(?:\s*signup)?|vip\s*sign\s*up)\]\s*$",
-        f"[VIP Sign-Up]({VIP_URL})",
+        r"(?mi)^\s*\[?(vip|vip\s*sign[- ]?up|vip\s*signup)\]?\s*$",
+        f"VIP Sign-Up: {VIP_URL}",
         text,
-        flags=re.IGNORECASE,
     )
 
-    # If we talk about VIP but no URL is anywhere in the message, add the link once at the end
-    if ("vip" in text.lower()) and (VIP_URL not in text):
-        if text.endswith("\n"):
-            text += VIP_URL
-        else:
-            text += "\n" + VIP_URL
+    # If we talk about VIP but there is no gumroad link anywhere, append once
+    if "vip" in text.lower() and "gumroad.com" not in text.lower():
+        text = text.rstrip()
+        text += ("\n" if not text.endswith("\n") else "") + VIP_URL
 
     return text
 
-    # Finalize + send 
+# ---------------------------------------------------------------------------
 # Finalize + send (single path; handles freshness, links, de-dup, CTA)
 # -------------------------------------------------------------------
 def _finalize_and_send(
@@ -387,6 +691,27 @@ def _enforce_freshness(reply: str, recent_texts: list[str]) -> str:
             logger.warning("[Freshness] rewrite_different failed; sending original")
     return reply
 
+OPENING_BANNED = [
+    "it sounds like", "i understand that", "you're not alone", 
+    "i'm sorry you're", "technology can be", "i get that"
+]
+
+def _fix_cringe_opening(reply: str) -> str:
+    if not reply:
+        return reply
+    first, *rest = [l for l in reply.splitlines()]
+    if any(first.lower().startswith(p) for p in OPENING_BANNED):
+        try:
+            # reuse your model rewrite but ask for a punchy opener
+            return ai.rewrite_different(
+                "\n".join([first] + rest),
+                avoid="\n".join(OPENING_BANNED + BANNED_STOCK_PHRASES),
+                instruction="Rewrite the first line to be punchy, confident, and helpful. No therapy clichés."
+            )
+        except Exception:
+            # fall back: drop the opener
+            return "\n".join(rest) if rest else reply
+    return reply
 
 def _pick_unique_cta(recent_texts: list[str]) -> str:
     cta_pool = [
@@ -417,6 +742,34 @@ def generate_reply_job(convo_id: int, user_id: int, text_val: str) -> None:
     try:
         reply: Optional[str] = None
         normalized_text = (text_val or "").lower().strip()
+            # >>> GATE: block replies until the right plan state
+        _ensure_profile_defaults(user_id)  # safe no-op if already set
+        gate = _user_gate_status(user_id)
+        logger.info("[Gate] user_id={} -> {}", user_id, gate)
+
+        if not gate["allowed"]:
+            r = gate["reason"]
+            if r in ("pending", "canceled"):
+                _store_and_send(user_id, convo_id, _wall_start_message(user_id))  # TRIAL_URL or FULL_URL
+                return
+            if r == "expired":
+                _store_and_send(
+                    user_id,
+                    convo_id,
+                    "Your free trial ended. To keep going it’s $7 for the next 14 days, then $17/month. "
+                    f"Cancel anytime. No refunds.\n{FULL_URL}"
+                )
+                return
+        # <<< end gate   $ 
+    except Exception as e:
+        logger.exception("💥 [Worker][Job] Unhandled exception in generate_reply_job: {}", e)
+        _finalize_and_send(
+            user_id,
+            convo_id,
+            "Babe, I glitched — but I’ll be back to drag you properly 💅",
+            add_cta=False,
+            force_send=True,
+        )
 
         # Step 0: does this conversation have any messages yet?
         with db.session() as s:
@@ -429,12 +782,21 @@ def generate_reply_job(convo_id: int, user_id: int, text_val: str) -> None:
         if "http" in text_val and any(x in normalized_text for x in [".jpg", ".jpeg", ".png", ".gif"]):
             logger.info("[Worker][Media] Detected image URL — sending to describe_image()")
             reply = ai.describe_image(text_val.strip())
+            reply = _maybe_inject_vip_by_convo(reply, convo_id, text_val)
             _finalize_and_send(user_id, convo_id, reply, add_cta=False)
+            return
+        # Step 0.5: simple media detectors
+        if "http" in text_val and any(x in normalized_text for x in [".jpg", ".jpeg", ".png", ".gif"]):
+            logger.info("[Worker][Media] Detected image URL — sending to describe_image()")
+            reply = ai.describe_image(text_val.strip())
+            reply = _maybe_inject_vip_by_convo(reply, convo_id, text_val)
+            _finalize_and_send(user_id, convo_id, reply, add_cta=False)           
             return
 
         if "http" in text_val and any(x in normalized_text for x in [".mp3", ".m4a", ".wav", ".ogg"]):
             logger.info("[Worker][Media] Detected audio URL — sending to transcribe_and_respond()")
             reply = ai.transcribe_and_respond(text_val.strip(), user_id=user_id)
+            reply = _maybe_inject_vip_by_convo(reply, convo_id, text_val)
             _finalize_and_send(user_id, convo_id, reply, add_cta=False)
             return
 
@@ -500,6 +862,21 @@ def generate_reply_job(convo_id: int, user_id: int, text_val: str) -> None:
         # --- Build dynamic product candidates (DP links only via Rainforest) ---
         product_candidates: List[Dict] = build_product_candidates(intent_data)
         product_candidates = prefer_amazon_first(product_candidates)
+        def _shape_product_reply(text: str, max_len: int = 500) -> str:
+            """
+            Ensure shopping replies are text-message friendly:
+            - Split into 2–4 lines
+            - Keep under max_len
+            """
+            lines = [l.strip() for l in text.splitlines() if l.strip()]
+            out = []
+            for l in lines:
+                if len(" ".join(out + [l])) > max_len:
+                    break
+                out.append(l)
+            return "\n".join(out)
+        reply = _shape_product_reply(reply, max_len=480)
+        reply = _sprinkle_sales_line(reply)
 
         if product_candidates:
             # Normalize for GPT
@@ -535,6 +912,8 @@ def generate_reply_job(convo_id: int, user_id: int, text_val: str) -> None:
                 ),
                 context=context,
             )
+            reply = _maybe_inject_vip_by_convo(reply, convo_id, text_val)
+            reply = _fix_cringe_opening(reply)
             _finalize_and_send(user_id, convo_id, reply, add_cta=False)
             return
 
@@ -562,6 +941,12 @@ Prefer Amazon links first; if you can’t find a good Amazon match, use the bran
 Links must be direct (no trackers) and kept exactly as provided.
 Avoid repeating wording you’ve used in this conversation. Vary phrasing.
 """.strip()
+        # 5) flatten Markdown to bare URLs for SMS auto-link
+    try:
+        from app.linkwrap import sms_ready_links
+        reply = sms_ready_links(reply)
+    except Exception:
+        pass
 
         # Step 7: call AI
         logger.info("[Worker][AI] Calling AI for convo_id={} user_id={}", convo_id, user_id)
@@ -572,7 +957,9 @@ Avoid repeating wording you’ve used in this conversation. Vary phrasing.
             system_prompt=system_prompt,
             context=context,
         )
+        reply = _maybe_inject_vip_by_convo(reply, convo_id, text_val)
         logger.info("[Worker][AI] 🤖 AI reply generated: {}", reply)
+        _finalize_and_send(user_id, convo_id, reply, add_cta=True)
 
         # Optional tone rewrite
         try:
