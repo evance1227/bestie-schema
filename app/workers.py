@@ -968,8 +968,8 @@ Avoid repeating wording you’ve used in this conversation. Vary phrasing.
 """.strip()
         # 5) flatten Markdown to bare URLs for SMS auto-link
     try:
-        from app.linkwrap import sms_ready_links
-        reply = sms_ready_links(reply)
+        from app import linkwrap
+        reply = linkwrap.make_sms_reply(reply, amazon_tag="schizobestie-20")
     except Exception:
         pass
 
@@ -979,7 +979,7 @@ Avoid repeating wording you’ve used in this conversation. Vary phrasing.
             user_text=str(text_val),
             product_candidates=[],
             user_id=user_id,
-            system_prompt=system_prompt,
+            system_prompt="",
             context=context,
         )
         reply = _maybe_inject_vip_by_convo(reply, convo_id, text_val)
