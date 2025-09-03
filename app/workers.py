@@ -966,12 +966,6 @@ Prefer Amazon links first; if you can’t find a good Amazon match, use the bran
 Links must be direct (no trackers) and kept exactly as provided.
 Avoid repeating wording you’ve used in this conversation. Vary phrasing.
 """.strip()
-        # 5) flatten Markdown to bare URLs for SMS auto-link
-    try:
-        from app import linkwrap
-        reply = linkwrap.make_sms_reply(reply, amazon_tag="schizobestie-20")
-    except Exception:
-        pass
 
         # Step 7: call AI
         logger.info("[Worker][AI] Calling AI for convo_id={} user_id={}", convo_id, user_id)
