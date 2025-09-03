@@ -22,6 +22,19 @@ from app.product_search import build_product_candidates, prefer_amazon_first
 from app.linkwrap import rewrite_affiliate_links_in_text
 from app import ai_intent, product_search
 from app import db, models, ai, integrations
+from os import getenv
+
+DEV_BYPASS_PHONE = getenv("DEV_BYPASS_PHONE")
+
+def _norm_phone(p: str | None) -> str | None:
+    if not p:
+        return None
+    d = re.sub(r"\D", "", p)
+    if len(d) == 10:
+        return "+1" + d
+    if len(d) == 11 and d.startswith("1"):
+        return "+" + d
+    return p if p.startswith("+") else "+" + d if d else None
 
 # ---------------------------------------------------------------------------
 # Multiprocessing – ensure RQ workers don't fork with "fork" on some hosts
@@ -81,14 +94,6 @@ def _user_gate_status(user_id: int) -> dict:
 
     if enforce and (not plan_status or plan_status == "pending"):
         return {"allowed": False, "reason": "pending"}
-
-    if plan_status == "trial":
-        if not trial_start:
-            return {"allowed": False, "reason": "pending"}
-        days_in = (datetime.now(timezone.utc) - trial_start).days
-        if days_in >= free_days:
-            return {"allowed": False, "reason": "expired"}
-        return {"allowed": True, "reason": "trial"}
 
     if plan_status == "active":
         return {"allowed": True, "reason": "active"}
@@ -182,7 +187,6 @@ def _ensure_profile_defaults(user_id: int):
             """), {"u": user_id})
             s.commit()
         daily_used = 0
-
     # paywall gate
     if ENFORCE_SIGNUP and (plan_status is None or plan_status in ("pending", "")):
         return {"allowed": False, "reason": "pending"}  # must start trial at VIP_URL first
@@ -738,7 +742,7 @@ def _pick_unique_cta(recent_texts: list[str]) -> str:
 # ---------------------------------------------------------------------------
 # Main worker job
 # ---------------------------------------------------------------------------
-def generate_reply_job(convo_id: int, user_id: int, text_val: str) -> None:
+def generate_reply_job(convo_id: int, user_id: int, text_val: str, user_phone: str | None = None) -> None:
     """
     Main worker entrypoint:
     - Checks rename flow
@@ -757,16 +761,31 @@ def generate_reply_job(convo_id: int, user_id: int, text_val: str) -> None:
         gate = _user_gate_status(user_id)
         logger.info("[Gate] user_id={} -> {}", user_id, gate)
 
-        if not gate["allowed"]:
-            r = gate["reason"]
-            if r in ("pending", "canceled"):
-                _store_and_send(user_id, convo_id, _wall_start_message(user_id))
-                return
-            if r == "expired":
-                _store_and_send(user_id, convo_id, _wall_trial_expired_message())
-                return
-                return
-        # <<< end gate   $ 
+        np = _norm_phone(user_phone)
+        nb = _norm_phone(DEV_BYPASS_PHONE)
+        logger.info("[Gate] phone={} norm={} bypass_norm={}", user_phone, np, nb)
+
+# 🔑 DEV BYPASS
+        if np and nb and np == nb:
+            logger.info("[Gate] DEV_BYPASS active -> skipping paywall")
+        else:
+            if not gate["allowed"]:
+                r = gate["reason"]
+                if r in ("pending", "canceled"):
+                    _store_and_send(user_id, convo_id, _wall_start_message(user_id))
+                    return
+                if r == "expired":
+                    _store_and_send(user_id, convo_id, _wall_trial_expired_message())
+                    return
+                if not gate["allowed"]:
+                    r = gate["reason"]
+                    if r in ("pending", "canceled"):
+                        _store_and_send(user_id, convo_id, _wall_start_message(user_id))
+                        return
+                    if r == "expired":
+                        _store_and_send(user_id, convo_id, _wall_trial_expired_message())
+                        return
+                  # <<< end gate   $ 
     except Exception as e:
         logger.exception("💥 [Worker][Job] Unhandled exception in generate_reply_job: {}", e)
         _finalize_and_send(

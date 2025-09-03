@@ -27,17 +27,16 @@ def healthz():
 def plan_rollover(request: Request):
     if CRON_SECRET and request.headers.get("x-cron-secret") != CRON_SECRET:
         return {"ok": False, "error": "forbidden"}
-    with db.session() as s:
-        s.execute(sqltext("""
-            UPDATE public.user_profiles
-            SET plan_status='intro',
-                plan_renews_at = NOW() + INTERVAL '14 days'
-            WHERE plan_status='trial'
-              AND trial_start_date IS NOT NULL
-              AND NOW() > trial_start_date + INTERVAL '14 days'
-        """))
-        s.commit()
-    return {"ok": True}
+with db.session() as s:
+    s.execute(sqltext("""
+        UPDATE public.user_profiles
+        SET plan_status='active',
+            plan_renews_at = NOW() + INTERVAL '30 days'
+        WHERE plan_status='trial'
+          AND trial_start_date IS NOT NULL
+          AND NOW() > trial_start_date + INTERVAL '7 days'
+    """))
+    s.commit()
 
 # -------------------- DEBUG: queue probe -------------------- #
 from redis import Redis
@@ -78,7 +77,7 @@ def process_incoming(message_id: str, user_phone: str, text_val: str, raw_body: 
                         convo.id, user.id)
 
         # Hand off to worker
-        job = enqueue_generate_reply(convo.id, user.id, text_val)
+        job = enqueue_generate_reply(convo.id, user.id, text_val, user_phone=user_phone)
         logger.success("[API][Queue] ✅ Enqueued job={} convo_id={} user_id={} text={}",
                        job.id, convo.id, user.id, text_val)
 

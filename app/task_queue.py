@@ -1,11 +1,9 @@
-from dotenv import load_dotenv
-load_dotenv()
-
 import os
-from urllib.parse import urlparse
 from loguru import logger
 from rq import Queue
 from redis import Redis
+from app import workers
+from urllib.parse import urlparse
 
 REDIS_URL = os.environ.get("REDIS_URL")
 if not REDIS_URL:
@@ -14,10 +12,20 @@ if not REDIS_URL:
 redis = Redis.from_url(REDIS_URL)
 q = Queue("bestie_queue", connection=redis)
 
+def enqueue_generate_reply(convo_id: int, user_id: int, text_val: str, *, user_phone: str | None = None):
+    return q.enqueue(
+        workers.generate_reply_job,
+        args=(convo_id, user_id, text_val),
+        kwargs={"user_phone": user_phone},
+        job_timeout=600,
+        result_ttl=500,
+    )
+
 # Boot visibility
 host = urlparse(REDIS_URL).hostname
 logger.info("[API][QueueBoot] Host={} Queue={}", host, q.name)
 logger.info("[API][QueueBoot] Using REDIS_URL={} queue={}", REDIS_URL, q.name)
+logger.info("[Gate][Config] DEV_BYPASS_PHONE={}", os.getenv("DEV_BYPASS_PHONE"))
 
 def enqueue_generate_reply(convo_id: int, user_id: int, text: str):
     from app.workers import generate_reply_job
