@@ -11,4 +11,14 @@ services:
     runtime: python
     plan: starter
     buildCommand: pip install -r requirements.txt
-    startCommand: python -m app.start_worker  
+    startCommand: python -m app.start_worker
+
+cronJobs:
+  - name: plan-rollover
+    schedule: "0 9 * * *"   # daily at 09:00 UTC
+    command: curl -s -X POST -H "X-Cron-Secret: $CRON_SECRET" $BACKEND_URL/tasks/plan_rollover
+    envVars:
+      - key: BACKEND_URL
+        value: https://bestie-backend.onrender.com
+      - key: CRON_SECRET
+        value: 7c9b8e1f9a6d42c0983c1b235be92f73a5f918b09ef41f67a2dcb6c8b91c40d2
