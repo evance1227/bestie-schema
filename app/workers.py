@@ -23,7 +23,6 @@ from app.linkwrap import rewrite_affiliate_links_in_text
 from app import ai_intent, product_search
 from app import db, models, ai, integrations
 
-
 # ---------------------------------------------------------------------------
 # Multiprocessing – ensure RQ workers don't fork with "fork" on some hosts
 # ---------------------------------------------------------------------------
@@ -49,36 +48,8 @@ _AMZN_RE = re.compile(r"https?://(?:www\.)?amazon\.[^\s)\]]+", re.I)
 # ---------------------------------------------------------------------------
 from datetime import datetime, timedelta, timezone, date
 
-VIP_URL = os.getenv("VIP_URL", "https://schizobestie.gumroad.com/l/gexqp")
-QUIZ_URL = os.getenv("QUIZ_URL", "https://tally.so/r/YOUR_QUIZ_ID")
-FREE_TRIAL_DAYS = int(os.getenv("FREE_TRIAL_DAYS", "14"))
-INTRO_DAYS = int(os.getenv("INTRO_DAYS", "14"))
-ENFORCE_SIGNUP = os.getenv("ENFORCE_SIGNUP_BEFORE_CHAT", "0") == "1"
-TRIAL_URL = os.getenv("TRIAL_URL", "https://schizobestie.gumroad.com/l/gexqp")
-FULL_URL  = os.getenv("FULL_URL",  "https://schizobestie.gumroad.com/l/ibltj")
-
-def _has_ever_started_trial(user_id: int) -> bool:
-    with db.session() as s:
-        r = s.execute(sqltext("SELECT trial_start_date FROM user_profiles WHERE user_id=:u"), {"u": user_id}).first()
-        return bool(r and r[0])
-
-def _wall_start_message(user_id: int) -> str:
-    # First time → send TRIAL; returning after any past trial → send FULL (no deal)
-    link = FULL_URL if _has_ever_started_trial(user_id) else TRIAL_URL
-    return (
-        "Before we chat, start your access so I can remember everything and tailor recs to you. "
-        f"Tap here and you’ll go straight to your quiz after signup:\n{link}\n"
-        "No refunds. Cancel anytime. 💅"
-    )
-
-def _load_user_profile_row(user_id: int):
-    with db.session() as s:
-        row = s.execute(sqltext("""
-            SELECT gumroad_customer_id, gumroad_email, plan_status, trial_start_date,
-                   plan_renews_at, is_quiz_completed, daily_msgs_used, daily_counter_date
-            FROM user_profiles WHERE user_id = :u
-        """), {"u": user_id}).first()
-    return row
+from sqlalchemy import text as sqltext
+from app import db
 
 import os
 from datetime import datetime, timezone
@@ -86,16 +57,17 @@ from sqlalchemy import text as sqltext
 from app import db
 
 def _user_gate_status(user_id: int) -> dict:
+    """
+    Returns gate dict:
+      {"allowed": bool, "reason": 'pending'|'trial'|'active'|'expired'|'canceled'}
+    1-week trial, no message caps. After 7 days → expired.
+    """
     with db.session() as s:
         row = s.execute(sqltext("""
             SELECT
-                gumroad_customer_id, gumroad_email,
-                COALESCE(plan_status,'pending')    AS plan_status,
+                COALESCE(plan_status,'pending') AS plan_status,
                 trial_start_date,
-                plan_renews_at,
-                COALESCE(is_quiz_completed,false)  AS is_quiz_completed,
-                COALESCE(daily_msgs_used,0)        AS daily_used,
-                daily_counter_date
+                plan_renews_at
             FROM public.user_profiles
             WHERE user_id = :u
         """), {"u": user_id}).first()
@@ -103,26 +75,12 @@ def _user_gate_status(user_id: int) -> dict:
     if not row:
         return {"allowed": False, "reason": "pending"}
 
-    gum_id, gum_email, plan_status, trial_start, renews_at, is_quiz, daily_used, daily_date = row
+    plan_status, trial_start, renews_at = row
+    enforce   = os.getenv("ENFORCE_SIGNUP_BEFORE_CHAT", "0") == "1"
+    free_days = int(os.getenv("FREE_TRIAL_DAYS", "7"))
 
-    # reset daily counter on UTC day rollover
-    today = datetime.now(timezone.utc).date()
-    if daily_date != today:
-        with db.session() as s:
-            s.execute(sqltext("""
-                UPDATE public.user_profiles
-                SET daily_counter_date = CURRENT_DATE,
-                    daily_msgs_used    = 0
-                WHERE user_id = :u
-            """), {"u": user_id})
-            s.commit()
-        daily_used = 0
-
-    enforce = os.getenv("ENFORCE_SIGNUP_BEFORE_CHAT", "0") == "1"
     if enforce and (not plan_status or plan_status == "pending"):
         return {"allowed": False, "reason": "pending"}
-
-    free_days = int(os.getenv("FREE_TRIAL_DAYS", "14"))
 
     if plan_status == "trial":
         if not trial_start:
@@ -130,16 +88,68 @@ def _user_gate_status(user_id: int) -> dict:
         days_in = (datetime.now(timezone.utc) - trial_start).days
         if days_in >= free_days:
             return {"allowed": False, "reason": "expired"}
-        return {"allowed": True, "reason": "trial", "days_in": days_in, "daily_used": daily_used}
+        return {"allowed": True, "reason": "trial"}
 
-    if plan_status in ("intro", "active"):
-        return {"allowed": True, "reason": plan_status, "daily_used": daily_used}
+    if plan_status == "active":
+        return {"allowed": True, "reason": "active"}
 
     if plan_status in ("expired", "canceled"):
         return {"allowed": False, "reason": plan_status}
 
     return {"allowed": False, "reason": "pending"}
 
+def _load_user_profile_row(user_id: int):
+    """Return a single row with the key subscription fields for this user."""
+    with db.session() as s:
+        row = s.execute(sqltext("""
+            SELECT
+                gumroad_customer_id,
+                gumroad_email,
+                plan_status,
+                trial_start_date,
+                plan_renews_at,
+                is_quiz_completed,
+                daily_msgs_used,
+                daily_counter_date
+            FROM public.user_profiles
+            WHERE user_id = :u
+        """), {"u": user_id}).first()
+    return row
+
+VIP_URL = os.getenv("VIP_URL", "https://schizobestie.gumroad.com/l/gexqp")
+QUIZ_URL = os.getenv("QUIZ_URL", "https://tally.so/r/YOUR_QUIZ_ID")
+FREE_TRIAL_DAYS = int(os.getenv("FREE_TRIAL_DAYS", "7"))
+ENFORCE_SIGNUP = os.getenv("ENFORCE_SIGNUP_BEFORE_CHAT", "0") == "1"
+TRIAL_URL = os.getenv("TRIAL_URL", "https://schizobestie.gumroad.com/l/gexqp")
+FULL_URL  = os.getenv("FULL_URL",  "https://schizobestie.gumroad.com/l/ibltj")
+
+def _has_ever_started_trial(user_id: int) -> bool:
+    with db.session() as s:
+        r = s.execute(sqltext("""
+            SELECT trial_start_date FROM public.user_profiles
+            WHERE user_id=:u
+        """), {"u": user_id}).first()
+    return bool(r and r[0])
+
+def _wall_start_message(user_id: int) -> str:
+    link = FULL_URL if _has_ever_started_trial(user_id) else TRIAL_URL
+    if link == TRIAL_URL:
+        return (
+            "Before we chat, start your access so I remember everything and tailor recs. "
+            f"Tap here — quiz comes right after signup:\n{link}\n"
+            "1 week free, then $17/mo. Cancel anytime. No refunds. 💅"
+        )
+    else:
+        return (
+            "You’ve already had your free trial, babe. To keep going it’s $17/mo. "
+            f"Cancel anytime. No refunds.\n{link}"
+        )
+
+def _wall_trial_expired_message() -> str:
+    return (
+        "Your free week ended. To keep the customized magic, it’s $17/mo. "
+        f"Cancel anytime. No refunds.\n{FULL_URL}"
+    )
 def _ensure_profile_defaults(user_id: int):
     with db.session() as s:
         s.execute(sqltext("""
@@ -579,7 +589,7 @@ def _finalize_and_send(
     try:
         if add_cta and os.getenv("BESTIE_APPEND_CTA") == "1":
             reply += (
-                "\n\nBabe, your VIP is open: first month FREE, $7 your second, then $17/mo. "
+                "\n\nBabe, your VIP is open: first week FREE, then $17/mo. "
                 "Unlimited texts. https://schizobestie.gumroad.com/l/gexqp"
             )
     except Exception:
@@ -750,15 +760,11 @@ def generate_reply_job(convo_id: int, user_id: int, text_val: str) -> None:
         if not gate["allowed"]:
             r = gate["reason"]
             if r in ("pending", "canceled"):
-                _store_and_send(user_id, convo_id, _wall_start_message(user_id))  # TRIAL_URL or FULL_URL
+                _store_and_send(user_id, convo_id, _wall_start_message(user_id))
                 return
             if r == "expired":
-                _store_and_send(
-                    user_id,
-                    convo_id,
-                    "Your free trial ended. To keep going it’s $7 for the next 14 days, then $17/month. "
-                    f"Cancel anytime. No refunds.\n{FULL_URL}"
-                )
+                _store_and_send(user_id, convo_id, _wall_trial_expired_message())
+                return
                 return
         # <<< end gate   $ 
     except Exception as e:
