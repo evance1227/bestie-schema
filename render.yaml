@@ -16,9 +16,11 @@ services:
 cronJobs:
   - name: plan-rollover
     schedule: "0 9 * * *"   # daily at 09:00 UTC
-    command: curl -s -X POST -H "X-Cron-Secret: $CRON_SECRET" $BACKEND_URL/tasks/plan_rollover
+    command: 'curl -s -X POST -H "X-Cron-Secret: $CRON_SECRET" $BACKEND_URL/tasks/plan_rollover'
     envVars:
       - key: BACKEND_URL
-        value: https://bestie-backend.onrender.com
+        value: https://bestie-backend.onrender.com   # your Render web service URL
       - key: CRON_SECRET
         value: 7c9b8e1f9a6d42c0983c1b235be92f73a5f918b09ef41f67a2dcb6c8b91c40d2
+
+        startCommand: uvicorn app.main:app --host 0.0.0.0 --port 8000

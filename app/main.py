@@ -1,6 +1,5 @@
-# top of main.py
 import os
-import time, re  # <-- add this line
+import time, re
 from fastapi import FastAPI, Request, BackgroundTasks
 from fastapi.responses import JSONResponse
 from loguru import logger
@@ -10,9 +9,19 @@ from app.webhooks_gumroad import router as gumroad_router
 
 CRON_SECRET = os.getenv("CRON_SECRET")
 
-app = FastAPI(title="Bestie Backend")
+# Explicitly set docs & openapi so /docs exists
+app = FastAPI(
+    title="Bestie Backend",
+    docs_url="/docs",
+    openapi_url="/openapi.json",
+    redoc_url=None,
+)
 logger.info("[API][Boot] Using REDIS_URL={}", os.getenv("REDIS_URL"))
 app.include_router(gumroad_router)
+
+@app.get("/healthz")
+def healthz():
+    return {"ok": True}
 
 @app.post("/tasks/plan_rollover")
 def plan_rollover(request: Request):
