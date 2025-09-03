@@ -1,12 +1,34 @@
+# top of main.py
 import os
-import time, re
+import time, re  # <-- add this line
 from fastapi import FastAPI, Request, BackgroundTasks
 from fastapi.responses import JSONResponse
 from loguru import logger
+from sqlalchemy import text as sqltext
+from app import db
+from app.webhooks_gumroad import router as gumroad_router
 
-# ✅ init app first
+CRON_SECRET = os.getenv("CRON_SECRET")
+
 app = FastAPI(title="Bestie Backend")
 logger.info("[API][Boot] Using REDIS_URL={}", os.getenv("REDIS_URL"))
+app.include_router(gumroad_router)
+
+@app.post("/tasks/plan_rollover")
+def plan_rollover(request: Request):
+    if CRON_SECRET and request.headers.get("x-cron-secret") != CRON_SECRET:
+        return {"ok": False, "error": "forbidden"}
+    with db.session() as s:
+        s.execute(sqltext("""
+            UPDATE public.user_profiles
+            SET plan_status='intro',
+                plan_renews_at = NOW() + INTERVAL '14 days'
+            WHERE plan_status='trial'
+              AND trial_start_date IS NOT NULL
+              AND NOW() > trial_start_date + INTERVAL '14 days'
+        """))
+        s.commit()
+    return {"ok": True}
 
 # -------------------- DEBUG: queue probe -------------------- #
 from redis import Redis
