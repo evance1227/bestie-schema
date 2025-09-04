@@ -19,7 +19,7 @@ import requests  # (ok if unused for now)
 import redis     # already present as an RQ dep
 
 from app.product_search import build_product_candidates, prefer_amazon_first
-from app.linkwrap import rewrite_affiliate_links_in_text, make_sms_reply
+from app import linkwrap
 from app import ai_intent, product_search
 from app import db, models, ai, integrations
 from os import getenv
@@ -620,24 +620,33 @@ def _finalize_and_send(
     except Exception:
         pass
     # 4) optional site-wide affiliate rewrite (safe no-op if not configured)
-    reply = make_sms_reply(reply, amazon_tag="schizobestie-20")
     try:
-        aff = rewrite_affiliate_links_in_text(reply)
+        aff = linkwrap.rewrite_affiliate_links_in_text(reply)
         if aff:
             reply = aff
     except Exception as e:
         logger.debug("[Affiliate] rewrite_affiliate_links_in_text skipped: {}", e)
+    # 5) SMS-safe rewrite + Amazon tag (module-level, with fallback)
+    try:
+        if hasattr(linkwrap, "make_sms_reply"):
+            reply = linkwrap.make_sms_reply(reply, amazon_tag="schizobestie-20")
+        else:
+            # fallback combo if older linkwrap deployed
+            if hasattr(linkwrap, "sms_ready_links"):
+                reply = linkwrap.sms_ready_links(reply)
+            if hasattr(linkwrap, "enforce_affiliate_tags"):
+                reply = linkwrap.enforce_affiliate_tags(reply, "schizobestie-20")
+    except Exception as e:
+        logger.warning("[Linkwrap] sms formatting fallback failed: {}", e)
+        # Redis de-dupe guard (skip only when NOT forcing)
+        if not force_send and not _send_dedupe_guard(convo_id, reply):
+            logger.warning("[Dedup] Skipping duplicate outbound for convo_id={}", convo_id)
+            return
 
-    # Redis de-dupe guard (skip only when NOT forcing)
-    if not force_send and not _send_dedupe_guard(convo_id, reply):
-        logger.warning("[Dedup] Skipping duplicate outbound for convo_id={}", convo_id)
-        return
-
-    logger.info(
-        "[Worker][Send] → user_id={} convo_id={} chars={} preview={!r}",
-        user_id, convo_id, len(reply), reply[:200]
-    )
-
+        logger.info(
+            "[Worker][Send] → user_id={} convo_id={} chars={} preview={!r}",
+            user_id, convo_id, len(reply), reply[:200]
+        )
     # Single send/storage
     _store_and_send(user_id, convo_id, reply)
 
