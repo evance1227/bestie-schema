@@ -19,7 +19,7 @@ import requests  # (ok if unused for now)
 import redis     # already present as an RQ dep
 
 from app.product_search import build_product_candidates, prefer_amazon_first
-from app.linkwrap import rewrite_affiliate_links_in_text
+from app.linkwrap import rewrite_affiliate_links_in_text, make_sms_reply
 from app import ai_intent, product_search
 from app import db, models, ai, integrations
 from os import getenv
@@ -620,6 +620,7 @@ def _finalize_and_send(
     except Exception:
         pass
     # 4) optional site-wide affiliate rewrite (safe no-op if not configured)
+    reply = make_sms_reply(reply, amazon_tag="schizobestie-20")
     try:
         aff = rewrite_affiliate_links_in_text(reply)
         if aff:
@@ -785,6 +786,8 @@ def generate_reply_job(convo_id: int, user_id: int, text_val: str, user_phone: s
                     if r == "expired":
                         _store_and_send(user_id, convo_id, _wall_trial_expired_message())
                         return
+            logger.info("[Gate] Flow: past gate, continuing")
+      
                   # <<< end gate   $ 
     except Exception as e:
         logger.exception("💥 [Worker][Job] Unhandled exception in generate_reply_job: {}", e)
