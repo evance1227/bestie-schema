@@ -476,7 +476,6 @@ def _rewrite_links_to_genius(text: str) -> str:
 
     return text
 
-
 # ---------------------------------------------------------------------------
 # SMS product list renderer
 # ---------------------------------------------------------------------------
@@ -495,11 +494,11 @@ def render_products_for_sms(products, limit: int = 3) -> str:
             lines.append(f"{idx}. **{name}**")
     return "\n\n".join(lines)
 
-
 # ---------------------------------------------------------------------------
 # Core: store + send (splits long messages; inserts outbound row; calls integration)
 # ---------------------------------------------------------------------------
 def _store_and_send(user_id: int, convo_id: int, text_val: str) -> None:
+    did_send = True   
     """
     Insert outbound message in DB and send via LeadConnector.
     Automatically splits long messages into parts with [1/2], [2/2], etc.
@@ -537,7 +536,6 @@ def _store_and_send(user_id: int, convo_id: int, text_val: str) -> None:
             logger.success("[Worker][Send] ✅ SMS send attempted for user_id={}", user_id)
         except Exception:
             logger.exception("💥 [Worker][Send] Exception while calling send_sms_reply")
-
 
 # ---------------------------------------------------------------------------
 # Finalize + send (single path; handles freshness, links, de-dup, CTA)
@@ -640,7 +638,7 @@ def _finalize_and_send(
         logger.warning("[Linkwrap] sms formatting fallback failed: {}", e)
     # Single send/storage
     _store_and_send(user_id, convo_id, reply)
-
+    did_send = True
 # ---------------------------------------------------------------------------
 # Rename flow helpers
 # ---------------------------------------------------------------------------
@@ -774,22 +772,16 @@ def generate_reply_job(convo_id: int, user_id: int, text_val: str, user_phone: s
                 r = gate["reason"]
                 if r in ("pending", "canceled"):
                     _store_and_send(user_id, convo_id, _wall_start_message(user_id))
+                    did_send = True
                     return
                 if r == "expired":
                     _store_and_send(user_id, convo_id, _wall_trial_expired_message())
+                    did_send = True
                     return
 
         logger.info("[Flow] After gate, proceeding to routing")          
-                        # <<< end gate   $ 
-    except Exception as e:
-        logger.exception("💥 [Worker][Job] Unhandled exception in generate_reply_job: {}", e)
-        _finalize_and_send(
-            user_id,
-            convo_id,
-            "Babe, I glitched — but I’ll be back to drag you properly 💅",
-            add_cta=False,
-            force_send=True,
-        )
+        did_send = False 
+                        # <<< end gate   $                    
         # Step 0: does this conversation have any messages yet?
         with db.session() as s:
             first_msg_check = s.execute(
@@ -829,6 +821,7 @@ def generate_reply_job(convo_id: int, user_id: int, text_val: str, user_phone: s
                 "Welcome to your new favorite addiction. You talk. I text back like a glam oracle with rage issues and receipts. Let’s go.",
             ])
             _store_and_send(user_id, convo_id, onboarding_reply)  # canned -> no transforms
+            did_send = True   
             return
 
         # Step 1: quick FAQ intercepts
@@ -847,11 +840,13 @@ def generate_reply_job(convo_id: int, user_id: int, text_val: str, user_phone: s
             if key in normalized_text:
                 logger.info("[Worker][FAQ] Intercepted: '{}'", key)
                 _store_and_send(user_id, convo_id, canned)  # canned -> no transforms
+                did_send = True   
                 return
 
         # Step 1.5: rename flow
         rename_reply = try_handle_bestie_rename(user_id, convo_id, text_val)
         if rename_reply:
+            did_send = True   
             _store_and_send(user_id, convo_id, rename_reply)  # canned-ish
             return
 
@@ -983,9 +978,24 @@ Avoid repeating wording you’ve used in this conversation. Vary phrasing.
         except Exception:
             logger.warning("[Worker][AI] rewrite_if_cringe failed; using original reply")
 
-        # Step 8: finalize the general-chat reply (freshness + optional CTA)
+        # Step 8: finalize the general–chat reply (freshness + optional CTA)
         _finalize_and_send(user_id, convo_id, reply, add_cta=True)
-        return
+        did_send = True
+        
+        # ---- FINAL FALLBACK ----
+        if not did_send:
+            logger.info("[Fallback] No branch sent; running general AI fallback")
+            context = {"is_vip": False, "has_completed_quiz": False}
+            reply = ai.generate_reply(
+                user_text=str(text_val),
+                product_candidates=[],
+                user_id=user_id,
+                system_prompt="You are Bestie. Be brief, helpful, and witty.",
+                context=context,
+            )
+            _finalize_and_send(user_id, convo_id, reply, add_cta=False)
+            did_send = True
+            return
 
     except Exception as e:
         logger.exception("💥 [Worker][Job] Unhandled exception in generate_reply_job: {}", e)
@@ -994,10 +1004,9 @@ Avoid repeating wording you’ve used in this conversation. Vary phrasing.
             convo_id,
             "Babe, I glitched — but I’ll be back to drag you properly 💅",
             add_cta=False,
-            force_send=True,  # ensure the fallback always goes out once
+            force_send=True,
         )
-
-
+       
 # ---------------------------------------------------------------------------
 # Debug job
 # ---------------------------------------------------------------------------
@@ -1049,9 +1058,10 @@ def send_reengagement_job():
                     continue
 
                 message = random.choice(nudges)
-                logger.info("[Worker][Reengage] Nudging user_id={} phone={} with: {}", user_id, phone, message)
+                logger.info("[Worker][Reengage] Nudging user_id={} phone={} with: {}", user_id, phone, message)                
                 _store_and_send(user_id, convo_id, message)
-
+                did_send = True
+                return       
         logger.info("[Worker][Reengage] ✅ Completed re-engagement run")
 
     except Exception as e:
