@@ -497,8 +497,7 @@ def render_products_for_sms(products, limit: int = 3) -> str:
 # ---------------------------------------------------------------------------
 # Core: store + send (splits long messages; inserts outbound row; calls integration)
 # ---------------------------------------------------------------------------
-def _store_and_send(user_id: int, convo_id: int, text_val: str) -> None:
-    did_send = True   
+def _store_and_send(user_id: int, convo_id: int, text_val: str) -> None:  
     """
     Insert outbound message in DB and send via LeadConnector.
     Automatically splits long messages into parts with [1/2], [2/2], etc.
@@ -638,7 +637,7 @@ def _finalize_and_send(
         logger.warning("[Linkwrap] sms formatting fallback failed: {}", e)
     # Single send/storage
     _store_and_send(user_id, convo_id, reply)
-    did_send = True
+ 
 # ---------------------------------------------------------------------------
 # Rename flow helpers
 # ---------------------------------------------------------------------------
@@ -845,9 +844,9 @@ def generate_reply_job(convo_id: int, user_id: int, text_val: str, user_phone: s
 
         # Step 1.5: rename flow
         rename_reply = try_handle_bestie_rename(user_id, convo_id, text_val)
-        if rename_reply:
-            did_send = True   
+        if rename_reply:            
             _store_and_send(user_id, convo_id, rename_reply)  # canned-ish
+            did_send = True   
             return
 
         # Step 2: product intent
@@ -981,7 +980,7 @@ Avoid repeating wording you’ve used in this conversation. Vary phrasing.
         # Step 8: finalize the general–chat reply (freshness + optional CTA)
         _finalize_and_send(user_id, convo_id, reply, add_cta=True)
         did_send = True
-        
+    
         # ---- FINAL FALLBACK ----
         if not did_send:
             logger.info("[Fallback] No branch sent; running general AI fallback")
