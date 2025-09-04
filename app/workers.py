@@ -626,27 +626,18 @@ def _finalize_and_send(
             reply = aff
     except Exception as e:
         logger.debug("[Affiliate] rewrite_affiliate_links_in_text skipped: {}", e)
-    # 5) SMS-safe rewrite + Amazon tag (module-level, with fallback)
+        # 5) SMS-safe rewrite + Amazon tag (module-level, with fallback)
     try:
         if hasattr(linkwrap, "make_sms_reply"):
             reply = linkwrap.make_sms_reply(reply, amazon_tag="schizobestie-20")
         else:
-            # fallback combo if older linkwrap deployed
+            # fallback combo if older linkwrap is deployed
             if hasattr(linkwrap, "sms_ready_links"):
                 reply = linkwrap.sms_ready_links(reply)
             if hasattr(linkwrap, "enforce_affiliate_tags"):
                 reply = linkwrap.enforce_affiliate_tags(reply, "schizobestie-20")
     except Exception as e:
         logger.warning("[Linkwrap] sms formatting fallback failed: {}", e)
-        # Redis de-dupe guard (skip only when NOT forcing)
-        if not force_send and not _send_dedupe_guard(convo_id, reply):
-            logger.warning("[Dedup] Skipping duplicate outbound for convo_id={}", convo_id)
-            return
-
-        logger.info(
-            "[Worker][Send] → user_id={} convo_id={} chars={} preview={!r}",
-            user_id, convo_id, len(reply), reply[:200]
-        )
     # Single send/storage
     _store_and_send(user_id, convo_id, reply)
 
@@ -767,7 +758,7 @@ def generate_reply_job(convo_id: int, user_id: int, text_val: str, user_phone: s
         reply: Optional[str] = None
         normalized_text = (text_val or "").lower().strip()
             # >>> GATE: block replies until the right plan state
-        _ensure_profile_defaults(user_id)  # safe no-op if already set
+        _ensure_profile_defaults(user_id)
         gate = _user_gate_status(user_id)
         logger.info("[Gate] user_id={} -> {}", user_id, gate)
 
@@ -775,7 +766,7 @@ def generate_reply_job(convo_id: int, user_id: int, text_val: str, user_phone: s
         nb = _norm_phone(DEV_BYPASS_PHONE)
         logger.info("[Gate] phone={} norm={} bypass_norm={}", user_phone, np, nb)
 
-# 🔑 DEV BYPASS
+        # 🔑 DEV BYPASS
         if np and nb and np == nb:
             logger.info("[Gate] DEV_BYPASS active -> skipping paywall")
         else:
@@ -787,17 +778,9 @@ def generate_reply_job(convo_id: int, user_id: int, text_val: str, user_phone: s
                 if r == "expired":
                     _store_and_send(user_id, convo_id, _wall_trial_expired_message())
                     return
-                if not gate["allowed"]:
-                    r = gate["reason"]
-                    if r in ("pending", "canceled"):
-                        _store_and_send(user_id, convo_id, _wall_start_message(user_id))
-                        return
-                    if r == "expired":
-                        _store_and_send(user_id, convo_id, _wall_trial_expired_message())
-                        return
-            logger.info("[Gate] Flow: past gate, continuing")
-      
-                  # <<< end gate   $ 
+
+        logger.info("[Flow] After gate, proceeding to routing")          
+                        # <<< end gate   $ 
     except Exception as e:
         logger.exception("💥 [Worker][Job] Unhandled exception in generate_reply_job: {}", e)
         _finalize_and_send(
@@ -807,7 +790,6 @@ def generate_reply_job(convo_id: int, user_id: int, text_val: str, user_phone: s
             add_cta=False,
             force_send=True,
         )
-
         # Step 0: does this conversation have any messages yet?
         with db.session() as s:
             first_msg_check = s.execute(
