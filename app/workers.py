@@ -31,15 +31,7 @@ from sqlalchemy import text as sqltext
 # ------------------------------ App deps ------------------------------- #
 from app import db, models, ai, ai_intent, integrations, linkwrap
 from app.product_search import build_product_candidates, prefer_amazon_first
-from urllib.parse import quote_plus
-
-def _amazon_search_url(q: str) -> str:
-    """Build a safe Amazon search URL (no backslashes in f-string expressions)."""
-    try:
-        term = quote_plus((q or "").strip())
-    except Exception:
-        term = (q or "").strip().replace(" ", "+")
-    return "https://www.amazon.com/s?k=" + term
+from urllib.parse import quote_plus  # keep near the top with other imports if not present
 
 # ---------------------------------------------------------------------- #
 # Environment and globals
@@ -265,7 +257,12 @@ def _maybe_inject_vip_by_convo(reply: str, convo_id: int, user_text: str) -> str
 # Link hygiene and affiliate helpers
 # ---------------------------------------------------------------------- #
 def _amazon_search_url(q: str) -> str:
-    return f"https://www.amazon.com/s?k={re.sub(r'\\s+', '+', q.strip())}"
+    """Build a safe Amazon search URL without backslashes in f-string expressions."""
+    try:
+        term = quote_plus((q or "").strip())
+    except Exception:
+        term = (q or "").strip().replace(" ", "+")
+    return "https://www.amazon.com/s?k=" + term
 
 def _ensure_amazon_links(text: str) -> str:
     """
