@@ -20,6 +20,7 @@ import re
 import uuid
 import hashlib
 import random
+import time
 from typing import Optional, List, Dict
 from datetime import datetime, timezone, timedelta
 
@@ -38,7 +39,7 @@ from urllib.parse import quote_plus  # keep near the top with other imports if n
 # ---------------------------------------------------------------------- #
 REDIS_URL = os.getenv("REDIS_URL", "")
 _rds = redis.from_url(REDIS_URL, decode_responses=True) if REDIS_URL else None
-
+SMS_PART_DELAY_MS = int(os.getenv("SMS_PART_DELAY_MS", "800")) 
 DEV_BYPASS_PHONE = os.getenv("DEV_BYPASS_PHONE", "").strip()
 
 # Gumroad and trial settings
@@ -361,6 +362,12 @@ def _store_and_send(user_id: int, convo_id: int, text_val: str) -> None:
             logger.success("[Worker][Send] SMS send attempted for user_id={}", user_id)
         except Exception:
             logger.exception("[Worker][Send] Exception while calling send_sms_reply")
+        # small pause so carriers preserve part ordering
+        try:
+            if total_parts > 1 and idx < total_parts:
+                time.sleep(SMS_PART_DELAY_MS / 1000.0)
+        except Exception:
+            pass
 
 # ---------------------------------------------------------------------- #
 # Finalize + send (formatting, links, optional VIP CTA)

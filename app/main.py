@@ -12,6 +12,7 @@ from app import db
 from app.webhooks_gumroad import router as gumroad_router
 
 CRON_SECRET = os.getenv("CRON_SECRET")
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")  # << inbound shared secret (set in Web service env)
 
 # Explicitly set docs & openapi so /docs exists
 app = FastAPI(
@@ -58,6 +59,7 @@ def debug_env(secret: str):
         "GENIUSLINK_DOMAIN": os.getenv("GENIUSLINK_DOMAIN"),
         "ENFORCE_SIGNUP_BEFORE_CHAT": os.getenv("ENFORCE_SIGNUP_BEFORE_CHAT"),
         "FREE_TRIAL_DAYS": os.getenv("FREE_TRIAL_DAYS"),
+        "WEBHOOK_SECRET": os.getenv("WEBHOOK_SECRET"),  # will be masked by _masked_env
     }
     return _masked_env(snap)
 
@@ -126,6 +128,13 @@ def process_incoming(message_id: str, user_phone: str, text_val: str, raw_body: 
 @app.post("/webhook/incoming_message")
 async def incoming_message_any(req: Request, background_tasks: BackgroundTasks):
     """Inbound webhook from GHL → normalize payload → enqueue reply job."""
+    # 🔐 Optional inbound verification: require matching shared secret header
+    if WEBHOOK_SECRET:
+        sec = req.headers.get("X-Webhook-Secret") or req.headers.get("x-webhook-secret")
+        if sec != WEBHOOK_SECRET:
+            logger.warning("[API][Webhook] Forbidden: bad or missing X-Webhook-Secret")
+            return JSONResponse(status_code=403, content={"ok": False, "error": "forbidden"})
+
     try:
         body = await req.json()
         logger.info("[API][Webhook] >>> Incoming webhook hit! Raw body: {}", body)

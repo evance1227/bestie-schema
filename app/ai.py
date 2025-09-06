@@ -32,6 +32,7 @@ from sqlalchemy import text as sqltext
 
 from app import db, linkwrap
 from app.personas.bestie_altare import BESTIE_SYSTEM_PROMPT
+from typing import Optional, Dict
 
 # ------------------ OpenAI client ------------------ #
 CLIENT: Optional[OpenAI] = None
@@ -556,6 +557,68 @@ def rewrite_different(
     )
     out = (resp.choices[0].message.content or "").strip()
     return _sanitize_output(out)
+# ------------------ Routine audit (AM/PM map) ------------------ #
+from typing import Optional, Dict  # (safe if already imported)
+
+def audit_routine(user_text: str, constraints: Optional[Dict] = None, user_id: Optional[int] = None) -> str:
+    """
+    Quick overlap checker that yields a safe AM/PM map in Bestie voice.
+    Rule-of-thumb only (not medical): avoid doubling harsh actives in one session,
+    separate retinoids from strong acids/BPO, SPF every AM, hydrate freely.
+    """
+    tlow = (user_text or "").lower()
+    ings = set(((constraints or {}).get("ingredients") or []))
+    # flags from text or parsed ingredients
+    has = lambda k: (k in tlow) or (k in ings)
+
+    flags = {
+        "retinoid": any(has(x) for x in ["retinoid","retinol","retinal","tretinoin","adapalene"]),
+        "acid": any(has(x) for x in ["aha","bha","pha","glycolic","lactic","mandelic","salicylic"]),
+        "bpo": has("benzoyl peroxide"),
+        "vitc": any(has(x) for x in ["vitamin c","ascorbic"]),
+        "niacinamide": has("niacinamide"),
+        "azelaic": has("azelaic"),
+        "peptide": has("peptide") or has("peptides"),
+        "spf": any(x in tlow for x in ["spf","sunscreen"]),
+        "sensitive": "sensitive" in tlow,
+    }
+
+    warnings = []
+    if flags["retinoid"] and (flags["acid"] or flags["bpo"]):
+        warnings.append("Avoid pairing retinoids with strong acids or benzoyl peroxide in the same session.")
+
+    # AM defaults
+    am = ["Gentle cleanse (or splash)"]
+    if flags["vitc"]:
+        am.append("Vitamin C (thin layer, then serum)")
+    if flags["niacinamide"]:
+        am.append("Niacinamide (plays nice)")
+    am.append("Hydrator/serum")
+    am.append("Moisturizer")
+    am.append("SPF 30+{}".format(" (mineral if sensitive)" if flags["sensitive"] else ""))
+
+    # PM defaults
+    pm_core = ["Cleanse", "Hydrator", "Moisturizer"]
+    pm_actives = []
+    if flags["acid"]:
+        pm_actives.append("Exfoliant (AHA/BHA) on alternate nights")
+    if flags["retinoid"]:
+        pm_actives.append("Retinoid on non-exfoliant nights")
+    if flags["azelaic"]:
+        pm_actives.append("Azelaic can go AM or PM (plays nice)")
+    if flags["peptide"]:
+        pm_actives.append("Peptides are fine AM/PM (stack with hydrator)")
+
+    pm = [" + ".join(pm_actives)] + pm_core if pm_actives else pm_core
+
+    out = []
+    if warnings:
+        out.append("Heads up: " + " ".join(warnings))
+    out.append("Here’s your no-drama map:")
+    out.append("AM: " + " → ".join([x for x in am if x]))
+    out.append("PM: " + " → ".join([x for x in pm if x]))
+    out.append("Rule of thumb: don’t double harsh actives in one session. Alternate. Hydrate always. SPF every morning.")
+    return "\n".join(out)
 
 # ------------------ QA / Health --------------------- #
 def health_check(user_id: Optional[int] = None) -> Dict:
