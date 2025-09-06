@@ -1,222 +1,132 @@
-# app/webhooks_gumroad.py
-from __future__ import annotations
+# app/start_worker.py
+"""
+Bestie Worker bootstrap (add-only changes, reliability-focused).
 
-import os, hmac, hashlib
-from datetime import datetime, timezone, timedelta
+Flow:
+  1) Boot logs + masked env snapshot (sanity)
+  2) Connect + ping Redis
+  3) Import app.workers so import errors surface at boot
+  4) Build Queue (env-driven) and log initial depth
+  5) Start a heartbeat that logs current depth regularly
+  6) Run a single RQ Worker with env-driven timeouts/TTLs
+"""
+
+import os
+import sys
+import time
+import threading
 from urllib.parse import urlparse
-from typing import Optional, Dict, Any
 
-from fastapi import APIRouter, Request, Header, HTTPException
 from loguru import logger
-from sqlalchemy import text as sqltext
+from redis import Redis
+from rq import Worker, Queue, Connection
 
-from app import db
-from app.workers import _store_and_send
+# Optional scheduler (off unless ENABLE_RQ_SCHEDULER=1)
+try:
+    from rq.scheduler import Scheduler  # noqa: F401
+except Exception:  # pragma: no cover
+    Scheduler = None
 
-router = APIRouter()
+# ---------------------- Config (env) ---------------------- #
+REDIS_URL = os.getenv("REDIS_URL")                             # required
+QUEUE_NAME = os.getenv("QUEUE_NAME", "bestie_queue")           # same queue the web enqueues to
 
-# ---------- Env / product mapping ----------
-BESTIE_BASIC_URL = os.getenv("BESTIE_BASIC_URL", "https://schizobestie.gumroad.com/l/bestie_basic")
-BESTIE_PLUS_URL  = os.getenv("BESTIE_PLUS_URL",  "https://schizobestie.gumroad.com/l/bestie_plus")
-BESTIE_ELITE_URL = os.getenv("BESTIE_ELITE_URL", "https://schizobestie.gumroad.com/l/bestie_elite")
+# tune via Render envs; safe defaults
+WORKER_HEARTBEAT_SEC = int(os.getenv("WORKER_HEARTBEAT_SEC", "10"))
+WORKER_JOB_TIMEOUT   = int(os.getenv("WORKER_JOB_TIMEOUT", "240"))
+WORKER_RESULT_TTL    = int(os.getenv("WORKER_RESULT_TTL", "900"))
 
-# Back-compat with old IDs if Gumroad sends product_id or legacy permalinks
-TRIAL_PRODUCT_ID = os.getenv("TRIAL_PRODUCT_ID", "")
-FULL_PRODUCT_ID  = os.getenv("FULL_PRODUCT_ID", "")
-
-QUIZ_URL        = os.getenv("QUIZ_URL", "https://tally.so/r/YOUR_QUIZ_ID")
-FREE_TRIAL_DAYS = int(os.getenv("FREE_TRIAL_DAYS", "7"))
-SIGNING_SECRET  = os.getenv("GUMROAD_SIGNING_SECRET")
-
-def _slug(url: str) -> str:
-    try:
-        p = urlparse(url)
-        return p.path.strip("/").split("/")[-1].lower()
-    except Exception:
+# ---------------------- Helpers --------------------------- #
+def _mask(s: str, keep: int = 6) -> str:
+    if not s:
         return ""
+    return s[:keep] + "…" + s[-keep:] if len(s) > keep * 2 else "***"
 
-BASIC_SLUG = _slug(BESTIE_BASIC_URL) or "bestie_basic"
-PLUS_SLUG  = _slug(BESTIE_PLUS_URL)  or "bestie_plus"
-ELITE_SLUG = _slug(BESTIE_ELITE_URL) or "bestie_elite"
+def _env_snap() -> None:
+    """Mask-sensitive snapshot so we can verify the worker sees the right envs at boot."""
+    snap = {
+        "QUEUE_NAME": QUEUE_NAME,
+        "REDIS_URL": _mask(os.getenv("REDIS_URL") or ""),
+        "DATABASE_URL": _mask(os.getenv("DATABASE_URL") or ""),
+        "OPENAI_API_KEY": _mask(os.getenv("OPENAI_API_KEY") or ""),
+        "GHL_OUTBOUND_WEBHOOK_URL": _mask(os.getenv("GHL_OUTBOUND_WEBHOOK_URL") or ""),
+        "JOB_TIMEOUT": WORKER_JOB_TIMEOUT,
+        "RESULT_TTL": WORKER_RESULT_TTL,
+        "HB_SEC": WORKER_HEARTBEAT_SEC,
+    }
+    logger.info("[Worker][ENV] {}", snap)
 
-# ---------- Helpers ----------
-async def _payload_dict(req: Request) -> Dict[str, Any]:
-    """Gumroad can send JSON or form-encoded."""
-    raw = await req.body()
-    # optional signature check
-    if SIGNING_SECRET:
+def _heartbeat(q: Queue, r: Redis, stop_flag: threading.Event) -> None:
+    """
+    Emit queue depth regularly so we can see liveness in logs and a simple key in Redis.
+    (Non-invasive; if it fails, the worker still works.)
+    """
+    key = f"bestie:worker:hb:{os.getpid()}"
+    while not stop_flag.is_set():
         try:
-            expected = hmac.new(SIGNING_SECRET.encode(), raw, hashlib.sha256).hexdigest()
-            sig = req.headers.get("X-Gumroad-Signature") or req.headers.get("x_gumroad_signature") or ""
-            if sig and not hmac.compare_digest(sig, expected):
-                logger.warning("[Gumroad] signature mismatch")
+            depth = q.count
+            r.setex(key, WORKER_HEARTBEAT_SEC * 3, str(time.time()))
+            logger.info("[Worker][HB] Queue '{}' depth={}", q.name, depth)
         except Exception as e:
-            logger.warning("[Gumroad] signature check error: {}", e)
+            logger.error("[Worker][HB] error: {}", e)
+        stop_flag.wait(WORKER_HEARTBEAT_SEC)
 
+# ---------------------- Main ------------------------------ #
+def main() -> None:
+    logger.info("[Worker][BOOT] start_worker online pid={} cwd={}", os.getpid(), os.getcwd())
+
+    if not REDIS_URL:
+        logger.error("[Worker][BOOT] REDIS_URL is not set; cannot start worker.")
+        sys.exit(1)
+
+    _env_snap()
+
+    # Connect Redis and fail fast if unreachable
     try:
-        data = await req.json()
-        if isinstance(data, dict) and data:
-            return data
-    except Exception:
-        pass
+        redis_conn = Redis.from_url(REDIS_URL)
+        redis_conn.ping()
+    except Exception as e:
+        logger.exception("[Worker][BOOT] Redis ping failed: {}", e)
+        sys.exit(1)
+
+    # Import job module up front so any error is visible at boot
     try:
-        form = await req.form()
-        return dict(form.items())
-    except Exception:
-        return {}
+        import app.workers as _w  # noqa: F401
+        logger.info("[Worker][BOOT] Imported app.workers successfully")
+    except Exception as e:
+        logger.exception("[Worker][BOOT] Failed to import app.workers: {}", e)
+        sys.exit(1)
 
-def _event_name(p: Dict[str, Any]) -> str:
-    # Classic Gumroad uses alert_name; newer webhooks may use event/type
-    return str(p.get("alert_name") or p.get("event") or p.get("type") or "").lower()
+    host = urlparse(REDIS_URL).hostname or "unknown-host"
 
-def _product_hint(p: Dict[str, Any]) -> str:
-    # Try permalink/url fields first, then product_name, then product_id fallback
-    for k in ("product_permalink", "permalink", "short_url", "url", "product_url"):
-        v = str(p.get(k) or "")
-        if v:
-            return _slug(v)
-    name = str(p.get("product_name") or "").lower().replace(" ", "_")
-    if name:
-        return name
-    return str(p.get("product_id") or "").lower()
+    with Connection(redis_conn):
+        # Queue (env-driven) + initial depth
+        q = Queue(QUEUE_NAME, connection=redis_conn, default_timeout=WORKER_JOB_TIMEOUT)
+        try:
+            logger.info("[Worker][BOOT] Redis host={} queue='{}' initial depth={}", host, q.name, q.count)
+        except Exception as e:
+            logger.warning("[Worker][BOOT] Could not read initial depth: {}", e)
 
-def _map_tier(p: Dict[str, Any]) -> Optional[str]:
-    s = _product_hint(p)
-    if BASIC_SLUG in s or (TRIAL_PRODUCT_ID and TRIAL_PRODUCT_ID == s) or (FULL_PRODUCT_ID and FULL_PRODUCT_ID == s):
-        return "basic"
-    if PLUS_SLUG in s:
-        return "plus"
-    if ELITE_SLUG in s:
-        return "elite"
-    return None
-
-def _next_charge_at(p: Dict[str, Any]) -> Optional[datetime]:
-    for k in ("next_charge_date", "subscription_next_charge_date", "next_charge_at", "charge_occurs_on"):
-        v = p.get(k)
-        if v:
+        # Optional: RQ scheduler (off unless ENABLE_RQ_SCHEDULER=1)
+        if os.getenv("ENABLE_RQ_SCHEDULER") == "1" and Scheduler is not None:
             try:
-                return datetime.fromisoformat(str(v).replace("Z", "+00:00"))
-            except Exception:
-                continue
-    # Fallbacks
-    if FREE_TRIAL_DAYS > 0:
-        return datetime.now(timezone.utc) + timedelta(days=FREE_TRIAL_DAYS)
-    return datetime.now(timezone.utc) + timedelta(days=30)
+                scheduler = Scheduler(queue=q, connection=redis_conn)
+                threading.Thread(target=scheduler.run, daemon=True).start()
+                logger.info("[Worker][BOOT] RQ Scheduler thread started")
+            except Exception as e:
+                logger.warning("[Worker][BOOT] Scheduler not running: {}", e)
 
-def _find_user_id(p: Dict[str, Any]) -> Optional[int]:
-    # Prefer explicit custom_fields.user_id if you send it
-    try:
-        custom = p.get("custom_fields") or p.get("custom") or {}
-        if isinstance(custom, dict):
-            uid = custom.get("user_id") or custom.get("uid")
-            if uid:
-                return int(uid)
-    except Exception:
-        pass
-    # Fallback to email
-    email = (p.get("email") or p.get("purchaser_email") or p.get("customer_email") or "").strip().lower()
-    if not email:
-        return None
-    with db.session() as s:
-        r = s.execute(sqltext("SELECT id FROM users WHERE lower(email)=:e"), {"e": email}).first()
-        return int(r[0]) if r else None
+        # Heartbeat thread (keeps your existing log style)
+        stop_flag = threading.Event()
+        threading.Thread(target=_heartbeat, args=(q, redis_conn, stop_flag), daemon=True).start()
 
-def _latest_convo(user_id: int) -> Optional[int]:
-    with db.session() as s:
-        r = s.execute(sqltext("SELECT id FROM conversations WHERE user_id=:u ORDER BY id DESC LIMIT 1"), {"u": user_id}).first()
-        return int(r[0]) if r else None
+        # RQ worker (single queue; env-driven TTL)
+        worker = Worker([q], connection=redis_conn, default_worker_ttl=WORKER_RESULT_TTL)
+        logger.info("🚀 bestie-worker is listening on '{}' (job_timeout={}s, result_ttl={}s)",
+                    q.name, WORKER_JOB_TIMEOUT, WORKER_RESULT_TTL)
 
-def _set_status(
-    user_id: int,
-    *,
-    plan_status: str,
-    next_renew: Optional[datetime],
-    gumroad_id: Optional[str],
-    email: Optional[str],
-    start_trial: bool = False,
-) -> None:
-    """Upsert user profile with new plan status. Reset daily counter on change."""
-    with db.session() as s:
-        if start_trial and FREE_TRIAL_DAYS > 0:
-            s.execute(sqltext("""
-                UPDATE public.user_profiles
-                SET plan_status        = :st,
-                    trial_start_date   = COALESCE(trial_start_date, NOW()),
-                    plan_renews_at     = :rn,
-                    gumroad_customer_id= COALESCE(:gid, gumroad_customer_id),
-                    gumroad_email      = COALESCE(:em, gumroad_email),
-                    daily_msgs_used    = 0
-                WHERE user_id = :u
-            """), {"st": "trial", "rn": next_renew, "gid": gumroad_id, "em": email, "u": user_id})
-        else:
-            s.execute(sqltext("""
-                UPDATE public.user_profiles
-                SET plan_status        = :st,
-                    plan_renews_at     = :rn,
-                    gumroad_customer_id= COALESCE(:gid, gumroad_customer_id),
-                    gumroad_email      = COALESCE(:em, gumroad_email),
-                    daily_msgs_used    = 0
-                WHERE user_id = :u
-            """), {"st": plan_status, "rn": next_renew, "gid": gumroad_id, "em": email, "u": user_id})
-        s.commit()
+        # Block here; ctrl-C / SIGTERM handled by RQ
+        worker.work(logging_level="INFO")
 
-# ---------- Webhook endpoint ----------
-@router.post("/webhooks/gumroad")
-async def gumroad(req: Request):
-    payload = await _payload_dict(req)
-    if not payload:
-        raise HTTPException(status_code=400, detail="Empty Gumroad payload")
-
-    event = _event_name(payload)
-    tier  = _map_tier(payload)
-    user_id = _find_user_id(payload)
-    gum_id  = str(payload.get("customer_id") or payload.get("gumroad_customer_id") or payload.get("subscriber_id") or "")
-    email   = (payload.get("email") or payload.get("purchaser_email") or payload.get("customer_email") or "")
-
-    logger.info("[Gumroad] event={} tier={} email={} user_id={} keys={}", event, tier, email, user_id, list(payload.keys())[:12])
-
-    if not tier or not user_id:
-        # Accept but ignore unknown products or unresolved users
-        return {"ok": True, "ignored": True}
-
-    e = event
-
-    # BASIC — internal trial allowed for first week
-    if tier == "basic":
-        if e in ("sale", "subscription_started"):
-            renew = _next_charge_at(payload)
-            _set_status(user_id, plan_status=("active" if FREE_TRIAL_DAYS == 0 else "trial"),
-                        next_renew=renew, gumroad_id=gum_id, email=email, start_trial=(FREE_TRIAL_DAYS > 0))
-            # Send quiz link on join
-            convo_id = _latest_convo(user_id)
-            if convo_id and QUIZ_URL:
-                _store_and_send(
-                    user_id, convo_id,
-                    f"You’re in. Take your quiz so I can customize your Bestie — it is quick and makes me scary accurate:\n{QUIZ_URL}"
-                )
-        elif e in ("subscription_payment", "charge", "recurring_charge"):
-            _set_status(user_id, plan_status="active", next_renew=_next_charge_at(payload), gumroad_id=gum_id, email=email)
-        elif e in ("subscription_cancelled", "refund", "chargeback", "subscription_stopped"):
-            _set_status(user_id, plan_status="canceled", next_renew=None, gumroad_id=gum_id, email=email)
-        else:
-            logger.info("[Gumroad] Basic: unhandled event='{}' accepted", e)
-
-    # PLUS
-    elif tier == "plus":
-        if e in ("sale", "subscription_started", "subscription_payment", "charge"):
-            _set_status(user_id, plan_status="plus", next_renew=_next_charge_at(payload), gumroad_id=gum_id, email=email)
-        elif e in ("subscription_cancelled", "refund", "chargeback", "subscription_stopped"):
-            _set_status(user_id, plan_status="canceled", next_renew=None, gumroad_id=gum_id, email=email)
-        else:
-            logger.info("[Gumroad] Plus: unhandled event='{}' accepted", e)
-
-    # ELITE
-    elif tier == "elite":
-        if e in ("sale", "subscription_started", "subscription_payment", "charge"):
-            _set_status(user_id, plan_status="elite", next_renew=_next_charge_at(payload), gumroad_id=gum_id, email=email)
-        elif e in ("subscription_cancelled", "refund", "chargeback", "subscription_stopped"):
-            _set_status(user_id, plan_status="canceled", next_renew=None, gumroad_id=gum_id, email=email)
-        else:
-            logger.info("[Gumroad] Elite: unhandled event='{}' accepted", e)
-
-    return {"ok": True}
+if __name__ == "__main__":
+    main()
