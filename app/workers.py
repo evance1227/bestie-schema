@@ -32,7 +32,7 @@ from sqlalchemy import text as sqltext
 # ------------------------------ App deps ------------------------------- #
 from app import db, models, ai, ai_intent, integrations, linkwrap
 from app.product_search import build_product_candidates, prefer_amazon_first
-from urllib.parse import quote_plus  # keep near the top with other imports if not present
+from urllib.parse import quote_plus  
 
 # ---------------------------------------------------------------------- #
 # Environment and globals
@@ -406,8 +406,7 @@ def _finalize_and_send(
     try:
         if add_cta:
             reply += (
-                "\n\nPS: New “Bestie Team Faves” drop daily—peek back tomorrow. "
-                "Savings tip: try WELCOME10 or search brand + coupon."
+                "\n\nPS: Savings tip: try WELCOME10 or search brand + coupon."
             )
     except Exception:
         pass
@@ -590,11 +589,54 @@ def generate_reply_job(convo_id: int, user_id: int, text_val: str, user_phone: O
             logger.warning("[Intent] Extractor failed: {}", e)
         logger.info("[Intent] intent_data: {}", intent_data)
 
-        # Routine audit path
         if intent_data and intent_data.get("intent") == "routine_audit":
             reply = ai.audit_routine(user_text, constraints=intent_data.get("constraints") or {}, user_id=user_id)
-            reply = _maybe_inject_vip_by_convo(reply, convo_id, user_text)
-            _finalize_and_send(user_id, convo_id, reply, add_cta=True)
+            # No product CTA tails on routine audits
+            # (VIP soft-line is also skipped to keep this clean & helpful)
+            _finalize_and_send(user_id, convo_id, reply, add_cta=False)
+
+            # If the message implies shopping, send a second SMS with 1–3 picks.
+            # Triggers: explicit verbs or the ingredient itself (e.g., "peptides").
+            try:
+                want_products = any(w in normalized_text for w in [
+                    "recommend","recommendation","suggest","what should","which","looking for","peptide","peptides"
+                ])
+                if want_products:
+                    # Minimal peptide search intent – Amazon-first monetization
+                    secondary_intent = {
+                        "intent": "find_products",
+                        "query": "peptide serum",          # simple default seed
+                        "category": "skincare",
+                        "constraints": {"channel": "amazon", "count": 3}
+                    }
+                    picks = prefer_amazon_first(build_product_candidates(secondary_intent))
+
+                    if picks:
+                        gpt_products = [{
+                            "name": p.get("title") or p.get("name") or "Product",
+                            "category": "skincare",
+                            "url": p.get("url",""),
+                            "review": p.get("review",""),
+                        } for p in picks[:3]]
+
+                        rec_text = ai.generate_reply(
+                            user_text=user_text,
+                            product_candidates=gpt_products,
+                            user_id=user_id,
+                            system_prompt=(
+                                "You are Bestie. Use the provided product candidates (already monetized DP URLs).\n"
+                                "FORMAT AS A NUMBERED LIST with bold names so link hygiene can attach if needed:\n"
+                                "1. **Name**: one-liner benefit. URL\n"
+                                "Keep the whole reply ~450 chars. 1–3 options max. No disclaimers. Do not alter or replace URLs."
+                            ),
+                            context={"session_goal": "offer quick peptide product picks"}
+                        )
+                        rec_text = _fix_cringe_opening(rec_text)
+                        # No CTA tail here either; links are monetized by linkwrap
+                        _finalize_and_send(user_id, convo_id, rec_text, add_cta=False)
+            except Exception as e:
+                logger.warning("[Routine+Products] Secondary picks failed: {}", e)
+
             return
 
         # ---------- Product candidates ----------
