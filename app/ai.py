@@ -558,7 +558,8 @@ def rewrite_different(
     out = (resp.choices[0].message.content or "").strip()
     return _sanitize_output(out)
 # ------------------ Routine audit (AM/PM map) ------------------ #
-from typing import Optional, Dict  # (safe if already imported)
+# ------------------ Routine audit (AM/PM map) ------------------ #
+from typing import Optional, Dict  # safe if already imported; Python ignores duplicates
 
 def audit_routine(user_text: str, constraints: Optional[Dict] = None, user_id: Optional[int] = None) -> str:
     """
@@ -568,7 +569,6 @@ def audit_routine(user_text: str, constraints: Optional[Dict] = None, user_id: O
     """
     tlow = (user_text or "").lower()
     ings = set(((constraints or {}).get("ingredients") or []))
-    # flags from text or parsed ingredients
     has = lambda k: (k in tlow) or (k in ings)
 
     flags = {
@@ -593,9 +593,7 @@ def audit_routine(user_text: str, constraints: Optional[Dict] = None, user_id: O
         am.append("Vitamin C (thin layer, then serum)")
     if flags["niacinamide"]:
         am.append("Niacinamide (plays nice)")
-    am.append("Hydrator/serum")
-    am.append("Moisturizer")
-    am.append("SPF 30+{}".format(" (mineral if sensitive)" if flags["sensitive"] else ""))
+    am += ["Hydrator/serum", "Moisturizer", "SPF 30+" + (" (mineral if sensitive)" if flags["sensitive"] else "")]
 
     # PM defaults
     pm_core = ["Cleanse", "Hydrator", "Moisturizer"]
