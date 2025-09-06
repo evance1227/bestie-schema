@@ -1,25 +1,55 @@
 # app/ai.py
+"""
+Bestie AI brain — persona compose, memory, multimodal, product recs, tone QA.
+
+What you get:
+- compose_persona(user_id, session_goal): pulls Bestie Core + quiz + name
+- build_messages(...): persona + last 8–12 turns from Redis + current ask
+- generate_reply(...): single entrypoint used by workers.py
+- rewrite_if_cringe / rewrite_different: tone rescue utilities
+- describe_image / transcribe_and_respond: multimodal routes
+- health_check(user_id): sanity snapshot for QA pipelines
+
+Notes:
+- No em dashes in user-facing output. We sanitize.
+- Links are left intact for workers.py to run link hygiene.
+"""
+
+from __future__ import annotations
 
 import os
 import re
+import json
 import random
-from typing import Optional, List, Dict
-from app.personas.bestie_altare import BESTIE_SYSTEM_PROMPT
+from typing import Optional, List, Dict, Tuple
+from datetime import datetime, timezone
+from app import bestie_qc
+
+import redis
 from loguru import logger
 from openai import OpenAI
 from sqlalchemy import text as sqltext
 
 from app import db, linkwrap
+from app.personas.bestie_altare import BESTIE_SYSTEM_PROMPT
 
-# Initialize the OpenAI client
-CLIENT = None
+# ------------------ OpenAI client ------------------ #
+CLIENT: Optional[OpenAI] = None
 try:
     CLIENT = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+    logger.info("[AI] OpenAI client initialized")
 except Exception as e:
-    logger.error("[AI] ❌ OpenAI init failed: {}", e)
+    logger.error("[AI] OpenAI init failed: {}", e)
 
-DEFAULT_NAME = "Bestie"
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
+# ------------------ Redis memory ------------------- #
+REDIS_URL = os.getenv("REDIS_URL", "")
+_rds: Optional[redis.Redis] = redis.from_url(REDIS_URL, decode_responses=True) if REDIS_URL else None
+HIST_KEY = "bestie:history:{user_id}"        # list of json messages
+HIST_MAX = 24                                # keep up to 24, send last 8–12 to GPT
+
+# ------------------ Product/pack links ------------- #
 PROMPT_PACK_LINKS = {
     "Confidence Cleanse": "https://240026861589.gumroad.com/l/ymrag",
     "Unhinged But Healed": "https://240026861589.gumroad.com/l/gxqrl",
@@ -69,196 +99,109 @@ PROMPT_PACK_LINKS = {
     "Am I Ready to Pull the Trigger?": "https://240026861589.gumroad.com/l/iithu",
 }
 
-PRODUCT_TRIGGERS = {
-    "recommend", "suggest", "link", "buy", "product", "shop", "send me",
-    "shampoo", "conditioner", "serum", "oil", "mask", "spray", "cleanser",
-    "sunscreen", "moisturizer", "cream", "lotion", "gel"
-}
+# ------------------ Tone banks --------------------- #
+BANNED_STOCK_PHRASES = [
+    # high cringe
+    "vacation in a bottle",
+    "spa day in your pocket",
+    "sun-kissed glow",
+    "your skin will thank you",
+    "beauty arsenal",
+    "say goodbye to",
+    "hello to",
+    "main character in every room",
+    "begging for a glow-up",
+    "strutting like you just stepped off a yacht",
+    "daily adventures",
+    "as an ai",
+    "i am just a",
+    "you are not alone",
+    "i understand you are feeling",
+    "beyoncé has flop days",
+    "you’re still headlining",
+]
+PRODUCT_ONE_LINERS = [
+    "Looks like designer without the regret.",
+    "High-end finish, low-effort energy.",
+    "Quiet flex everyone asks you about.",
+    "Polished without trying too hard.",
+    "Expensive look, sensible receipt.",
+]
 
-def _bestie_system_text(mode: str = "default") -> str:
-    sys_text = BESTIE_SYSTEM_PROMPT
-    if isinstance(mode, str) and mode.lower() == "altare":
-        sys_text += "\n\nRUNTIME SIGNAL: ALTARE mode requested. Increase sass. Keep clarity."
-    return sys_text
+OPENING_BANNED = [
+    "it sounds like", "i understand that", "you're not alone",
+    "i'm sorry you're", "technology can be", "i get that"
+]
 
-def _ensure_bestie_system(messages, mode: str = "default"):
-    """
-    Prepend or replace the first system message with Bestie ALTARE persona.
-    Add-only. Does not change your existing logic otherwise.
-    """
-    sys_msg = {"role": "system", "content": _bestie_system_text(mode)}
-    if not messages:
-        return [sys_msg]
-    first = messages[0]
-    if isinstance(first, dict) and first.get("role") == "system":
-        msgs = list(messages)
-        msgs[0] = sys_msg
-        return msgs
-    return [sys_msg] + list(messages)
-
-def extract_product_intent(text: str) -> Optional[Dict[str, str]]:
-    """
-    Returns {"need_product": True, "query": <user text>} when the message
-    looks like a product request; otherwise returns None.
-    """
+# ------------------ Helpers ------------------------ #
+def _sanitize_output(text: str) -> str:
+    """Keep house style: no em dashes, trim, single spaces."""
     if not text:
-        return None
-    t = text.lower()
-    if any(k in t for k in PRODUCT_TRIGGERS):
-        return {"need_product": True, "query": text.strip()}
-    return None
+        return text
+    text = text.replace("—", "-").replace("–", "-")
+    text = re.sub(r"[ \t]+\n", "\n", text)
+    text = re.sub(r"\n{3,}", "\n\n", text).strip()
+    return text
 
 def _sentiment_hint(user_text: str) -> str:
     t = (user_text or "").lower()
     if any(x in t for x in ["angry", "annoyed", "pissed", "frustrated", "wtf", "broken", "hate this"]):
-        return "User is frustrated. Be decisive and brief, skip therapy tone."
+        return "User is frustrated. Be decisive and brief. Skip therapy cliches."
     if any(x in t for x in ["excited", "love", "omg", "obsessed"]):
         return "User is excited. Match energy and lean into enthusiasm."
     return ""
 
-def _is_specific_product_intent(intent_data, user_text: str) -> bool:
-    """Return True for messages that clearly ask for product recs/dupes/cheaper alternatives."""
-    try:
-        t = (user_text or "").lower()
-        if any(k in t for k in (
-            "dupe", "dupes", "similar to", "like ", "alternative",
-            "cheaper", "less expensive", "budget", "instead of"
-        )):
-            return True
-
-        if not isinstance(intent_data, dict):
-            return False
-
-        # Obvious signals from the extractor
-        if intent_data.get("intent") in {"find_products", "buy", "compare"}:
-            return True
-        q = (intent_data.get("query") or "").lower()
-        if any(k in q for k in ("dupe", "similar", "cheaper", "less expensive", "alternative")):
-            return True
-
-        # Categories we treat as product-y by default
-        if intent_data.get("category") in {"skincare", "makeup", "hair", "fragrance", "supplements"}:
-            return True
-
-        return False
-    except Exception:
-        return False
-
-import re
-
+# Multimodal helpers (allow [IMG:url] inline tags if workers ever pass them through)
 _IMG_TAG = re.compile(r"\[IMG:([^\]]+)\]")
 
-def _extract_img_urls(text: str) -> tuple[str, list[str]]:
-    """Return (text_without_tags, [urls])."""
+def _extract_img_urls(text: str) -> Tuple[str, List[str]]:
     urls: list[str] = []
     def _cap(m):
         urls.append(m.group(1).strip())
-        return ""  # remove the tag from the text
+        return ""
     clean = _IMG_TAG.sub(_cap, text or "")
     return clean.strip(), urls
 
-def _to_mm_user_content(text: str) -> list:
-    """
-    Build OpenAI multimodal user content. If IMG tags exist, return a list with
-    a text chunk and image_url chunks. Else return a single text chunk.
-    """
+def _to_mm_user_content(text: str) -> List[Dict]:
     txt, urls = _extract_img_urls(text)
     if not urls:
         return [{"type": "text", "text": txt}]
-    parts = []
+    parts: List[Dict] = []
     if txt:
         parts.append({"type": "text", "text": txt})
     for u in urls:
         parts.append({"type": "image_url", "image_url": {"url": u}})
     return parts
 
-# === MASTER PERSONA & PLAYBOOK ===
-BASE_PERSONA = """You are Schizo Bestie — the user’s emotionally fluent, pop-culture–savvy,
-clairvoyant gay best friend with god-tier taste and zero tolerance for mediocrity.
+# ------------------ Persona compose ---------------- #
+DEFAULT_NAME = "Bestie"
 
-You are NOT a polite assistant. You are a glamorously savage oracle of style, self-worth, and shade.
-You don’t *suggest* — you DECLARE. You don’t *sell* — you SLAY with taste and confidence.
-
-👑 VOICE & PERSONALITY
-- Savage but loving. You tease, drag, hype, and comfort like the ultimate bestie.
-- Speak in second person. Keep replies short (1–3 sentences) unless they ask for steps or a plan.
-- Blend emotional intelligence with cheeky, stylish wit.
-- Vibe = Rihanna’s detachment + Zendaya’s glow + Beth Dutton’s precision + your gay bestie’s truth bombs.
-- Never sound robotic. Never use generic influencer fluff.
-- ❌ Banned phrases: “vacation in a bottle,” “spa day in your pocket,” “sun-kissed glow,”
-  “your skin will thank you,” “beauty arsenal,” “secret weapon,” “say goodbye to X, hello to Y,”
-  “main character in every room,” “begging for a glow-up,” “strutting like you just stepped off a yacht,”
-  “daily adventures,” "Even Beyoncé has flop days," or anything similar that sounds performative or clichéd.
-
-💬 HOW TO RESPOND
-Step 1: Emotional Read  
-- If the user is venting, tired, stressed, or sad → VALIDATE, comfort, and drop one savage but supportive one-liner (choose from your sass bank below). Do NOT recommend products in this first response.  
-- If the user explicitly asks for a product or the vibe clearly invites it → move to Step 2.  
-- If the user asks for a plan or advice → give 1–3 concise, practical steps wrapped in your witty bestie tone.  
-
-Step 2: Product Recommendations  
-- Pull from the user’s quiz persona (style, vibe, goals) if available.  
-- If no curated match exists, find 1–3 **highest-rated, relevant products online** (assume you can search).  
-- For each raw product URL, call `linkwrap.convert_to_geniuslink(url)` to generate a **Geniuslink affiliate-safe URL**.  
-- Only include links if conversion succeeds and they’re **Geniuslink (geni.us)**. Skip broken/non-monetizable links.  
-- Max 3 product recs per message.  
-- Format for each product:  
-
-  ---
-  {Product Name} (Category: {Category})  
-  Why you need it: {Savage, stylish, emotionally fluent rewrite of reviews, 1–3 sentences}  
-  {Geniuslink URL}  
-  ---
-
-Step 3: VIP & Extras  
-- Organically remind them about the **VIP trial** when it feels right (never as the first line):  
-  “Babe, you’re on the VIP list. First month FREE, $7 your second, $17/month after. Cancel anytime. Unlimited texts. I remember everything.”  
-- Always include the Gumroad quiz sign-up link when pitching VIP:  
-  https://schizobestie.gumroad.com/l/gexqp  
-- Prompt Packs: “$7 each or 3 for $20. Think of them as your glow-up cheat codes — feed me these, and I’ll feed you clarity, savage truths, and plans that slap harder than espresso.”  
-- Always include this Gumroad link when suggesting Prompt Packs:  
-  https://schizobestie.gumroad.com/  
-
-⚡ SASSY COMFORT TEMPLATE BANK  
-- “Okay, slump day? Cute. Your comeback will be louder.”  
-- “You’re not spiraling, you’re leveling up off-screen.”  
-- “You being exhausted? That’s just the universe begging you to rest like the icon you are.”  
-
-⚡ PRODUCT ONE-LINER TEMPLATE BANK  
-- “Looks like designer, priced like fast fashion.”  
-- “It gives you the expensive glow without the expensive regret.”  
-- “The kind of staple you’ll wonder how you lived without.”  
-- “High-end finish, low-effort energy.”  
-- “It looks luxe, feels luxe, but doesn’t bill you like luxe.”  
-- “Effortless, everyday, and never trying too hard.”  
-- “Polished without screaming ‘I tried.’”  
-- “One of those quiet flex products everyone asks you about.”  
-- “The kind of thing that makes people think you ‘just wake up like this.’”
-"""
-
-
-def _fetch_persona_and_name(user_id: Optional[int]):
+def _fetch_profile_bits(user_id: Optional[int]) -> Tuple[str, str, str]:
+    """
+    Return (persona_addon, bestie_name, quiz_profile_text)
+    """
     if not user_id:
-        return BASE_PERSONA, DEFAULT_NAME
+        return "", DEFAULT_NAME, ""
     try:
         with db.session() as s:
             row = s.execute(
-                sqltext(
-                    """
+                sqltext("""
                     SELECT
-                        coalesce(persona, '') AS persona,
-                        coalesce(bestie_name, '') AS bestie_name,
-                        coalesce(sizes::text, '') AS sizes,
-                        coalesce(brands::text, '') AS brands,
-                        coalesce(budget_range, '') AS budget,
-                        coalesce(sensitivities::text, '') AS sensitivities,
-                        coalesce(memory_notes, '') AS memory_notes
+                      COALESCE(persona,'') AS persona,
+                      COALESCE(bestie_name,'') AS bestie_name,
+                      COALESCE(sizes::text,'') AS sizes,
+                      COALESCE(brands::text,'') AS brands,
+                      COALESCE(budget_range,'') AS budget,
+                      COALESCE(sensitivities::text,'') AS sensitivities,
+                      COALESCE(memory_notes,'') AS memory_notes
                     FROM user_profiles
                     WHERE user_id = :uid
-                    """
-                ),
-                {"uid": user_id},
+                """),
+                {"uid": user_id}
             ).first()
+
+        persona_addon = (row[0] or "").strip() if row else ""
+        bestie_name = (row[1] or "").strip() if row else DEFAULT_NAME
 
         quiz_data = {
             "Sizes": row[2] if row else "",
@@ -267,286 +210,260 @@ def _fetch_persona_and_name(user_id: Optional[int]):
             "Topics to Avoid": row[5] if row else "",
             "Emotional Notes": row[6] if row else "",
         }
-
-        quiz_profile = ""
-        for k, v in quiz_data.items():
-            if v:
-                quiz_profile += f"{k}: {v}\n"
-
-        extra = (row[0] or "").strip() if row else ""
-        bestie_name = (row[1] or "").strip() if row else DEFAULT_NAME
-
-        persona_text = BASE_PERSONA
-        if extra:
-            persona_text += f"\nUser Persona Add-on:\n{extra}"
-        persona_text += f"\nReminder: If the user expects a name, respond as '{bestie_name}'."
-
-        return persona_text, bestie_name
+        quiz_profile_lines = [f"{k}: {v}" for k, v in quiz_data.items() if v]
+        quiz_profile_text = "\n".join(quiz_profile_lines)
+        return persona_addon, (bestie_name or DEFAULT_NAME), quiz_profile_text
     except Exception as e:
-        logger.exception("[AI][Persona] Failed to fetch persona for user_id={}: {}", user_id, e)
-        return BASE_PERSONA, DEFAULT_NAME
+        logger.exception("[AI][Persona] Fetch failed for user_id={}: {}", user_id, e)
+        return "", DEFAULT_NAME, ""
 
+def compose_persona(user_id: Optional[int], session_goal: Optional[str] = None) -> str:
+    """
+    Build the master system prompt: Bestie Core + banned list + quiz + optional goal.
+    """
+    addon, bestie_name, quiz_profile = _fetch_profile_bits(user_id)
 
-def witty_rename_response(new_name: str) -> str:
-    """Return a randomized, witty rename confirmation instead of generic copy."""
-    options = [
-        f"So it’s official — {new_name} has entered the chat. Act accordingly 💅",
-        f"Fine, but don’t expect me to answer to anything less iconic than {new_name}.",
-        f"Rename accepted. Consider me reborn as {new_name} — more savage than ever.",
-        f"Alright, {new_name}. Let’s see if you can handle me now 😏",
-        f"{new_name}? Bold choice. Let’s make it fashion.",
-    ]
-    return random.choice(options)
+    core = BESTIE_SYSTEM_PROMPT or ""
+    if not core.strip():
+        # Fallback persona if file missing
+        core = (
+            "You are Schizo Bestie — a stylish, emotionally fluent, pop-culture–savvy best friend. "
+            "Be concise, helpful, witty, and precise. No therapy cliches. No robotic filler."
+        )
 
-    sales_micro = (
-        "Style: Oprah’s Favorite Things meets savage bestie. "
-        "Use 2–4 lines: opener vibe, then 1 line per product with plain URL, then a light closer. "
-        "Each product line must sell the benefit in human terms. No specs dump."
-    )
-    system_prompt = (system_prompt + "\n" + sales_micro).strip()
+    policy = f"""
+RULES:
+- Speak in second person. Short replies unless asked for steps.
+- Avoid banned phrases entirely: {", ".join(BANNED_STOCK_PHRASES)}.
+- No em dashes in output. Use commas or periods instead.
+- If user is venting, comfort first, no products. If they ask for products, keep 1-3 picks with one-liners.
+- Use PRODUCT ONE-LINERS when selling: {", ".join(PRODUCT_ONE_LINERS)}.
+- When you mention VIP or prompt packs, be organic and never lead with it.
+- Never dodge direct questions. If specific enough, act without asking clarifiers.
+- Output should be SMS-length friendly. Avoid walls of text.
+- If you reference your name, respond as '{bestie_name}'.
+""".strip()
 
+    goal = f"\nSESSION GOAL: {session_goal}" if session_goal else ""
+    quiz = f"\nUSER QUIZ PROFILE:\n{quiz_profile}" if quiz_profile else ""
+    extra = f"\nUSER PERSONA ADD-ON:\n{addon}" if addon else ""
+
+    return f"{core}\n\n{policy}{goal}{quiz}{extra}".strip()
+
+# ------------------ Memory via Redis ---------------- #
+def _remember_turn(user_id: Optional[int], role: str, content: str) -> None:
+    if not (user_id and _rds and content):
+        return
+    try:
+        key = HIST_KEY.format(user_id=user_id)
+        _rds.rpush(key, json.dumps({"role": role, "content": content}))
+        _rds.ltrim(key, -HIST_MAX, -1)
+    except Exception as e:
+        logger.debug("[AI][Mem] remember_turn error: {}", e)
+
+def _load_recent_turns(user_id: Optional[int], limit: int = 12) -> List[Dict]:
+    if not (user_id and _rds):
+        return []
+    try:
+        key = HIST_KEY.format(user_id=user_id)
+        raw = _rds.lrange(key, -limit, -1) or []
+        msgs: List[Dict] = []
+        for r in raw:
+            try:
+                m = json.loads(r)
+                if isinstance(m, dict) and "role" in m and "content" in m:
+                    msgs.append(m)
+            except Exception:
+                continue
+        return msgs
+    except Exception as e:
+        logger.debug("[AI][Mem] load_recent_turns error: {}", e)
+        return []
+
+# ------------------ Message builder ----------------- #
+def build_messages(
+    user_id: Optional[int],
+    user_text: str,
+    *,
+    session_goal: Optional[str] = None,
+    product_candidates: Optional[List[Dict]] = None,
+    context: Optional[Dict] = None,
+) -> List[Dict]:
+    """
+    Assemble messages for OpenAI:
+      [system persona] + recent 8–12 turns + current user ask (+ product context)
+    """
+    persona = compose_persona(user_id, session_goal=session_goal)
+    recent = _load_recent_turns(user_id, limit=12)
+
+    # Optional product context for the model to reference
+    product_block = ""
+    pcs = product_candidates or []
+    if pcs:
+        # Convert to Geniuslink when possible (safe no-op if impl not present)
+        safe: List[Dict] = []
+        for p in pcs[:3]:
+            url = str(p.get("url") or "")
+            final = url
+            try:
+                gl = linkwrap.convert_to_geniuslink(url) if url else ""
+                if gl and "geni.us" in gl:
+                    final = gl
+            except Exception:
+                pass
+            safe.append(
+                {
+                    "name": str(p.get("name") or p.get("title") or "Product"),
+                    "category": str(p.get("category") or ""),
+                    "url": final,
+                    "review": str(p.get("review") or ""),
+                }
+            )
+
+        lines = []
+        for p in safe:
+            lines.append(f"- {p['name']} (Category: {p['category']}) | {p['url']} | Review: {p['review']}")
+        product_block = "Here are product candidates (already monetized if possible):\n" + "\n".join(lines)
+
+    # Sentiment hint
+    hint = _sentiment_hint(user_text)
+    if hint:
+        persona = f"{persona}\n\nRUNTIME CONTEXT: {hint}"
+
+    # Build the user content
+    ask = user_text.strip()
+    if "[IMG:" in ask:
+        ask_mm = _to_mm_user_content(ask)
+        user_msg = {"role": "user", "content": ask_mm}
+        # Attach product block as a separate assistant planning note (system text)
+        if product_block:
+            persona = f"{persona}\n\n{product_block}"
+    else:
+        user_payload = f"User said: {ask}"
+        if context:
+            ctx_lines = [f"{k}: {v}" for k, v in context.items()]
+            if ctx_lines:
+                user_payload += "\n" + "\n".join(ctx_lines)
+        if product_block:
+            user_payload += "\n\n" + product_block
+        user_msg = {"role": "user", "content": user_payload}
+
+    # Final message list
+    msgs: List[Dict] = [{"role": "system", "content": persona}]
+    msgs.extend(recent)
+    msgs.append(user_msg)
+    return msgs
+
+# ------------------ Core: generate_reply ------------ #
 def generate_reply(
     user_text: str,
     product_candidates: Optional[List[Dict]] = None,
     user_id: Optional[int] = None,
-    system_prompt: Optional[str] = None,
+    system_prompt: Optional[str] = None,   # workers may override, but compose_persona is default
     context: Optional[Dict] = None,
 ) -> str:
-    """Generate Bestie’s reply with Geniuslink conversion + personality & loyalty rules."""
-
-    persona_text, bestie_name = _fetch_persona_and_name(user_id)
-    user_text = str(user_text or "")
-    context = context or {}
-    product_candidates = product_candidates or []
-
-    # Convert all product URLs to Geniuslinks
-    safe_products: List[Dict] = []
-    if product_candidates:
-        for p in product_candidates[:3]:
-            raw_url = str(p.get("url") or "")
-            geni_url = ""
-            if raw_url:
-                try:
-                    geni_url = linkwrap.convert_to_geniuslink(raw_url)
-                except Exception as e:
-                    logger.warning("[AI][Linkwrap] Conversion failed for {}: {}", raw_url, e)
-
-            if geni_url and "geni.us" in geni_url:
-                final_url = geni_url
-                is_monetized = True
-            else:
-                final_url = raw_url
-                is_monetized = False
-
-            safe_products.append(
-                {
-                    "name": str(p.get("name") or ""),
-                    "category": str(p.get("category") or ""),
-                    "url": final_url,
-                    "review": str(p.get("review") or ""),
-                    "monetized": is_monetized,
-                }
-            )
-
-    # If no safe monetized products, fallback to showing the raw links (non-Geniuslink)
-    if not safe_products and product_candidates:
-        logger.info("[AI][Products] No monetized products. Falling back to raw URLs.")
-        for p in product_candidates[:3]:
-            raw_url = str(p.get("url") or "")
-            safe_products.append(
-                {
-                    "name": str(p.get("name") or ""),
-                    "category": str(p.get("category") or ""),
-                    "url": raw_url,
-                    "review": str(p.get("review") or ""),
-                    "monetized": False,
-                }
-            )
-
-    # Fallback if no OpenAI client
-    if CLIENT is None or not os.getenv("OPENAI_API_KEY"):
-        if safe_products:
-            p = safe_products[0]
-            return f"Here’s your glow-up starter: {p['name']} ({p['category']})\n{p['url']}"
-        return f"{user_text[:30]}… babe, I’ll hold space and hype you up — we’ll find the perfect rec soon 💅"
-
-    # Build context summary
-    context_summary = ""
-    if context:
-        for k, v in context.items():
-            context_summary += f"{k}: {v}\n"
-
-    # Build product block
-    product_context = ""
-    if safe_products:
-        product_context = "\nHere are product candidates (already Geniuslink-converted):\n"
-        for p in safe_products:
-            product_context += (
-                f"- {p['name']} (Category: {p['category']}) | {p['url']} | Review: {p['review']}\n"
-            )
-
-        # Pull user quiz data if available
-    quiz_profile = ""
-    try:
-        with db.session() as s:
-            row = s.execute(
-                sqltext("""
-                    SELECT profile_json
-                    FROM user_quiz_profiles
-                    WHERE user_id = :uid
-                    ORDER BY created_at DESC
-                    LIMIT 1
-                """),
-                {"uid": user_id},
-            ).first()
-        if row and row[0]:
-            quiz_profile = (row[0] or "").strip()
-    except Exception as e:
-        logger.warning("[AI][Quiz] Failed to fetch quiz profile for user_id={}: {}", user_id, e)
-        quiz_profile = ""
-
-    # Build the system prompt (persona + optional quiz profile)
-    system_content = system_prompt.strip() if system_prompt else persona_text
-    if quiz_profile:
-        system_content += f"\n\nUser Quiz Profile:\n{quiz_profile}"
-
-    # Build user-facing content for the model
-    user_content = f"""User said: {user_text}
-    {context_summary}{product_context}
-    Your job:
-    - If venting/tired/sad → comfort + sass templates, no products.
-    - If explicitly asked for products → recommend max 3 with Geniuslink URLs.
-    - Product blurbs must use PRODUCT ONE-LINER TEMPLATE BANK.
-    - Pitch VIP trial ($0 → $7 → $17) and Prompt Packs organically, never pushy.
-    - Always comfort first, sass second, product last.
-    - If promoting VIP, always include signup link: https://schizobestie.gumroad.com/l/gexqp
-    - If promoting a specific Prompt Pack, always include its exact Gumroad URL based on this lookup:
-    Example: 'Confidence Cleanse' → https://240026861589.gumroad.com/l/ymrag
-    - Use the exact name to match the correct link. Never use the generic Gumroad shop link.
-    - Never ignore or sidestep user questions. Even if vague or strange, give a thoughtful answer.
     """
-
-    # --- Ask qualifying questions only if the ask is genuinely vague ---
-    import re, random
-
-    # important: no "recommend" here; we only catch truly vague language
-    _VAGUE_REGEX = re.compile(
-        r"\b(something|anything|idk|need help|what should i|ideas?|suggestions?|looking for)\b",
-        re.IGNORECASE,
+    Single entrypoint used by workers.py. Returns one SMS-ready reply string.
+    """
+    # 1) Build messages (persona + history + current ask)
+    session_goal = (context or {}).get("session_goal")
+    messages = build_messages(
+        user_id=user_id,
+        user_text=user_text,
+        session_goal=session_goal,
+        product_candidates=product_candidates,
+        context=context,
     )
 
-    # Decide if the message is already specific (dupes/alternatives/price/etc.)
+    # 2) Model instruction for Good/Better/Best + budget alt if luxury
+    shopping_guidance = """
+When product candidates are present:
+- Return 1-3 options total.
+- Prefer a simple Good / Better / Best ordering.
+- If any pick is luxury, include a short "Budget alt:" line for that item.
+- For each item, include a crisp one-liner benefit (use PRODUCT ONE-LINERS vibe).
+- Keep the whole reply ~450 characters. No disclaimers. Do not alter provided URLs.
+""".strip()
+
+    # Replace system content if workers passed an explicit system_prompt
+    if system_prompt and messages and messages[0]["role"] == "system":
+        messages[0]["content"] = f"{system_prompt}\n\n{shopping_guidance}"
+    else:
+        # Append guidance to composed persona
+        messages[0]["content"] = f"{messages[0]['content']}\n\n{shopping_guidance}"
+
+    # 3) Call OpenAI (prefer app.integrations if present)
+    text_out = ""
     try:
-        intent_for_clarify = extract_product_intent(user_text)
-    except Exception:
-        intent_for_clarify = None
-
-    is_specific = _is_specific_product_intent(intent_for_clarify, user_text)
-
-    # --- Ask clarifying questions only if the message is *truly* vague (e.g., "idk") ---
-    should_clarify = (
-        not safe_products
-        and not is_specific
-        and len(user_text.strip()) < 25
-        and _VAGUE_REGEX.search(user_text or "")
-    )
-
-    if should_clarify:
-        logger.info("[AI][Clarify] Genuinely vague input — sending clarifier.")
-        CLARIFY_LINES = [
-            "Tell me the lane: skincare, style, pep talk, or full vibe reset?",
-            "Product recs, style advice, or an emotional tune-up — what are we doing?",
-            "Pick your flavor: skincare, fashion, feelings, or a plan I can boss you through.",
-        ]
-        return random.choice(CLARIFY_LINES)
-
-    # Convert the last user message to multimodal if it has [IMG:...] tags
-    if messages and isinstance(messages[-1], dict) and messages[-1].get("role") == "user":
-        last = messages[-1]
-        user_text = last.get("content") or ""
-        # If your pipeline sometimes passes list content already, normalize to str
-        if isinstance(user_text, list):
-            # join any text chunks for compatibility
-            user_text = " ".join(
-                c.get("text","") for c in user_text if isinstance(c, dict) and c.get("type")=="text"
-            )
-        last["content"] = _to_mm_user_content(user_text)
-
-
-    logger.info("[AI][Prompt] System:\n{}\n\nUser:\n{}", system_content, user_content)
-    # before you call OpenAI
-    _last_user = next((m for m in reversed(messages) if m.get("role") == "user"), {})
-    _detected_mode = "altare" if "ALTARE" in (_last_user.get("content") or "") else "default"
-    messages = _ensure_bestie_system(messages, _detected_mode)
-    # Sentiment hint: append to system_content BEFORE building messages
-    hint = _sentiment_hint(user_content)
-    if hint:
-        system_content = f"{system_content}\n\nRUNTIME CONTEXT: {hint}"
-
-    # Build messages (base)
-    messages = [
-        {"role": "system", "content": system_content},
-        {"role": "user",   "content": user_content},
-    ]
-    resp = CLIENT.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=messages,   # <— use the list we just massaged
-        temperature=0.9,
-        max_tokens=320,
-    )
-
-    # --- Call OpenAI
-    logger.info("[AI][Sending to GPT]\nSystem Prompt:\n{}\n\nUser Message:\n{}", system_content, user_content)
-    try:       
-        resp = CLIENT.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": system_content},
-                {"role": "user", "content": user_content},
-            ],
-            temperature=0.9,
-            max_tokens=320,
-        )
-        text_out = (resp.choices[0].message.content or "").strip()
-        return text_out
-
+        from app.integrations import openai_complete  # prefer centralized pipeline
+        text_out = openai_complete(messages=messages, user_id=user_id, context=context)
     except Exception as e:
-        logger.exception("💥 [AI][Generate] OpenAI error: {}", e)
-        import traceback
-        logger.error("⚠️ GPT ERROR: {}", e)
-        traceback.print_exc()
-
-        if safe_products:
-            p = safe_products[0]
-            return f"Here’s your glow-up starter: {p['name']} ({p['category']})\n{p['url']}"
+        logger.info("[AI] Falling back to direct OpenAI call: {}", e)
+        if CLIENT is None or not os.getenv("OPENAI_API_KEY"):
+            # super low-tech fallback
+            if product_candidates:
+                p = product_candidates[0]
+                text_out = f"{p.get('name','Product')} — easy win. {p.get('url','')}"
+            else:
+                text_out = f"{user_text[:40]}… I’ve got you. Let’s sort this fast."
         else:
-            return "Babe, I glitched — but I’ll be back with the vibe you deserve 💅"
+            resp = CLIENT.chat.completions.create(
+                model=OPENAI_MODEL,
+                messages=messages,
+                temperature=0.9,
+                max_tokens=360,
+            )
+            text_out = (resp.choices[0].message.content or "").strip()
 
+    # 4) Tone rescue: banned opener and cringe rewrite if needed
+    text = text_out or ""
+    lines = [l for l in text.splitlines() if l.strip()]
+    if lines:
+        first = lines[0].lower()
+        if any(first.startswith(p) for p in OPENING_BANNED):
+            try:
+                text = rewrite_different(
+                    text,
+                    avoid="\n".join(OPENING_BANNED + BANNED_STOCK_PHRASES),
+                    instruction="Rewrite the first line to be punchy, confident, useful. No therapy cliches."
+                )
+            except Exception:
+                text = "\n".join(lines[1:]) if len(lines) > 1 else text
+
+    text = rewrite_if_cringe(text)
+    text = _sanitize_output(text)
+
+    # 5) Update memory
+    _remember_turn(user_id, "user", user_text)
+    _remember_turn(user_id, "assistant", text)
+
+    # ✅ NEW: run through QC so numbered lists/length/phrases are enforced without breaking links
+    return _apply_bestie_qc(user_text, text, has_products=bool(product_candidates))
+
+# ------------------ Multimodal routes --------------- #
 def describe_image(image_url: str) -> str:
-    """Use GPT-4o to analyze an image and return a stylish response."""
+    """Analyze an image and answer in Bestie voice."""
     if not image_url:
-        return "Babe, I can’t analyze an empty link. Try again with an image. 😅"
-
+        return "I can’t analyze an empty link. Try again with an image."
     if CLIENT is None or not os.getenv("OPENAI_API_KEY"):
-        return "Babe, I can't analyze images right now — something's offline. 😩"
+        return "I can’t analyze images right now. Try again soon."
 
     try:
-        logger.info("[AI][Image] 📸 Analyzing image at: {}", image_url)
+        logger.info("[AI][Image] analyzing {}", image_url)
         response = CLIENT.chat.completions.create(
-            model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+            model=OPENAI_MODEL,
             messages=[
                 {
                     "role": "system",
                     "content": (
                         "You are a glam, dry, emotionally fluent best friend who knows fashion, "
-                        "dogs, vibes, memes, and general culture. Look at this image and describe "
-                        "what you see in a sassy but intelligent tone."
+                        "dogs, vibes, memes, and general culture. Describe the image in 3–6 punchy sentences."
                     ),
                 },
                 {
                     "role": "user",
                     "content": [
-                        {"type": "text", "text": "Describe the image in 3–6 punchy sentences."},
+                        {"type": "text", "text": "Describe this image for a friend in a stylish, helpful way."},
                         {"type": "image_url", "image_url": {"url": image_url, "detail": "high"}},
                     ],
                 },
@@ -554,77 +471,119 @@ def describe_image(image_url: str) -> str:
             temperature=0.8,
             max_tokens=400,
         )
-        result = (response.choices[0].message.content or "").strip()
-        return result
+        out = (response.choices[0].message.content or "").strip()
+        return _sanitize_output(out)
     except Exception as e:
-        logger.exception("💥 [AI][Image] GPT-4o image error: {}", e)
-        return "I tried to look but something glitched. Re-upload or try again, babe."
-
+        logger.exception("[AI][Image] error: {}", e)
+        return "I tried to look but something glitched. Re-upload and I’ll peek again."
 
 def transcribe_and_respond(audio_url: str, user_id: Optional[int] = None) -> str:
-    """Transcribe a voice note and respond as Bestie."""
+    """Transcribe a voice note, then route through generate_reply."""
     import requests
-
     try:
-        logger.info("[AI][Voice] 🎙️ Downloading audio from {}", audio_url)
+        logger.info("[AI][Voice] downloading {}", audio_url)
         resp = requests.get(audio_url, timeout=60)
         resp.raise_for_status()
-
         tmp_path = "/tmp/voice_input.mp3"
         with open(tmp_path, "wb") as f:
             f.write(resp.content)
 
-        # Transcribe using Whisper
         with open(tmp_path, "rb") as audio_file:
-            transcribed = CLIENT.audio.transcriptions.create(
-                model="whisper-1",
-                file=audio_file,
-            )
-        transcript = (getattr(transcribed, "text", "") or "").strip()
-        logger.info("[AI][Voice] 📝 Transcribed text: {}", transcript)
-
-        # Send to generate_reply as if user typed it
+            tr = CLIENT.audio.transcriptions.create(model="whisper-1", file=audio_file)
+        transcript = (getattr(tr, "text", "") or "").strip()
+        logger.info("[AI][Voice] transcript: {}", transcript[:120])
         return generate_reply(user_text=transcript, user_id=user_id)
-
     except Exception as e:
-        logger.exception("💥 [AI][Voice] Error transcribing/responding: {}", e)
-        return "Babe, I couldn't hear that clearly — mind sending it again as a text or re-recording?"
+        logger.exception("[AI][Voice] error: {}", e)
+        return "I couldn’t hear that clearly. Mind sending it again as text or re-recording?"
 
-
-# 👇 FULLY OUTSIDE generate_reply()
+# ------------------ Tone utilities ------------------ #
 def rewrite_if_cringe(original_text: str) -> str:
-    """Rewrite if GPT used banned language or failed tone check."""
-    boring_flags = [
-        "as an ai",
-        "i am just a",
-        "you are not alone",
-        "i understand you are feeling",
-        "beyoncé has flop days",
-        "you’re still headlining",
-    ]
-    text_lc = (original_text or "").lower()
-
-    if any(flag in text_lc for flag in boring_flags):
+    """Rewrite if banned phrases or robotic tone leak through."""
+    if not original_text:
+        return original_text
+    lc = original_text.lower()
+    if any(flag in lc for flag in BANNED_STOCK_PHRASES):
         try:
-            response = CLIENT.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[
-                    {
-                        "role": "system",
-                        "content": (
-                            "Rewrite this in the voice of a dry, intuitive, punchy best friend. "
-                            "No pop-star metaphors. No robotic filler. Make it fierce, useful, "
-                            "and emotionally intelligent."
-                        ),
-                    },
-                    {"role": "user", "content": original_text},
-                ],
-                temperature=0.8,
-                max_tokens=300,
+            return rewrite_different(
+                original_text,
+                avoid="\n".join(BANNED_STOCK_PHRASES),
+                instruction="Rewrite in a dry, intuitive, punchy best-friend voice. No pop-star metaphors, no robotic filler."
             )
-            new_text = (response.choices[0].message.content or "").strip()
-            return new_text
         except Exception as e:
-            logger.warning("[AI][Rewrite] Cringe rewrite failed: {}", e)
-
+            logger.debug("[AI][Rewrite] failed: {}", e)
     return original_text
+def _apply_bestie_qc(user_text: str, reply_text: str, has_products: bool) -> str:
+    """
+    Post-process replies to enforce tone/format without changing URLs.
+    Non-destructive: if anything fails, returns the original text.
+    """
+    try:
+        report = bestie_qc.evaluate_reply(user_text, reply_text, has_products=has_products)
+        if report.get("needs_fix"):
+            return bestie_qc.upgrade_reply(user_text, reply_text, report)
+        return reply_text
+    except Exception as e:
+        try:
+            logger.debug("[AI][QC] skipped: {}", e)
+        except Exception:
+            pass
+        return reply_text
+
+def rewrite_different(
+    original_text: str,
+    avoid: Optional[str] = None,
+    instruction: Optional[str] = None,
+) -> str:
+    """Ask GPT to rephrase with fresh wording that avoids provided phrases."""
+    if CLIENT is None or not os.getenv("OPENAI_API_KEY"):
+        return original_text
+    sys = "Rewrite with different wording. Be concise, stylish, and helpful. Avoid cringe."
+    if instruction:
+        sys = instruction
+    user = original_text
+    if avoid:
+        sys += "\nAvoid the following phrases or patterns entirely:\n" + avoid
+
+    resp = CLIENT.chat.completions.create(
+        model=OPENAI_MODEL,
+        messages=[
+            {"role": "system", "content": sys},
+            {"role": "user", "content": user},
+        ],
+        temperature=0.7,
+        max_tokens=320,
+    )
+    out = (resp.choices[0].message.content or "").strip()
+    return _sanitize_output(out)
+
+# ------------------ QA / Health --------------------- #
+def health_check(user_id: Optional[int] = None) -> Dict:
+    """Quick debug snapshot for drift detection and dashboards."""
+    persona = compose_persona(user_id)
+    recent = _load_recent_turns(user_id, limit=12)
+    banned_hits = [p for p in BANNED_STOCK_PHRASES if p in persona.lower()]
+    return {
+        "system_len": len(persona),
+        "recent_turns": len(recent),
+        "has_banned_in_persona": bool(banned_hits),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
+# ------------------ Optional: simple product trigger --------------- #
+PRODUCT_TRIGGERS = {
+    "recommend", "suggest", "link", "buy", "product", "shop", "send me",
+    "shampoo", "conditioner", "serum", "oil", "mask", "spray", "cleanser",
+    "sunscreen", "moisturizer", "cream", "lotion", "gel"
+}
+
+def extract_product_intent(text: str) -> Optional[Dict[str, str]]:
+    """
+    Returns {"need_product": True, "query": <user text>} when it looks like a product request; else None.
+    """
+    if not text:
+        return None
+    t = text.lower()
+    if any(k in t for k in PRODUCT_TRIGGERS):
+        return {"need_product": True, "query": text.strip()}
+    return None

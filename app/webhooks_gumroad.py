@@ -1,96 +1,230 @@
-# at top of the file, make sure you have these imports:
+# app/webhooks_gumroad.py
+from __future__ import annotations
+
 import os, hmac, hashlib
 from datetime import datetime, timezone, timedelta
-from fastapi import APIRouter, Request, Header
+from urllib.parse import urlparse
+from typing import Optional, Dict, Any
+
+from fastapi import APIRouter, Request, Header, HTTPException
 from loguru import logger
 from sqlalchemy import text as sqltext
+
 from app import db
 from app.workers import _store_and_send
 
 router = APIRouter()
 
-TRIAL_PRODUCT_ID = os.getenv("TRIAL_PRODUCT_ID", "gexqp")
-FULL_PRODUCT_ID  = os.getenv("FULL_PRODUCT_ID",  "ibltj")
+# ---------- Env: link-based tier mapping ----------
+BESTIE_BASIC_URL = os.getenv("BESTIE_BASIC_URL", "https://schizobestie.gumroad.com/l/bestie_basic")
+BESTIE_PLUS_URL  = os.getenv("BESTIE_PLUS_URL",  "https://schizobestie.gumroad.com/l/bestie_plus")
+BESTIE_ELITE_URL = os.getenv("BESTIE_ELITE_URL", "https://schizobestie.gumroad.com/l/bestie_elite")
+
+FREE_TRIAL_DAYS  = int(os.getenv("FREE_TRIAL_DAYS","7"))                  # Basic only
 QUIZ_URL         = os.getenv("QUIZ_URL", "https://tally.so/r/YOUR_QUIZ_ID")
-FREE_TRIAL_DAYS  = int(os.getenv("FREE_TRIAL_DAYS","7"))
-SIGNING_SECRET   = os.getenv("GUMROAD_SIGNING_SECRET")
+SIGNING_SECRET   = os.getenv("GUMROAD_SIGNING_SECRET", "")
 
-def _find_user_by_email(email: str):
-    with db.session() as s:
-        r = s.execute(sqltext("SELECT id FROM users WHERE lower(email)=:e"), {"e": email.lower()}).first()
-        return r[0] if r else None
+def _slug(url: str) -> str:
+    try:
+        p = urlparse(url)
+        return p.path.strip("/").split("/")[-1].lower()
+    except Exception:
+        return ""
 
-def _latest_convo(user_id: int):
-    with db.session() as s:
-        r = s.execute(sqltext("SELECT id FROM conversations WHERE user_id=:u ORDER BY id DESC LIMIT 1"), {"u": user_id}).first()
-        return r[0] if r else None
+BASIC_SLUG = _slug(BESTIE_BASIC_URL) or "bestie_basic"
+PLUS_SLUG  = _slug(BESTIE_PLUS_URL)  or "bestie_plus"
+ELITE_SLUG = _slug(BESTIE_ELITE_URL) or "bestie_elite"
 
-@router.post("/webhooks/gumroad")
-async def gumroad(req: Request, x_gumroad_signature: str = Header(None)):
+# ---------- Helpers ----------
+async def _payload_dict(req: Request) -> Dict[str, Any]:
+    """
+    Gumroad may send JSON or form-encoded payloads.
+    """
     raw = await req.body()
 
-    # optional signature check
+    # Optional signature check (log-only; do not block)
     if SIGNING_SECRET:
-        expected = hmac.new(SIGNING_SECRET.encode(), raw, hashlib.sha256).hexdigest()
-        if x_gumroad_signature and not hmac.compare_digest(x_gumroad_signature, expected):
-            logger.warning("[Gumroad] signature mismatch")
-            # do not block; just log
+        try:
+            expected = hmac.new(SIGNING_SECRET.encode(), raw, hashlib.sha256).hexdigest()
+            sig = req.headers.get("X-Gumroad-Signature") or req.headers.get("x_gumroad_signature") or ""
+            if sig and not hmac.compare_digest(sig, expected):
+                logger.warning("[Gumroad] signature mismatch")
+        except Exception as e:
+            logger.warning("[Gumroad] signature check error: {}", e)
 
-    # Parse body (form or json)
+    # Try JSON first, then form
     try:
-        data = await req.form()
-        payload = dict(data)
+        data = await req.json()
+        if isinstance(data, dict) and data:
+            return data
     except Exception:
-        payload = await req.json()
+        pass
+    try:
+        form = await req.form()
+        return dict(form.items())
+    except Exception:
+        return {}
 
-    logger.info("[Gumroad] webhook: {}", payload)
+def _event_name(p: Dict[str, Any]) -> str:
+    # Classic Gumroad: alert_name; newer webhooks: event/type
+    return str(
+        p.get("alert_name") or p.get("event") or p.get("type") or ""
+    ).lower()
 
-    email = (payload.get("email") or payload.get("purchaser_email") or "").strip().lower()
-    prod  = (payload.get("permalink") or payload.get("product_permalink") or payload.get("product_id") or "").strip().lower()
-    cust  = (payload.get("customer_id") or payload.get("purchaser_id") or "").strip()
-    now   = datetime.now(timezone.utc)
+def _product_hint(p: Dict[str, Any]) -> str:
+    # Prefer explicit permalink; fallback to product_name, product_id
+    for k in ("product_permalink", "permalink", "short_url", "url", "product_url"):
+        v = str(p.get(k) or "")
+        if v:
+            return _slug(v)
+    name = str(p.get("product_name") or "").lower().replace(" ", "_")
+    if name:
+        return name
+    return str(p.get("product_id") or "").lower()
 
+def _map_tier(p: Dict[str, Any]) -> Optional[str]:
+    s = _product_hint(p)
+    if BASIC_SLUG in s:
+        return "basic"
+    if PLUS_SLUG in s:
+        return "plus"
+    if ELITE_SLUG in s:
+        return "elite"
+    return None
+
+def _next_charge_at(p: Dict[str, Any]) -> Optional[datetime]:
+    # Take Gumroad's next charge date if provided; else fallback
+    for k in ("next_charge_date", "subscription_next_charge_date", "next_charge_at", "charge_occurs_on"):
+        v = p.get(k)
+        if v:
+            try:
+                return datetime.fromisoformat(str(v).replace("Z", "+00:00"))
+            except Exception:
+                continue
+    if FREE_TRIAL_DAYS > 0:
+        return datetime.now(timezone.utc) + timedelta(days=FREE_TRIAL_DAYS)
+    return datetime.now(timezone.utc) + timedelta(days=30)
+
+def _find_user_id(p: Dict[str, Any]) -> Optional[int]:
+    """
+    Prefer custom_fields.user_id (if you pass it from checkout), then fallback to email.
+    """
+    # Custom user id
+    try:
+        cf = p.get("custom_fields") or p.get("custom") or {}
+        if isinstance(cf, dict):
+            uid = cf.get("user_id") or cf.get("uid")
+            if uid:
+                return int(uid)
+    except Exception:
+        pass
+
+    # Fallback: email
+    email = (p.get("email") or p.get("purchaser_email") or p.get("customer_email") or "").strip().lower()
     if not email:
-        return {"ok": True}
-
-    user_id = _find_user_by_email(email)
-    if not user_id:
-        return {"ok": True}
-
-    # Decide plan by product
-    if prod == TRIAL_PRODUCT_ID:
-        plan_status = "trial"
-        trial_start = now
-        renews      = now + timedelta(days=FREE_TRIAL_DAYS)
-    elif prod == FULL_PRODUCT_ID:
-        plan_status = "active"
-        trial_start = None
-        renews      = now + timedelta(days=30)
-    else:
-        # different product (prompt pack, etc.) → ignore for plan state
-        return {"ok": True}
-
-    # Update profile
+        return None
     with db.session() as s:
-        s.execute(sqltext("""
-            UPDATE public.user_profiles
-            SET gumroad_customer_id = COALESCE(:cid, gumroad_customer_id),
-                gumroad_email       = COALESCE(:em, gumroad_email),
-                plan_status         = :st,
-                trial_start_date    = COALESCE(trial_start_date, :ts),
-                plan_renews_at      = :renews
-            WHERE user_id = :u
-        """), {"cid": cust or None, "em": email, "st": plan_status,
-               "ts": trial_start, "renews": renews, "u": user_id})
+        r = s.execute(sqltext("SELECT id FROM users WHERE lower(email)=:e"), {"e": email}).first()
+        return int(r[0]) if r else None
+
+def _latest_convo(user_id: int) -> Optional[int]:
+    with db.session() as s:
+        r = s.execute(sqltext("SELECT id FROM conversations WHERE user_id=:u ORDER BY id DESC LIMIT 1"), {"u": user_id}).first()
+        return int(r[0]) if r else None
+
+def _set_status(
+    user_id: int,
+    *,
+    plan_status: str,
+    next_renew: Optional[datetime],
+    gumroad_id: Optional[str],
+    email: Optional[str],
+    start_trial: bool = False,
+) -> None:
+    """
+    Upsert user profile with new plan status and reset today's usage counter.
+    """
+    with db.session() as s:
+        if start_trial and FREE_TRIAL_DAYS > 0:
+            s.execute(sqltext("""
+                UPDATE public.user_profiles
+                   SET plan_status         = :st,
+                       trial_start_date    = COALESCE(trial_start_date, NOW()),
+                       plan_renews_at      = :rn,
+                       gumroad_customer_id = COALESCE(:gid, gumroad_customer_id),
+                       gumroad_email       = COALESCE(:em, gumroad_email),
+                       daily_msgs_used     = 0
+                 WHERE user_id = :u
+            """), {"st": "trial", "rn": next_renew, "gid": gumroad_id, "em": email, "u": user_id})
+        else:
+            s.execute(sqltext("""
+                UPDATE public.user_profiles
+                   SET plan_status         = :st,
+                       plan_renews_at      = :rn,
+                       gumroad_customer_id = COALESCE(:gid, gumroad_customer_id),
+                       gumroad_email       = COALESCE(:em, gumroad_email),
+                       daily_msgs_used     = 0
+                 WHERE user_id = :u
+            """), {"st": plan_status, "rn": next_renew, "gid": gumroad_id, "em": email, "u": user_id})
         s.commit()
 
-    # If trial, immediately send the quiz link
-    if prod == TRIAL_PRODUCT_ID:
-        convo_id = _latest_convo(user_id)
-        if convo_id:
-            _store_and_send(
-                user_id, convo_id,
-                f"You’re in. Take your quiz so I can customize your Bestie — it’s quick and makes me scary accurate:\n{QUIZ_URL}"
-            )
+# ---------- Webhook endpoint ----------
+@router.post("/webhooks/gumroad")
+async def gumroad_webhook(request: Request):
+    p = await _payload_dict(request)
+    if not p:
+        raise HTTPException(status_code=400, detail="Empty Gumroad payload")
+
+    event = _event_name(p)  # sale, subscription_started, subscription_payment, subscription_cancelled, refund, chargeback...
+    tier  = _map_tier(p)
+    gum_id  = str(p.get("customer_id") or p.get("gumroad_customer_id") or p.get("subscriber_id") or "")
+    email   = (p.get("email") or p.get("purchaser_email") or p.get("customer_email") or "")
+    user_id = _find_user_id(p)
+
+    logger.info("[Gumroad] event={} tier={} email={} user_id={} keys={}", event, tier, email, user_id, list(p.keys())[:12])
+
+    if not tier or not user_id:
+        # Accept but ignore unknown products or unresolved users
+        return {"ok": True, "ignored": True}
+
+    e = event
+
+    # BASIC: allow internal trial window if configured
+    if tier == "basic":
+        if e in ("sale", "subscription_started"):
+            renew = _next_charge_at(p)
+            _set_status(user_id, plan_status=("active" if FREE_TRIAL_DAYS == 0 else "trial"),
+                        next_renew=renew, gumroad_id=gum_id, email=email, start_trial=(FREE_TRIAL_DAYS > 0))
+            # DM quiz link after join
+            convo_id = _latest_convo(user_id)
+            if convo_id and QUIZ_URL:
+                _store_and_send(
+                    user_id, convo_id,
+                    f"You’re in. Take your quiz so I can customize your Bestie — it’s quick and makes me scary accurate:\n{QUIZ_URL}"
+                )
+        elif e in ("subscription_payment", "charge", "recurring_charge"):
+            _set_status(user_id, plan_status="active", next_renew=_next_charge_at(p), gumroad_id=gum_id, email=email)
+        elif e in ("subscription_cancelled", "refund", "chargeback", "subscription_stopped"):
+            _set_status(user_id, plan_status="canceled", next_renew=None, gumroad_id=gum_id, email=email)
+        else:
+            logger.info("[Gumroad] Basic: unhandled event='{}' accepted", e)
+
+    # PLUS
+    elif tier == "plus":
+        if e in ("sale", "subscription_started", "subscription_payment", "charge"):
+            _set_status(user_id, plan_status="plus", next_renew=_next_charge_at(p), gumroad_id=gum_id, email=email)
+        elif e in ("subscription_cancelled", "refund", "chargeback", "subscription_stopped"):
+            _set_status(user_id, plan_status="canceled", next_renew=None, gumroad_id=gum_id, email=email)
+        else:
+            logger.info("[Gumroad] Plus: unhandled event='{}' accepted", e)
+
+    # ELITE
+    elif tier == "elite":
+        if e in ("sale", "subscription_started", "subscription_payment", "charge"):
+            _set_status(user_id, plan_status="elite", next_renew=_next_charge_at(p), gumroad_id=gum_id, email=email)
+        elif e in ("subscription_cancelled", "refund", "chargeback", "subscription_stopped"):
+            _set_status(user_id, plan_status="canceled", next_renew=None, gumroad_id=gum_id, email=email)
+        else:
+            logger.info("[Gumroad] Elite: unhandled event='{}' accepted", e)
 
     return {"ok": True}

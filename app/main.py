@@ -1,9 +1,13 @@
-import os
-import time, re
-from fastapi import FastAPI, Request, BackgroundTasks
+# app/main.py
+from dotenv import load_dotenv
+load_dotenv()
+
+import os, time, re
+from fastapi import FastAPI, Request, BackgroundTasks, HTTPException
 from fastapi.responses import JSONResponse
 from loguru import logger
 from sqlalchemy import text as sqltext
+
 from app import db
 from app.webhooks_gumroad import router as gumroad_router
 
@@ -23,22 +27,58 @@ app.include_router(gumroad_router)
 def healthz():
     return {"ok": True}
 
+# -------------------- Secure env snapshot -------------------- #
+SENSITIVE = re.compile(r"(secret|key|token|pwd|password|auth|api)", re.I)
+
+def _masked_env(snapshot: dict[str, str]) -> dict[str, str]:
+    masked = {}
+    for k, v in snapshot.items():
+        if v is None:
+            masked[k] = None
+            continue
+        masked[k] = "***" if SENSITIVE.search(k) else (v if len(v) < 80 else v[:76] + "…")
+    return masked
+
+@app.get("/debug/env")
+def debug_env(secret: str):
+    if secret != os.getenv("CRON_SECRET"):
+        raise HTTPException(status_code=403, detail="forbidden")
+    snap = {
+        "BESTIE_BASIC_URL": os.getenv("BESTIE_BASIC_URL"),
+        "BESTIE_PLUS_URL": os.getenv("BESTIE_PLUS_URL"),
+        "BESTIE_ELITE_URL": os.getenv("BESTIE_ELITE_URL"),
+        "BASIC_SMS_CAP": os.getenv("BASIC_SMS_CAP"),
+        "PLUS_SMS_CAP": os.getenv("PLUS_SMS_CAP"),
+        "ELITE_SMS_CAP": os.getenv("ELITE_SMS_CAP"),
+        "BASIC_MAX_CHARS": os.getenv("BASIC_MAX_CHARS"),
+        "PLUS_MAX_CHARS": os.getenv("PLUS_MAX_CHARS"),
+        "ELITE_MAX_CHARS": os.getenv("ELITE_MAX_CHARS"),
+        "AMAZON_ASSOCIATE_TAG": os.getenv("AMAZON_ASSOCIATE_TAG"),
+        "GENIUSLINK_WRAP": os.getenv("GENIUSLINK_WRAP"),
+        "GENIUSLINK_DOMAIN": os.getenv("GENIUSLINK_DOMAIN"),
+        "ENFORCE_SIGNUP_BEFORE_CHAT": os.getenv("ENFORCE_SIGNUP_BEFORE_CHAT"),
+        "FREE_TRIAL_DAYS": os.getenv("FREE_TRIAL_DAYS"),
+    }
+    return _masked_env(snap)
+
+# -------------------- Plan rollover (trial -> active) -------------------- #
 @app.post("/tasks/plan_rollover")
 def plan_rollover(request: Request):
     if CRON_SECRET and request.headers.get("x-cron-secret") != CRON_SECRET:
         return {"ok": False, "error": "forbidden"}
-with db.session() as s:
-    s.execute(sqltext("""
-        UPDATE public.user_profiles
-        SET plan_status='active',
-            plan_renews_at = NOW() + INTERVAL '30 days'
-        WHERE plan_status='trial'
-          AND trial_start_date IS NOT NULL
-          AND NOW() > trial_start_date + INTERVAL '7 days'
-    """))
-    s.commit()
+    with db.session() as s:
+        s.execute(sqltext("""
+            UPDATE public.user_profiles
+               SET plan_status='active',
+                   plan_renews_at = NOW() + INTERVAL '30 days'
+             WHERE plan_status='trial'
+               AND trial_start_date IS NOT NULL
+               AND NOW() > trial_start_date + INTERVAL '7 days'
+        """))
+        s.commit()
+    return {"ok": True}
 
-# -------------------- DEBUG: queue probe -------------------- #
+# -------------------- Debug: queue probe -------------------- #
 from redis import Redis
 from rq import Queue
 
@@ -55,8 +95,8 @@ def debug_queue():
         "sample_job_ids": [j.id for j in jobs[:5]],
     }
 
-# ✅ Use package-relative imports
-from . import db, models
+# ✅ Package-relative imports for worker helpers
+from . import models
 from .task_queue import enqueue_generate_reply
 from .workers import send_reengagement_job
 
@@ -68,7 +108,6 @@ def process_incoming(message_id: str, user_phone: str, text_val: str, raw_body: 
                     message_id, user_phone, text_val)
 
         with db.session() as s:
-            # Always allow follow-ups — each inbound SMS is unique
             user = models.get_or_create_user_by_phone(s, user_phone)
             convo = models.get_or_create_conversation(s, user.id)
             models.insert_message(s, convo.id, "in", message_id, text_val)
@@ -76,7 +115,6 @@ def process_incoming(message_id: str, user_phone: str, text_val: str, raw_body: 
             logger.info("[API][Process] 💾 Stored inbound: convo_id={} user_id={}",
                         convo.id, user.id)
 
-        # Hand off to worker
         job = enqueue_generate_reply(convo.id, user.id, text_val, user_phone=user_phone)
         logger.success("[API][Queue] ✅ Enqueued job={} convo_id={} user_id={} text={}",
                        job.id, convo.id, user.id, text_val)
@@ -96,11 +134,9 @@ async def incoming_message_any(req: Request, background_tasks: BackgroundTasks):
         return JSONResponse(status_code=200, content={"ok": True, "error": "invalid json"})
 
     try:
-        # ✅ Use customData if present, else fallback to body
         cd = body.get("customData") or body.get("custom_data")
         payload = cd if cd and isinstance(cd, dict) else body
 
-        # ✅ Always force unique message_id by appending timestamp
         base_id = (
             payload.get("message_id")
             or body.get("message_id")
@@ -109,7 +145,6 @@ async def incoming_message_any(req: Request, background_tasks: BackgroundTasks):
         message_id = f"{base_id}-{int(time.time())}"
         logger.info("[API][Webhook] Generated unique message_id={}", message_id)
 
-        # Extract and normalize phone number
         user_phone = (
             payload.get("user_phone")
             or body.get("user_phone")
@@ -120,11 +155,10 @@ async def incoming_message_any(req: Request, background_tasks: BackgroundTasks):
             digits = re.sub(r"\D", "", str(user_phone))
             if len(digits) == 10:
                 user_phone = "+1" + digits
-            elif not user_phone.startswith("+"):
+            elif not str(user_phone).startswith("+"):
                 user_phone = "+" + digits
         logger.info("[API][Webhook] Normalized phone={}", user_phone)
 
-        # Extract text
         text_val = (
             payload.get("text")
             or body.get("text")
@@ -132,8 +166,8 @@ async def incoming_message_any(req: Request, background_tasks: BackgroundTasks):
             or body.get("activity", {}).get("body")
             or body.get("contact", {}).get("last_message")
         )
+        text_val = str(text_val or "")
 
-        # ✅ Detect image/audio attachments
         attachments = body.get("message", {}).get("attachments", [])
         if attachments:
             for a in attachments:
@@ -147,35 +181,24 @@ async def incoming_message_any(req: Request, background_tasks: BackgroundTasks):
                     else:
                         text_val += f"\n[User sent a file: {url}]"
 
-        logger.info("[API][Webhook] Extracted text={}", text_val)
-
         if not user_phone or not text_val:
             logger.warning("⚠️ [API][Webhook] Missing required fields. phone={} text={}",
                            user_phone, text_val)
-            return JSONResponse(
-                status_code=200,
-                content={"ok": True, "error": "missing required fields"}
-            )
+            return JSONResponse(status_code=200, content={"ok": True, "error": "missing fields"})
 
-        # ✅ Fire background worker so GHL doesn’t wait
-        logger.info("[API][Webhook] Handing off to background task for msg_id={}", message_id)
         background_tasks.add_task(process_incoming, message_id, user_phone, text_val, body)
 
     except Exception as e:
         logger.exception("💥 [API][Webhook] Unexpected failure, but ACKing anyway: {}", e)
 
-    # ✅ Always ACK immediately, even if processing failed
     logger.info("[API][Webhook] ✅ Final ACK sent to GHL")
-    return {
-        "ok": True,
-        "message_id": locals().get("message_id", "fallback"),
-        "echo_text": locals().get("text_val", "")
-    }
+    return {"ok": True, "message_id": locals().get("message_id", "fallback")}
 
-# -------------------- Re-engagement endpoint -------------------- #
-@app.post("/tasks/trigger_reengagement")
-async def trigger_reengagement(background_tasks: BackgroundTasks):
-    """Manually or via cron: enqueue re-engagement nudges for inactive users."""
-    logger.info("[API][Reengage] 🔔 Trigger received")
-    background_tasks.add_task(send_reengagement_job)
-    return {"ok": True, "message": "Re-engagement job queued"}
+# -------------------- Secure re-engagement for Cron -------------------- #
+@app.post("/jobs/reengage")
+def jobs_reengage(request: Request):
+    secret = request.headers.get("X-Cron-Secret") or request.query_params.get("secret")
+    if not secret or secret != CRON_SECRET:
+        raise HTTPException(status_code=403, detail="forbidden")
+    send_reengagement_job()
+    return {"ok": True}

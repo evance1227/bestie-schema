@@ -3,24 +3,46 @@ services:
     name: bestie_backend
     runtime: python
     plan: starter
+    region: oregon
+    autoDeploy: true
+    healthCheckPath: /healthz
     buildCommand: pip install -r requirements.txt
     startCommand: uvicorn app.main:app --host 0.0.0.0 --port 8000
+    pullRequestPreviewsEnabled: false
 
   - type: worker
     name: bestie_worker
     runtime: python
     plan: starter
+    region: oregon
+    autoDeploy: true
     buildCommand: pip install -r requirements.txt
     startCommand: python -m app.start_worker
+    envVars:
+      - key: QUEUE_NAME
+        value: bestie_queue
+      - key: WORKER_HEARTBEAT_SEC
+        value: "10"      # launch: chatty; later bump to 30
+      - key: WORKER_JOB_TIMEOUT
+        value: "240"     # GPT + Vision + Whisper buffer
+      - key: WORKER_RESULT_TTL
+        value: "900"     # keep results 15 min for debugging
+      - key: ENABLE_RQ_SCHEDULER
+        value: "0"       # use Render Cron instead
 
 cronJobs:
-  - name: plan-rollover
-    schedule: "0 9 * * *"   # daily at 09:00 UTC
-    command: 'curl -s -X POST -H "X-Cron-Secret: $CRON_SECRET" $BACKEND_URL/tasks/plan_rollover'
-    envVars:
-      - key: BACKEND_URL
-        value: https://bestie-backend.onrender.com   # your Render web service URL
-      - key: CRON_SECRET
-        value: 7c9b8e1f9a6d42c0983c1b235be92f73a5f918b09ef41f67a2dcb6c8b91c40d2
+  - name: reengage-users
+    schedule: "0 15 * * *"     # 15:00 UTC ≈ 9:00am Denver (summer)
+    httpMethod: POST
+    url: https://bestie-backend.onrender.com/jobs/reengage
+    headers:
+      - name: X-Cron-Secret
+        value: ${CRON_SECRET}
 
-        startCommand: uvicorn app.main:app --host 0.0.0.0 --port 8000
+  - name: plan-rollover
+    schedule: "0 7 * * *"      # daily 07:00 UTC (if using internal 7-day Basic logic)
+    httpMethod: POST
+    url: https://bestie-backend.onrender.com/tasks/plan_rollover
+    headers:
+      - name: X-Cron-Secret
+        value: ${CRON_SECRET}
