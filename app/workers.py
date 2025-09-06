@@ -31,6 +31,15 @@ from sqlalchemy import text as sqltext
 # ------------------------------ App deps ------------------------------- #
 from app import db, models, ai, ai_intent, integrations, linkwrap
 from app.product_search import build_product_candidates, prefer_amazon_first
+from urllib.parse import quote_plus
+
+def _amazon_search_url(q: str) -> str:
+    """Build a safe Amazon search URL (no backslashes in f-string expressions)."""
+    try:
+        term = quote_plus((q or "").strip())
+    except Exception:
+        term = (q or "").strip().replace(" ", "+")
+    return "https://www.amazon.com/s?k=" + term
 
 # ---------------------------------------------------------------------- #
 # Environment and globals
