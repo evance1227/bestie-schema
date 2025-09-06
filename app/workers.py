@@ -1,15 +1,21 @@
 # app/workers.py
 """
 RQ worker job for SMS Bestie.
+
+Core:
 - Clean single send path
-- Paywall + trial gates
+- Paywall + trial gates (invite-only upgrades handled by Gumroad webhooks)
 - Media routing (image describe, audio transcribe)
 - Product intent → candidates → Bestie tone reply
-- Routine/overlap audit path
+- Routine/overlap audit path (optionally followed by products when asked/ implied)
 - General chat fallback with tone guards
-- VIP soft pitch with cooldown + daily cap
-- SMS link hygiene (Amazon search injection + Geniuslink + affiliate)
+- Optional VIP soft pitch (OFF by default) with cooldown + daily cap
+- SMS link hygiene (Amazon search injection + affiliate)
 - Re-engagement job (48h quiet)
+
+House policy:
+- 1-week free, then $17/month. Cancel anytime. Upgrades unlock by invitation.
+- No "Bestie Team Faves" CTA. No default sales CTA from code unless explicitly enabled.
 """
 
 from __future__ import annotations
@@ -21,8 +27,9 @@ import uuid
 import hashlib
 import random
 import time
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, Tuple
 from datetime import datetime, timezone, timedelta
+from urllib.parse import quote_plus
 
 # ----------------------------- Third party ----------------------------- #
 import redis
@@ -32,35 +39,43 @@ from sqlalchemy import text as sqltext
 # ------------------------------ App deps ------------------------------- #
 from app import db, models, ai, ai_intent, integrations, linkwrap
 from app.product_search import build_product_candidates, prefer_amazon_first
-from urllib.parse import quote_plus  
 
 # ---------------------------------------------------------------------- #
 # Environment and globals
 # ---------------------------------------------------------------------- #
 REDIS_URL = os.getenv("REDIS_URL", "")
 _rds = redis.from_url(REDIS_URL, decode_responses=True) if REDIS_URL else None
-SMS_PART_DELAY_MS = int(os.getenv("SMS_PART_DELAY_MS", "800")) 
+
+# Message pacing so carriers preserve multipart ordering
+SMS_PART_DELAY_MS = int(os.getenv("SMS_PART_DELAY_MS", "800"))
+
+# Dev bypass
 DEV_BYPASS_PHONE = os.getenv("DEV_BYPASS_PHONE", "").strip()
 
-# Gumroad and trial settings
-VIP_URL = os.getenv("VIP_URL", "https://schizobestie.gumroad.com/l/gexqp")
-TRIAL_URL = os.getenv("TRIAL_URL", "https://schizobestie.gumroad.com/l/gexqp")
-FULL_URL = os.getenv("FULL_URL", "https://schizobestie.gumroad.com/l/ibltj")
-QUIZ_URL = os.getenv("QUIZ_URL", "https://tally.so/r/YOUR_QUIZ_ID")
-
+# Trial / plan
 ENFORCE_SIGNUP = os.getenv("ENFORCE_SIGNUP_BEFORE_CHAT", "0") == "1"
 FREE_TRIAL_DAYS = int(os.getenv("FREE_TRIAL_DAYS", "7"))
 
-# VIP soft-pitch throttles
-VIP_COOLDOWN_MIN = int(os.getenv("VIP_COOLDOWN_MIN", "20"))
-VIP_DAILY_MAX = int(os.getenv("VIP_DAILY_MAX", "2"))
-_VIP_STOP = re.compile(r"(stop( trying)? to sell|don'?t sell|no vip|quit pitching|stop pitching)", re.I)
+# Gumroad/links (names kept for back-compat)
+VIP_URL   = os.getenv("VIP_URL",   "https://schizobestie.gumroad.com/l/bestie_basic")
+TRIAL_URL = os.getenv("TRIAL_URL", "https://schizobestie.gumroad.com/l/bestie_basic")
+FULL_URL  = os.getenv("FULL_URL",  "https://schizobestie.gumroad.com/l/bestie_basic")
+QUIZ_URL  = os.getenv("QUIZ_URL",  "https://tally.so/r/YOUR_QUIZ_ID")
 
-# Geniuslink / Amazon link hygiene
-GENIUSLINK_DOMAIN = os.getenv("GENIUSLINK_DOMAIN", "").strip()
-GENIUSLINK_WRAP = os.getenv("GENIUSLINK_WRAP", "").strip()  # eg: https://geni.us/redirect?url={url}
-GL_REWRITE = os.getenv("GL_REWRITE", "1").lower() not in ("0", "false", "")
-_AMZN_RE = re.compile(r"https?://(?:www\.)?amazon\.[^\s)\]]+", re.I)
+# Optional toggles (default OFF)
+VIP_SOFT_ENABLED = os.getenv("VIP_SOFT_ENABLED", "0").lower() not in ("0","false","no","off")
+BESTIE_PRODUCT_CTA_ENABLED = os.getenv("BESTIE_PRODUCT_CTA_ENABLED", "0").lower() not in ("0","false","no","off")
+
+# VIP soft-pitch throttles (used only if VIP_SOFT_ENABLED)
+VIP_COOLDOWN_MIN = int(os.getenv("VIP_COOLDOWN_MIN", "20"))
+VIP_DAILY_MAX    = int(os.getenv("VIP_DAILY_MAX", "2"))
+_VIP_STOP        = re.compile(r"(stop( trying)? to sell|don'?t sell|no vip|quit pitching|stop pitching)", re.I)
+
+# Geniuslink / Amazon wrap toggles (leave blank to disable)
+GENIUSLINK_DOMAIN = (os.getenv("GENIUSLINK_DOMAIN") or "").strip()
+GENIUSLINK_WRAP   = (os.getenv("GENIUSLINK_WRAP") or "").strip()  # e.g. https://geni.us/redirect?url={url}
+GL_REWRITE        = os.getenv("GL_REWRITE", "1").lower() not in ("0", "false", "")
+_AMZN_RE          = re.compile(r"https?://(?:www\.)?amazon\.[^\s)\]]+", re.I)
 
 # Opening/tone guards
 OPENING_BANNED = [
@@ -68,9 +83,8 @@ OPENING_BANNED = [
     "i'm sorry you're", "technology can be", "i get that",
 ]
 BANNED_STOCK_PHRASES = [
-    "I’ll cry a little… then wait like a glam houseplant",
-    "You're already on the VIP list, babe. That means I remember everything.",
-    "P.S. Your Bestie VIP access is still active — I’ve got receipts, rituals, and rage texts saved.",
+    # kill any stale cringe if it sneaks in
+    "I’ll cry a little", "houseplant", "you’re already on the VIP list",
 ]
 
 # ---------------------------------------------------------------------- #
@@ -122,7 +136,9 @@ def _has_ever_started_trial(user_id: int) -> bool:
     return bool(r and r[0])
 
 def _wall_start_message(user_id: int) -> str:
-    """Ask user to start access and take the quiz. Chooses trial vs full link."""
+    """
+    Ask user to start access and take the quiz. Chooses trial vs full link.
+    """
     link = TRIAL_URL if not _has_ever_started_trial(user_id) else FULL_URL
     if link == TRIAL_URL:
         return (
@@ -131,7 +147,7 @@ def _wall_start_message(user_id: int) -> str:
             "1 week free, then $17/mo. Cancel anytime. No refunds."
         )
     return (
-        "Your trial window ended. To keep going it’s $17/mo. Cancel anytime. No refunds.\n"
+        "Your trial ended. To keep going it’s $17/mo. Cancel anytime. No refunds.\n"
         f"{FULL_URL}"
     )
 
@@ -145,7 +161,7 @@ def _ensure_profile_defaults(user_id: int) -> Dict[str, object]:
     """Normalize profile counters and return current entitlement snapshot."""
     with db.session() as s:
         s.execute(sqltext("""
-            UPDATE user_profiles
+            UPDATE public.user_profiles
             SET plan_status        = COALESCE(plan_status, 'pending'),
                 daily_counter_date = COALESCE(daily_counter_date, CURRENT_DATE),
                 daily_msgs_used    = COALESCE(daily_msgs_used, 0),
@@ -166,21 +182,19 @@ def _ensure_profile_defaults(user_id: int) -> Dict[str, object]:
     if not row:
         return {"allowed": False, "reason": "pending"}
 
-    gum_id, gum_email, plan_status, trial_start, renews_at, is_quiz, daily_used, daily_date = row
+    _, _, plan_status, trial_start, _, _, daily_used, daily_date = row
 
-    # Reset daily counters if the date changed
-    today = datetime.now(timezone.utc).date()
-    if daily_date != today:
+    # reset daily counters if date rolled
+    if daily_date != datetime.now(timezone.utc).date():
         with db.session() as s:
             s.execute(sqltext("""
-                UPDATE user_profiles
-                SET daily_counter_date = CURRENT_DATE,
-                    daily_msgs_used    = 0
+                UPDATE public.user_profiles
+                SET daily_counter_date = CURRENT_DATE, daily_msgs_used = 0
                 WHERE user_id = :u
             """), {"u": user_id})
             s.commit()
 
-    # Plan gate
+    # plan gate
     if ENFORCE_SIGNUP and (not plan_status or plan_status in ("pending", "")):
         return {"allowed": False, "reason": "pending"}
 
@@ -201,9 +215,9 @@ def _ensure_profile_defaults(user_id: int) -> Dict[str, object]:
     return {"allowed": False, "reason": "pending"}
 
 # ---------------------------------------------------------------------- #
-# VIP soft pitch helpers
+# VIP soft pitch helpers (OFF by default)
 # ---------------------------------------------------------------------- #
-def _recent_vip_stats_by_convo(convo_id: int, minutes: int = 1440) -> tuple[int, Optional[datetime]]:
+def _recent_vip_stats_by_convo(convo_id: int, minutes: int = 1440) -> Tuple[int, Optional[datetime]]:
     cutoff = datetime.utcnow() - timedelta(minutes=minutes)
     count_24h = 0
     recent_ts = None
@@ -227,6 +241,8 @@ def _recent_vip_stats_by_convo(convo_id: int, minutes: int = 1440) -> tuple[int,
     return count_24h, recent_ts
 
 def _should_soft_pitch_vip_convo(convo_id: int, user_text: str, reply_text: str) -> bool:
+    if not VIP_SOFT_ENABLED:      # global kill switch
+        return False
     if _VIP_STOP.search(user_text or ""):
         return False
     count_24h, recent_ts = _recent_vip_stats_by_convo(convo_id, minutes=1440)
@@ -239,13 +255,16 @@ def _should_soft_pitch_vip_convo(convo_id: int, user_text: str, reply_text: str)
     txt = f"{user_text} {reply_text}".lower()
     friction = any(w in txt for w in ["overwhelmed", "confused", "stuck", "frustrated", "help", "support", "struggling"])
     momentum = any(w in txt for w in ["recommend", "options", "compare", "ideas", "plan", "next step", "next level", "upgrade", "more"])
-    asked = any(w in txt for w in ["vip", "membership", "trial"])
+    asked    = any(w in txt for w in ["vip", "membership", "trial"])
     return asked or friction or momentum
 
 def _vip_soft_line() -> str:
-    return f"No pressure, but if you want me at full throttle, VIP will level you up. Free for 30 days, cancel anytime. Try it: {VIP_URL}"
+    # copy locked to current pricing/business plan
+    return "First week free, then $17/month. Cancel anytime."
 
 def _maybe_inject_vip_by_convo(reply: str, convo_id: int, user_text: str) -> str:
+    if not VIP_SOFT_ENABLED:
+        return reply
     try:
         if _should_soft_pitch_vip_convo(convo_id, user_text, reply):
             if "gumroad.com" not in (reply or "").lower():
@@ -285,9 +304,10 @@ def _ensure_amazon_links(text: str) -> str:
 
 def _rewrite_links_to_genius(text: str) -> str:
     """
-    Wrap Amazon URLs via Geniuslink:
+    Wrap Amazon URLs via Geniuslink when explicitly configured ONLY.
       1) If GENIUSLINK_WRAP template is set, wrap any Amazon URL with it.
       2) Else if GL_REWRITE and GENIUSLINK_DOMAIN are set, rewrite /dp/ASIN to https://{domain}/{ASIN}.
+      3) Else return text unmodified.
     """
     if not text:
         return text
@@ -313,12 +333,12 @@ def _rewrite_links_to_genius(text: str) -> str:
     return text
 
 def _fix_vip_links(text: str) -> str:
-    """Ensure VIP mention is clickable."""
+    """Ensure VIP mention is clickable (used only if VIP soft-line appears)."""
     if not text:
         return text
-    text = re.sub(r"(?mi)^\s*\[?(vip|vip\s*sign[- ]?up|vip\s*signup)\]?\s*$", f"VIP Sign-Up: {VIP_URL}", text)
+    text = re.sub(r"(?mi)^\s*\[?(vip|vip\s*sign[- ]?up|vip\s*signup)\]?\s*$", f"VIP Sign-Up: {FULL_URL or VIP_URL}", text)
     if "vip" in text.lower() and "gumroad.com" not in text.lower():
-        text = text.rstrip() + ("\n" if not text.endswith("\n") else "") + VIP_URL
+        text = text.rstrip() + ("\n" if not text.endswith("\n") else "") + (FULL_URL or VIP_URL)
     return text
 
 # ---------------------------------------------------------------------- #
@@ -327,6 +347,7 @@ def _fix_vip_links(text: str) -> str:
 def _store_and_send(user_id: int, convo_id: int, text_val: str) -> None:
     """
     Single place to store and send. Splits long messages to ~450 chars with [1/2] prefix.
+    Adds a tiny headway between multipart sends so carriers keep order.
     """
     max_len = 450
     parts: List[str] = []
@@ -362,7 +383,8 @@ def _store_and_send(user_id: int, convo_id: int, text_val: str) -> None:
             logger.success("[Worker][Send] SMS send attempted for user_id={}", user_id)
         except Exception:
             logger.exception("[Worker][Send] Exception while calling send_sms_reply")
-        # small pause so carriers preserve part ordering
+
+        # tiny pause so carriers preserve ordering
         try:
             if total_parts > 1 and idx < total_parts:
                 time.sleep(SMS_PART_DELAY_MS / 1000.0)
@@ -370,7 +392,7 @@ def _store_and_send(user_id: int, convo_id: int, text_val: str) -> None:
             pass
 
 # ---------------------------------------------------------------------- #
-# Finalize + send (formatting, links, optional VIP CTA)
+# Finalize + send (formatting, links, optional CTA - OFF by default)
 # ---------------------------------------------------------------------- #
 def _finalize_and_send(
     user_id: int,
@@ -382,39 +404,27 @@ def _finalize_and_send(
 ) -> None:
     """
     Final formatting before a single send.
-    - Optional CTA based on env BESTIE_APPEND_CTA
-    - Link hygiene (Amazon search injection only if no links, Geniuslink wrapping)
-    - VIP links made clickable
+    - Link hygiene (Amazon search injection only if no links, optional Geniuslink wrap)
     - Optional affiliate transforms via linkwrap
     - SMS formatting for links
+    - CTA tail is disabled by default and only added if BESTIE_PRODUCT_CTA_ENABLED=1 AND add_cta=True
     """
     reply = (reply or "").strip()
     if not reply:
         logger.warning("[Worker][Send] Empty reply. Skipping.")
         return
 
+    # Optional CTA tail (globally disabled unless env enabled)
     try:
-        if add_cta and os.getenv("BESTIE_APPEND_CTA") == "1":
-            reply += (
-                "\n\nBabe, your VIP is open: first week FREE, then $17/mo. "
-                "Unlimited texts. https://schizobestie.gumroad.com/l/gexqp"
-            )
-    except Exception:
-        pass
-
-    # Product-friendly daily CTA tail
-    try:
-        if add_cta:
-            reply += (
-                "\n\nPS: Savings tip: try WELCOME10 or search brand + coupon."
-            )
+        if add_cta and BESTIE_PRODUCT_CTA_ENABLED:
+            reply += "\n\nPS: Savings tip: try WELCOME10 or search brand + coupon."
     except Exception:
         pass
 
     # Link hygiene order
-    reply = _ensure_amazon_links(reply)           # add Amazon search link under numbered items only if no links exist
-    reply = _rewrite_links_to_genius(reply)       # wrap Amazon links to Geniuslink
-    reply = _fix_vip_links(reply)                 # ensure VIP mention is clickable
+    reply = _ensure_amazon_links(reply)
+    reply = _rewrite_links_to_genius(reply)
+    reply = _fix_vip_links(reply)
 
     # Optional affiliate rewrite + SMS-safe formatting
     try:
@@ -502,12 +512,11 @@ def generate_reply_job(convo_id: int, user_id: int, text_val: str, user_phone: O
     user_text = str(text_val or "")
     normalized_text = user_text.lower().strip()
 
+    # 0) Gate
     try:
-        # Gate defaults and plan status
         gate_snapshot = _ensure_profile_defaults(user_id)
         logger.info("[Gate] user_id={} -> {}", user_id, gate_snapshot)
 
-        # Dev bypass by phone match
         np = _norm_phone(user_phone)
         nb = _norm_phone(DEV_BYPASS_PHONE)
         dev_bypass = bool(np and nb and np == nb)
@@ -522,169 +531,147 @@ def generate_reply_job(convo_id: int, user_id: int, text_val: str, user_phone: O
                     _store_and_send(user_id, convo_id, _wall_trial_expired_message())
                     return
 
-        # Check if this is the very first message in the conversation
-        with db.session() as s:
-            first_msg_count = s.execute(
-                sqltext("SELECT COUNT(*) FROM messages WHERE conversation_id = :cid"),
-                {"cid": convo_id},
-            ).scalar() or 0
+    except Exception as e:
+        logger.exception("[Gate] snapshot/build error: {}", e)
+        _store_and_send(user_id, convo_id, "Babe, I glitched. Give me one sec to reboot my attitude. 💅")
+        return
 
-        if first_msg_count == 0:
-            onboarding_reply = random.choice([
-                "OMG, you made it. Welcome to chaos, clarity, and couture-level glow ups. Text me anything. 💅",
-                "Hi. I’m Bestie. I don’t do small talk. I do savage insight and glow ups. Ask me something.",
-                "You’re in. I’m your emotionally fluent digital best friend. Vent or ask. I’m unshockable.",
-                "Welcome to your new favorite addiction. I talk back like a glam oracle with receipts. Let’s go.",
-            ])
-            _store_and_send(user_id, convo_id, onboarding_reply)
-            return
+    # 1) First message onboarding
+    with db.session() as s:
+        first_msg_count = s.execute(
+            sqltext("SELECT COUNT(*) FROM messages WHERE conversation_id = :cid"),
+            {"cid": convo_id},
+        ).scalar() or 0
 
-        # Media routing
-        if "http" in user_text:
-            if any(ext in normalized_text for ext in [".jpg", ".jpeg", ".png", ".gif", ".webp"]):
-                logger.info("[Worker][Media] Image URL detected, describing.")
-                reply = ai.describe_image(user_text.strip())
-                reply = _maybe_inject_vip_by_convo(reply, convo_id, user_text)
-                _finalize_and_send(user_id, convo_id, reply, add_cta=False)
-                return
-            if any(ext in normalized_text for ext in [".mp3", ".m4a", ".wav", ".ogg"]):
-                logger.info("[Worker][Media] Audio URL detected, transcribing.")
-                reply = ai.transcribe_and_respond(user_text.strip(), user_id=user_id)
-                reply = _maybe_inject_vip_by_convo(reply, convo_id, user_text)
-                _finalize_and_send(user_id, convo_id, reply, add_cta=False)
-                return
+    if first_msg_count == 0:
+        onboarding_reply = random.choice([
+            "OMG, you made it. Welcome to chaos, clarity, and couture-level glow ups. Text me anything. 💅",
+            "Hi. I’m Bestie. I don’t do small talk. I do savage insight and glow ups. Ask me something.",
+            "You’re in. I’m your emotionally fluent digital best friend. Vent or ask. I’m unshockable.",
+            "Welcome to your new favorite addiction. I talk back like a glam oracle with receipts. Let’s go.",
+        ])
+        _store_and_send(user_id, convo_id, onboarding_reply)
+        return
 
-        # FAQs
-        faq_map = {
-            "how do i take the quiz": f"Take the quiz here, babe. It unlocks your personalized Bestie: {QUIZ_URL}",
-            "where do i take the quiz": f"Here’s your link: {QUIZ_URL}",
-            "quiz link": f"Quiz link incoming: {QUIZ_URL}",
-            "how much is vip": "VIP is free the first month, $7 the second, then $17/month. Cancel anytime. Unlimited texts.",
-            "vip cost": "First month free, then $7, then $17/month. Cancel anytime.",
-            "price of vip": "VIP pricing: $0 → $7 → $17/month. Full access. Cancel anytime.",
-            "how much are prompt packs": "Prompt Packs are $7 each or 3 for $20.",
-            "prompt pack price": "Each pack is $7 — or 3 for $20. Link: https://schizobestie.gumroad.com/",
-            "prompt packs link": "Right this way: https://schizobestie.gumroad.com/",
-        }
-        for key, canned in faq_map.items():
-            if key in normalized_text:
-                logger.info("[Worker][FAQ] Intercepted '{}'", key)
-                _store_and_send(user_id, convo_id, canned)
-                return
-
-        # Rename flow
-        rename_reply = try_handle_bestie_rename(user_id, convo_id, user_text)
-        if rename_reply:
-            _store_and_send(user_id, convo_id, rename_reply)
-            return
-
-        # ---------- Intent extraction ----------
-        intent_data = None
-        try:
-            if hasattr(ai_intent, "extract_product_intent"):
-                intent_data = ai_intent.extract_product_intent(user_text)
-            else:
-                logger.info("[Intent] No extractor defined.")
-        except Exception as e:
-            logger.warning("[Intent] Extractor failed: {}", e)
-        logger.info("[Intent] intent_data: {}", intent_data)
-
-        if intent_data and intent_data.get("intent") == "routine_audit":
-            reply = ai.audit_routine(user_text, constraints=intent_data.get("constraints") or {}, user_id=user_id)
-            # No VIP soft-line, no CTA tail on audits
+    # 2) Media routing
+    if "http" in user_text:
+        if any(ext in normalized_text for ext in [".jpg", ".jpeg", ".png", ".gif", ".webp"]):
+            logger.info("[Worker][Media] Image URL detected, describing.")
+            reply = ai.describe_image(user_text.strip())
             _finalize_and_send(user_id, convo_id, reply, add_cta=False)
-            # If the message implies shopping, send a second SMS with 1–3 picks.
-            # Triggers: explicit verbs or the ingredient itself (e.g., "peptides").
-            try:
-                want_products = any(w in normalized_text for w in [
-                    "recommend","recommendation","suggest","what should","which","looking for","peptide","peptides"
-                ])
-                if want_products:
-                    # Minimal peptide search intent – Amazon-first monetization
-                    secondary_intent = {
-                        "intent": "find_products",
-                        "query": "peptide serum",          # simple default seed
-                        "category": "skincare",
-                        "constraints": {"channel": "amazon", "count": 3}
-                    }
-                    picks = prefer_amazon_first(build_product_candidates(secondary_intent))
-
-                    if picks:
-                        gpt_products = [{
-                            "name": p.get("title") or p.get("name") or "Product",
-                            "category": "skincare",
-                            "url": p.get("url",""),
-                            "review": p.get("review",""),
-                        } for p in picks[:3]]
-
-                        rec_text = ai.generate_reply(
-                            user_text=user_text,
-                            product_candidates=gpt_products,
-                            user_id=user_id,
-                            system_prompt=(
-                                "You are Bestie. Use the provided product candidates (already monetized DP URLs).\n"
-                                "FORMAT AS A NUMBERED LIST with bold names so link hygiene can attach if needed:\n"
-                                "1. **Name**: one-liner benefit. URL\n"
-                                "Keep the whole reply ~450 chars. 1–3 options max. No disclaimers. Do not alter or replace URLs."
-                            ),
-                            context={"session_goal": "offer quick peptide product picks"}
-                        )
-                        rec_text = _fix_cringe_opening(rec_text)
-                        # No CTA tail here either; links are monetized by linkwrap
-                        _finalize_and_send(user_id, convo_id, rec_text, add_cta=False)
-            except Exception as e:
-                logger.warning("[Routine+Products] Secondary picks failed: {}", e)
-
+            return
+        if any(ext in normalized_text for ext in [".mp3", ".m4a", ".wav", ".ogg"]):
+            logger.info("[Worker][Media] Audio URL detected, transcribing.")
+            reply = ai.transcribe_and_respond(user_text.strip(), user_id=user_id)
+            _finalize_and_send(user_id, convo_id, reply, add_cta=False)
             return
 
-        # ---------- Product candidates ----------
-        product_candidates: List[Dict] = []
+    # 3) FAQs (pricing corrected)
+    faq_map = {
+        "how do i take the quiz": f"Take the quiz here, babe. It unlocks your personalized Bestie: {QUIZ_URL}",
+        "where do i take the quiz": f"Here’s your link: {QUIZ_URL}",
+        "quiz link": f"Quiz link incoming: {QUIZ_URL}",
+        "how much is vip": "1 week free, then $17/month. Upgrades unlock by invitation (Plus $27, Elite $37). Cancel anytime.",
+        "vip cost": "1 week free, then $17/month. Upgrades are invite-only when you hit caps.",
+        "price of vip": "Start at $17/month after a 1-week free trial. Upgrades unlock by invitation.",
+        "how much are prompt packs": "Prompt Packs are $7 each or 3 for $20.",
+        "prompt pack price": "Each pack is $7 — or 3 for $20. Link: https://schizobestie.gumroad.com/",
+        "prompt packs link": "Right this way: https://schizobestie.gumroad.com/",
+    }
+    for key, canned in faq_map.items():
+        if key in normalized_text:
+            logger.info("[Worker][FAQ] Intercepted '{}'", key)
+            _store_and_send(user_id, convo_id, canned)
+            return
+
+    # 4) Rename flow
+    rename_reply = try_handle_bestie_rename(user_id, convo_id, user_text)
+    if rename_reply:
+        _store_and_send(user_id, convo_id, rename_reply)
+        return
+
+    # 5) Intent extraction (products/routine)
+    intent_data = {}
+    try:
+        if hasattr(ai_intent, "extract_product_intent"):
+            intent_data = ai_intent.extract_product_intent(user_text) or {}
+        else:
+            logger.info("[Intent] No extractor defined.")
+    except Exception as e:
+        logger.warning("[Intent] Extractor failed: {}", e)
+        intent_data = {}
+    logger.info("[Intent] intent_data: {}", intent_data)
+
+    # 5a) Routine audit path (map first, optional product follow-up)
+    if intent_data.get("intent") == "routine_audit":
+        reply = ai.audit_routine(user_text, constraints=intent_data.get("constraints") or {}, user_id=user_id)
+        _finalize_and_send(user_id, convo_id, reply, add_cta=False)
+
+        # If the message implies shopping, send 1–3 picks (form inferred when possible)
         try:
-            product_candidates = prefer_amazon_first(build_product_candidates(intent_data))
+            want_products = any(w in normalized_text for w in [
+                "recommend", "recommendation", "suggest", "what should", "which", "looking for", "buy", "get"
+            ]) or "peptide" in normalized_text
+
+            if want_products:
+                form = None
+                if hasattr(ai_intent, "infer_form_factor"):
+                    form = ai_intent.infer_form_factor(user_text)  # "topical" | "ingestible" | None
+
+                base_query = "peptide face serum" if form == "topical" else (
+                             "collagen peptides" if form == "ingestible" else "peptide")
+
+                secondary_intent = {
+                    "intent": "find_products",
+                    "query": base_query,
+                    "category": "skincare" if form == "topical" else "",
+                    "constraints": {"form": form, "count": 3}
+                }
+                picks = prefer_amazon_first(build_product_candidates(secondary_intent))
+                if picks:
+                    gpt_products = [{
+                        "name": p.get("title") or p.get("name") or "Product",
+                        "category": "skincare" if form == "topical" else "supplements",
+                        "url": p.get("url",""),
+                        "review": p.get("review",""),
+                    } for p in picks[:3]]
+
+                    rec_text = ai.generate_reply(
+                        user_text=user_text,
+                        product_candidates=gpt_products,
+                        user_id=user_id,
+                        system_prompt=(
+                            "You are Bestie. Use the provided product candidates (already monetized DP URLs).\n"
+                            "FORMAT AS A NUMBERED LIST with bold names so link hygiene can attach if needed:\n"
+                            "1. **Name**: one-liner benefit. URL\n"
+                            "Keep the whole reply ~450 chars. 1–3 options max. No disclaimers. Do not alter or replace URLs."
+                        ),
+                        context={"session_goal": "offer quick product picks"},
+                    )
+                    rec_text = _fix_cringe_opening(rec_text)
+                    _finalize_and_send(user_id, convo_id, rec_text, add_cta=False)  # no CTA tail
         except Exception as e:
-            logger.warning("[Products] Candidate build failed: {}", e)
+            logger.warning("[Routine+Products] Secondary picks failed: {}", e)
 
-        if product_candidates:
-            # Normalize for GPT
-            gpt_products: List[Dict] = []
-            for c in product_candidates[:3]:
-                gpt_products.append({
-                    "name": c.get("title") or c.get("name") or "Product",
-                    "category": (intent_data or {}).get("category", ""),
-                    "url": c.get("url", ""),
-                    "review": c.get("review", ""),
-                })
+        return
 
-            # VIP/quiz flags for tone shaping
-            with db.session() as s:
-                profile = s.execute(
-                    sqltext("SELECT is_vip, has_completed_quiz FROM user_profiles WHERE user_id = :uid"),
-                    {"uid": user_id}
-                ).first()
-            context = {
-                "is_vip": bool(profile and profile[0]),
-                "has_completed_quiz": bool(profile and profile[1]),
-            }
+    # 6) Product candidates path
+    product_candidates: List[Dict] = []
+    try:
+        product_candidates = prefer_amazon_first(build_product_candidates(intent_data))
+    except Exception as e:
+        logger.warning("[Products] Candidate build failed: {}", e)
 
-            # Enumerated format ensures Amazon fallback injection works when URLs are missing
-            reply = ai.generate_reply(
-                user_text=user_text,
-                product_candidates=gpt_products,
-                user_id=user_id,
-                system_prompt=(
-                    "You are Bestie. Use the provided product candidates (already monetized DP URLs).\n"
-                    "FORMAT AS A NUMBERED LIST with bold names so link hygiene can attach if needed:\n"
-                    "1. **Name**: one-liner benefit. URL\n"
-                    "Keep the whole reply ~450 chars. 1–3 options max. No disclaimers. Do not alter or replace URLs."
-                ),
-                context=context,
-            )
-            reply = _fix_cringe_opening(reply)
-            reply = _maybe_inject_vip_by_convo(reply, convo_id, user_text)
-            _finalize_and_send(user_id, convo_id, reply, add_cta=True)  # enable product CTA tail
-            return
+    if product_candidates:
+        gpt_products: List[Dict] = []
+        for c in product_candidates[:3]:
+            gpt_products.append({
+                "name": c.get("title") or c.get("name") or "Product",
+                "category": (intent_data or {}).get("category", ""),
+                "url": c.get("url", ""),
+                "review": c.get("review", ""),
+            })
 
-        # ---------- General chat fallback ----------
         with db.session() as s:
             profile = s.execute(
                 sqltext("SELECT is_vip, has_completed_quiz FROM user_profiles WHERE user_id = :uid"),
@@ -694,34 +681,48 @@ def generate_reply_job(convo_id: int, user_id: int, text_val: str, user_phone: O
 
         reply = ai.generate_reply(
             user_text=user_text,
-            product_candidates=[],
+            product_candidates=gpt_products,
             user_id=user_id,
-            system_prompt="You are Bestie. Be brief, helpful, stylish, emotionally fluent. No therapy cliches.",
+            system_prompt=(
+                "You are Bestie. Use the provided product candidates (already monetized DP URLs).\n"
+                "FORMAT AS A NUMBERED LIST with bold names so link hygiene can attach if needed:\n"
+                "1. **Name**: one-liner benefit. URL\n"
+                "Keep the whole reply ~450 chars. 1–3 options max. No disclaimers. Do not alter or replace URLs."
+            ),
             context=context,
         )
-
-        try:
-            if hasattr(ai, "rewrite_if_cringe"):
-                rewritten = ai.rewrite_if_cringe(reply)
-                if rewritten and rewritten != reply:
-                    logger.info("[Worker][AI] Reply rewritten to improve tone.")
-                    reply = rewritten
-        except Exception:
-            logger.warning("[Worker][AI] rewrite_if_cringe failed. Using original.")
-
-        reply = _maybe_inject_vip_by_convo(reply, convo_id, user_text)
-        _finalize_and_send(user_id, convo_id, reply, add_cta=False)  # no product CTA for general replies
+        reply = _fix_cringe_opening(reply)
+        # do NOT inject VIP or CTA tail for product replies unless explicitly allowed
+        _finalize_and_send(user_id, convo_id, reply, add_cta=False)
         return
 
-    except Exception as e:
-        logger.exception("Worker job failed: {}", e)
-        _finalize_and_send(
-            user_id,
-            convo_id,
-            "Babe, I glitched. Give me one sec to reboot my attitude. 💅",
-            add_cta=False,
-            force_send=True,
-        )
+    # 7) General chat fallback
+    with db.session() as s:
+        profile = s.execute(
+            sqltext("SELECT is_vip, has_completed_quiz FROM user_profiles WHERE user_id = :uid"),
+            {"uid": user_id}
+        ).first()
+    context = {"is_vip": bool(profile and profile[0]), "has_completed_quiz": bool(profile and profile[1])}
+
+    reply = ai.generate_reply(
+        user_text=user_text,
+        product_candidates=[],
+        user_id=user_id,
+        system_prompt="You are Bestie. Be brief, helpful, stylish, emotionally fluent. No therapy cliches.",
+        context=context,
+    )
+
+    try:
+        if hasattr(ai, "rewrite_if_cringe"):
+            rewritten = ai.rewrite_if_cringe(reply)
+            if rewritten and rewritten != reply:
+                logger.info("[Worker][AI] Reply rewritten to improve tone.")
+                reply = rewritten
+    except Exception:
+        logger.warning("[Worker][AI] rewrite_if_cringe failed. Using original.")
+
+    _finalize_and_send(user_id, convo_id, reply, add_cta=False)
+    return
 
 # ---------------------------------------------------------------------- #
 # Debug and re-engagement jobs

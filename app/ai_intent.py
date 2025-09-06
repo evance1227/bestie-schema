@@ -112,7 +112,15 @@ INGREDIENT_TOKENS = [
     "niacinamide","azelaic","arbutin","kojic","peptide","copper peptide",
     "hyaluronic","ceramide","sunscreen","spf"
 ]
-
+_TOPICAL_HINTS = {
+    "serum","moisturizer","cream","lotion","essence","toner","ampoule",
+    "face","facial","skin barrier","retinol","niacinamide","hyaluronic",
+    "apply","layer","under makeup","night routine","am routine","pm routine"
+}
+_INGEST_HINTS = {
+    "powder","drink","scoop","mix","shake","capsules","gummies","pills",
+    "supplement","in my coffee","smoothie","collagen peptides"
+}
 # --------------------------- Helpers --------------------------- #
 def _norm(s: str) -> str:
     s = re.sub(r"\s+", " ", s or "").strip()
