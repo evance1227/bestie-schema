@@ -591,10 +591,8 @@ def generate_reply_job(convo_id: int, user_id: int, text_val: str, user_phone: O
 
         if intent_data and intent_data.get("intent") == "routine_audit":
             reply = ai.audit_routine(user_text, constraints=intent_data.get("constraints") or {}, user_id=user_id)
-            # No product CTA tails on routine audits
-            # (VIP soft-line is also skipped to keep this clean & helpful)
+            # No VIP soft-line, no CTA tail on audits
             _finalize_and_send(user_id, convo_id, reply, add_cta=False)
-
             # If the message implies shopping, send a second SMS with 1–3 picks.
             # Triggers: explicit verbs or the ingredient itself (e.g., "peptides").
             try:
