@@ -273,14 +273,14 @@ def _ensure_amazon_links(text: str) -> str:
         return text
     if "amazon.com/dp/" in text.lower():
         return text  # keep direct DP links untouched
-    if re.search(r"https?://\\S+", text):
+    if re.search(r"https?://\S+", text):
         return text  # some link already present
 
     def _inject(m):
         name = m.group(1).strip()
         return f"{m.group(0)}\n    [Amazon link]({_amazon_search_url(name)})"
 
-    return re.sub(r"(?m)^\\s*\\d+\\.\\s+\\*\\*(.+?)\\*\\*.*$", _inject, text)
+    return re.sub(r"(?m)^\s*\d+\.\s+\*\*(.+?)\*\*.*$", _inject, text)
 
 def _rewrite_links_to_genius(text: str) -> str:
     """
@@ -293,13 +293,13 @@ def _rewrite_links_to_genius(text: str) -> str:
 
     if GENIUSLINK_WRAP:
         def _wrap(url: str) -> str:
-            return GENIUSLINK_WRAP.format(url=re.sub(r'\\s', '%20', url))
+            return GENIUSLINK_WRAP.format(url=re.sub(r'\s', '%20', url))
         text = re.sub(_AMZN_RE, lambda m: _wrap(m.group(0)), text)
 
         def _md_repl(m):
             label, url = m.group(1), m.group(2)
             return f"[{label}]({_wrap(url)})" if _AMZN_RE.match(url) else m.group(0)
-        return re.sub(r"\\[([^\\]]+)\\]\\((https?://[^\\)]+)\\)", _md_repl, text)
+        return re.sub(r"\[([^\]]+)\]\((https?://[^)]+)\)", _md_repl, text)
 
     if GL_REWRITE and GENIUSLINK_DOMAIN:
         host = GENIUSLINK_DOMAIN.rstrip("/")
@@ -315,22 +315,10 @@ def _fix_vip_links(text: str) -> str:
     """Ensure VIP mention is clickable."""
     if not text:
         return text
-    text = re.sub(r"(?mi)^\\s*\\[?(vip|vip\\s*sign[- ]?up|vip\\s*signup)\\]?\\s*$", f"VIP Sign-Up: {VIP_URL}", text)
+    text = re.sub(r"(?mi)^\s*\[?(vip|vip\s*sign[- ]?up|vip\s*signup)\]?\s*$", f"VIP Sign-Up: {VIP_URL}", text)
     if "vip" in text.lower() and "gumroad.com" not in text.lower():
         text = text.rstrip() + ("\n" if not text.endswith("\n") else "") + VIP_URL
     return text
-
-def render_products_for_sms(products: List[Dict], limit: int = 3) -> str:
-    """Compact SMS-friendly list renderer for quick lists (not used in GPT replies)."""
-    lines: List[str] = []
-    for idx, p in enumerate(products[:limit], start=1):
-        name = (p.get("title") or "").strip() or (p.get("merchant") or "Product")
-        url = p.get("url", "").strip()
-        if url:
-            lines.append(f"{idx}. **{name}**\n   {url}")
-        else:
-            lines.append(f"{idx}. **{name}**")
-    return "\n\n".join(lines)
 
 # ---------------------------------------------------------------------- #
 # Final storage and SMS send
