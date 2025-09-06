@@ -1,25 +1,25 @@
-# Use Python 3.11 (stable, long-term support)
+# Use Python 3.11 (stable)
 FROM python:3.11-slim
 
-# Set working directory
 WORKDIR /app
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
 
-# Install system dependencies needed for psycopg2 and others
-RUN apt-get update && apt-get install -y \
-    gcc \
-    libpq-dev \
-    && rm -rf /var/lib/apt/lists/*
+# System deps: Postgres client libs + curl for shell checks
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc libpq-dev curl && \
+    rm -rf /var/lib/apt/lists/*
 
-# Copy requirements and install dependencies
+# Python deps
 COPY requirements.txt .
 RUN pip install --no-cache-dir --upgrade pip \
     && pip install --no-cache-dir -r requirements.txt
 
-# Copy all project files
+# App code
 COPY . .
 
-# Expose port (Render maps this automatically)
+# Expose for local runs (Render sets $PORT at runtime)
 EXPOSE 8000
 
-# Run the app with uvicorn
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+# IMPORTANT: bind to Render's $PORT; default to 8000 for local runs
+CMD ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}"]
