@@ -3,7 +3,10 @@ from __future__ import annotations
 
 import os
 import re
-from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse, quote_plus
+import html  # NEW: for unescaping redirect params
+from urllib.parse import (
+    urlparse, parse_qsl, parse_qs, urlencode, urlunparse, quote_plus
+)
 from loguru import logger
 
 # -------------------- Env -------------------- #
@@ -18,6 +21,10 @@ GENIUSLINK_WRAP = (os.getenv("GENIUSLINK_WRAP") or "").strip()
 # Option B: domain style, e.g. geni.us   (we'll use https://{domain}/{ASIN})
 GENIUSLINK_DOMAIN = (os.getenv("GENIUSLINK_DOMAIN") or "").strip()
 GL_REWRITE = (os.getenv("GL_REWRITE") or "1").lower() not in ("0", "false", "")
+
+# NEW: make unwrapping and canonicalizing explicit toggles
+GL_UNWRAP_REDIRECTS = (os.getenv("GL_UNWRAP_REDIRECTS") or "1").lower() not in ("0", "false", "")
+AMAZON_CANONICALIZE = (os.getenv("AMAZON_CANONICALIZE") or "1").lower() not in ("0", "false", "")
 
 # -------------------- Regex ------------------ #
 _URL = re.compile(r"https?://[^\s)\]]+", re.I)
@@ -87,6 +94,48 @@ def _ensure_amazon_tag(url: str, tag: str) -> str:
     except Exception:
         return url
 
+# NEW: unwrap a geni.us/redirect?url=<target> into the true target
+def _unwrap_genius_redirect(url: str) -> str:
+    try:
+        u = urlparse(url)
+        host = u.netloc.lower()
+        if not GL_UNWRAP_REDIRECTS:
+            return url
+        if not _GENIUS_HOST.search(host):
+            return url
+        if not u.path.lower().startswith("/redirect"):
+            return url
+        q = parse_qs(u.query or "")
+        target = q.get("url") or q.get("target") or q.get("to")
+        if target and target[0]:
+            real = html.unescape(target[0])
+            logger.debug("[Linkwrap] Unwrapped geni.us redirect to {}", real)
+            return real
+    except Exception as e:
+        logger.debug("[Linkwrap] unwrap redirect failed: {}", e)
+    return url
+
+# NEW: optional canonical Amazon DP link builder
+def _canonicalize_amazon(url: str, tag: str) -> str:
+    if not AMAZON_CANONICALIZE:
+        return _ensure_amazon_tag(url, tag) if tag else url
+    try:
+        u = urlparse(url)
+        host = u.netloc.lower()
+        if host in _AMAZON_SHORTNERS or "amazon." not in host:
+            return url  # do not touch shorteners or non-amazon
+        asin = _asin_from_url(url)
+        if not asin:
+            return _ensure_amazon_tag(url, tag) if tag else url
+        # Default to US store for canon DP. If you need intl later, expose env.
+        dp_host = os.getenv("AMAZON_DP_HOST", "www.amazon.com")
+        path = f"/dp/{asin}"
+        query = urlencode({"tag": tag}) if tag else ""
+        return urlunparse(("https", dp_host, path, "", query, ""))
+    except Exception as e:
+        logger.debug("[Linkwrap] canonicalize failed: {}", e)
+        return _ensure_amazon_tag(url, tag) if tag else url
+
 def _wrap_with_geniuslink(url: str) -> str:
     """
     Wrap Amazon URLs for Geniuslink in one of two ways:
@@ -101,7 +150,7 @@ def _wrap_with_geniuslink(url: str) -> str:
         u = urlparse(url)
         host = u.netloc.lower()
 
-        # Already geni.us? leave it
+        # Already geni.us? leave it (we only unwrap the /redirect form earlier)
         if _GENIUS_HOST.search(host):
             return url
 
@@ -130,17 +179,26 @@ def _wrap_with_geniuslink(url: str) -> str:
 # -------------------- Public API ---------------- #
 def convert_to_geniuslink(url: str) -> str:
     """
-    Preferred transform: clean the URL, ensure Amazon tag, then wrap for Geniuslink if configured.
+    Preferred transform: unwrap broken redirects, clean, tag or canonicalize,
+    then wrap for Geniuslink if configured.
     """
     if not url:
         return url
+
     clean, trail = _strip_trailing_punct(url)
+
+    # NEW: unwrap any geni.us/redirect first to the real target
+    try:
+        clean = _unwrap_genius_redirect(clean)
+    except Exception:
+        pass
+
     clean = _strip_utm(clean)
 
-    # Amazon path: tag, then wrap
+    # Amazon path: canonicalize or tag, then optional wrap
     if _is_amazon(clean):
-        if AMAZON_TAG:
-            clean = _ensure_amazon_tag(clean, AMAZON_TAG)
+        if AMAZON_TAG or AMAZON_CANONICALIZE:
+            clean = _canonicalize_amazon(clean, AMAZON_TAG)
         clean = _wrap_with_geniuslink(clean)
 
     return clean + trail
@@ -151,8 +209,9 @@ convert_to_affiliate_link = convert_to_geniuslink
 def rewrite_affiliate_links_in_text(text: str) -> str:
     """
     Rewrites BOTH markdown and bare URLs:
+      - unwraps geni.us/redirect
       - cleans UTMs
-      - ensures amazon tag
+      - ensures amazon tag or canonical DP
       - geniuslink wrap when configured
     """
     if not text:
@@ -192,8 +251,8 @@ def enforce_affiliate_tags(text: str, amazon_tag: str) -> str:
 
     def _repl(m: re.Match) -> str:
         url, trail = _strip_trailing_punct(m.group(0))
-        if _is_amazon(url) and AMAZON_TAG:
-            return _ensure_amazon_tag(url, amazon_tag) + trail
+        if _is_amazon(url) and amazon_tag:
+            return _canonicalize_amazon(url, amazon_tag) + trail  # NEW: respect canonicalize flag
         return m.group(0)
 
     return _URL.sub(_repl, text)
@@ -202,8 +261,9 @@ def make_sms_reply(reply: str, amazon_tag: str = "schizobestie-20") -> str:
     """
     Final SMS-safe pass:
       1) flatten markdown links
-      2) enforce amazon affiliate tag
-      3) collapse whitespace
+      2) rewrite/clean any URLs (unwrap, tag/canon, optional wrap)
+      3) ensure amazon tag if anything slipped
+      4) collapse whitespace
     Do NOT add emojis or rewrite content here — workers handle tone and CTA.
     """
     try:
@@ -212,11 +272,13 @@ def make_sms_reply(reply: str, amazon_tag: str = "schizobestie-20") -> str:
         # 1) flatten markdown
         t = sms_ready_links(t)
 
-        # 2) rewrite/clean any URLs, then ensure tag for amazon (in case SMS copy joined lines)
+        # 2) rewrite/clean any URLs
         t = rewrite_affiliate_links_in_text(t)
+
+        # 3) ensure tag/canon
         t = enforce_affiliate_tags(t, amazon_tag)
 
-        # 3) collapse
+        # 4) collapse
         t = re.sub(r"\s{2,}", " ", t).strip()
         return t
     except Exception as e:
