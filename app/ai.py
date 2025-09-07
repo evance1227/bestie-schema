@@ -29,6 +29,7 @@ import redis
 from loguru import logger
 from openai import OpenAI
 from sqlalchemy import text as sqltext
+from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 
 from app import db, linkwrap
 from app.personas.bestie_altare import BESTIE_SYSTEM_PROMPT
@@ -301,18 +302,33 @@ def build_messages(
     product_block = ""
     pcs = product_candidates or []
     if pcs:
-        # Convert to Geniuslink when possible (safe no-op if impl not present)
-        safe: List[Dict] = []
-        for p in pcs[:3]:
-            url = str(p.get("url") or "")
-            final = url
-            try:
-                gl = linkwrap.convert_to_geniuslink(url) if url else ""
-                if gl and "geni.us" in gl:
-                    final = gl
-            except Exception:
-                pass
-            safe.append(
+# Convert to Geniuslink when possible (safe no-op if impl not present)
+        
+# Optional product context for the model to reference       f
+
+        product_block = ""
+        pcs = product_candidates or []
+        if pcs:
+            safe: List[Dict] = []
+            for p in pcs[:3]:
+                url = str(p.get("url") or "")
+                final = url
+    try:
+        gl = linkwrap.convert_to_geniuslink(url) if url else ""
+
+        if gl and "geni.us" in gl and os.getenv("GL_REWRITE", "0").lower() in ("1", "true"):
+            final = gl
+
+        elif "amazon.com" in url:
+            parsed = urlparse(url)
+            q = parse_qs(parsed.query)
+            q["tag"] = ["schizobestie-20"]
+            new_query = urlencode(q, doseq=True)
+            final = urlunparse(parsed._replace(query=new_query))
+    except Exception as e:
+        logger.debug("[Linkwrap] URL tweak failed: {}", e)
+
+        safe.append(
                 {
                     "name": str(p.get("name") or p.get("title") or "Product"),
                     "category": str(p.get("category") or ""),
@@ -321,10 +337,17 @@ def build_messages(
                 }
             )
 
-        lines = []
-        for p in safe:
+    lines = []
+    for p in safe:
+        lines.append(
+            f"- {p['name']} ({p['category']}) | {p['url']} | Review: {p['review']}"
+        )
+    product_block = "Here are product candidates (already monetized if possible):\n" + "\n".join(lines)
+
+    lines = []
+    for p in safe:
             lines.append(f"- {p['name']} (Category: {p['category']}) | {p['url']} | Review: {p['review']}")
-        product_block = "Here are product candidates (already monetized if possible):\n" + "\n".join(lines)
+    product_block = "Here are product candidates (already monetized if possible):\n" + "\n".join(lines)
 
     # Sentiment hint
     hint = _sentiment_hint(user_text)
@@ -350,8 +373,31 @@ def build_messages(
         user_msg = {"role": "user", "content": user_payload}
 
     # Final message list
-    msgs: List[Dict] = [{"role": "system", "content": persona}]
-    msgs.extend(recent)
+def _build_messages(
+    user_text: str,
+    product_candidates: Optional[List[Dict]] = None,
+    recent: Optional[List[Dict]] = None,
+    persona: Optional[str] = None,
+    context: Optional[Dict] = None
+) -> List[Dict]:
+    msgs: List[Dict] = [{"role": "system", "content": persona or ""}]
+
+    # Add past memory (last few turns)
+    if recent:
+        msgs.extend(recent)
+
+    # Build the user content
+    user_payload = user_text.strip()
+
+    if context:
+        ctx_lines = [f"{k}: {v}" for k, v in context.items()]
+        user_payload += "\n\n" + "\n".join(ctx_lines)
+
+    if product_candidates:
+        product_block = build_product_block(product_candidates)
+        user_payload += "\n\n" + product_block
+
+    user_msg = {"role": "user", "content": user_payload}
     msgs.append(user_msg)
     return msgs
 
@@ -648,3 +694,36 @@ def extract_product_intent(text: str) -> Optional[Dict[str, str]]:
     if any(k in t for k in PRODUCT_TRIGGERS):
         return {"need_product": True, "query": text.strip()}
     return None
+from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
+
+def build_product_block(product_candidates: List[Dict]) -> str:
+    safe = []
+    for p in product_candidates[:3]:
+        url = str(p.get("url") or "")
+        final = url
+
+        try:
+            # Geniuslink wrap only if GL_REWRITE is ON
+            gl = linkwrap.convert_to_geniuslink(url) if url else ""
+            if gl and "geni.us" in gl and os.getenv("GL_REWRITE", "0").lower() in ("1", "true"):
+                final = gl
+            elif "amazon.com" in url:
+                parsed = urlparse(url)
+                q = parse_qs(parsed.query)
+                q["tag"] = ["schizobestie-20"]
+                new_query = urlencode(q, doseq=True)
+                final = urlunparse(parsed._replace(query=new_query))
+        except Exception as e:
+            logger.debug("[Linkwrap] URL tweak failed: {}", e)
+
+        safe.append({
+            "name": str(p.get("name") or p.get("title") or "Product"),
+            "category": str(p.get("category") or ""),
+            "url": final,
+            "review": str(p.get("review") or "")
+        })
+
+    lines = []
+    for p in safe:
+        lines.append(f"**{p['name']}**: {p['review']} {p['url']}")
+    return "\n".join(lines)

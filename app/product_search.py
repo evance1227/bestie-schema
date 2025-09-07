@@ -1,4 +1,3 @@
-# app/product_search.py
 from __future__ import annotations
 
 import re
@@ -7,6 +6,7 @@ from urllib.parse import urlparse
 
 from loguru import logger
 from app.amazon_api import search_amazon_products
+
 
 def _normalize(items: List[Dict]) -> List[Dict]:
     """
@@ -21,12 +21,13 @@ def _normalize(items: List[Dict]) -> List[Dict]:
         out.append({
             "title": title,
             "name": (it.get("name") or title).strip(),
-            "url": (it.get("url") or "").strip(),
+            "url": (it.get("url") or "").strip(),  # Do NOT wrap upstream. Leave clean.
             "review": (it.get("review") or "").strip(),
             "merchant": (it.get("merchant") or "amazon.com").strip(),
             "meta": it.get("meta") or {},
         })
     return out
+
 
 def _fallback_from_query(query: str, max_items: int = 3) -> List[Dict]:
     """
@@ -43,6 +44,7 @@ def _fallback_from_query(query: str, max_items: int = 3) -> List[Dict]:
     # Keep tidy names
     seeds = [s[:80] for s in seeds]
     return [{"title": s, "name": s, "url": "", "review": "", "merchant": "amazon.com"} for s in seeds[:max_items]]
+
 
 def build_product_candidates(intent: Optional[Dict]) -> List[Dict]:
     """
@@ -77,6 +79,7 @@ def build_product_candidates(intent: Optional[Dict]) -> List[Dict]:
     except Exception as e:
         logger.exception("[ProductSearch] Error building candidates: {}", e)
         return _fallback_from_query(query, max_items=int((intent.get("constraints") or {}).get("count") or 3))
+
 
 def prefer_amazon_first(candidates: List[Dict]) -> List[Dict]:
     """

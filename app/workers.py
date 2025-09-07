@@ -9,7 +9,6 @@ Core:
 - Product intent → candidates → Bestie tone reply
 - Routine/overlap audit path (optionally followed by products when asked/ implied)
 - General chat fallback with tone guards
-- Optional VIP soft pitch (OFF by default) with cooldown + daily cap
 - SMS link hygiene (Amazon search injection + affiliate)
 - Re-engagement job (48h quiet)
 
@@ -344,6 +343,11 @@ def _fix_vip_links(text: str) -> str:
 # ---------------------------------------------------------------------- #
 # Final storage and SMS send
 # ---------------------------------------------------------------------- #
+# ==== Final shaping ====
+    text_val = _add_personality_if_flat(text_val)
+    text_val = make_sms_reply(text_val)
+    text_val = ensure_not_link_ending(text_val)
+
 def _add_personality_if_flat(text: str) -> str:
     if not text:
         return text
