@@ -27,6 +27,7 @@ import uuid
 import hashlib
 import random
 import time
+import requests
 from typing import Optional, List, Dict, Tuple
 from datetime import datetime, timezone, timedelta
 from urllib.parse import quote_plus
@@ -338,23 +339,58 @@ def _fix_vip_links(text: str) -> str:
         return text
     text = re.sub(r"(?mi)^\s*\[?(vip|vip\s*sign[- ]?up|vip\s*signup)\]?\s*$", f"VIP Sign-Up: {FULL_URL or VIP_URL}", text)
     if "vip" in text.lower() and "gumroad.com" not in text.lower():
-        text = text.rstrip() + ("\n" if not text.endswith("\n") else "") + (FULL_URL or VIP_URL)
-    return text
-
+        text = text.rstrip() + ("\n" if not text else "")
+                                
 # ---------------------------------------------------------------------- #
 # Final storage and SMS send
 # ---------------------------------------------------------------------- #
+def _add_personality_if_flat(text: str) -> str:
+    if not text:
+        return text
+    if text.count("http") >= 2 and len(text) < 480:
+        opener = "Got you, babe. Here are a couple that actually work:"
+        text = opener + "\n" + text
+    return text
+
 def _store_and_send(user_id: int, convo_id: int, text_val: str) -> None:
     """
     Single place to store and send. Splits long messages to ~450 chars with [1/2] prefix.
     Adds a tiny headway between multipart sends so carriers keep order.
-    """
+    Applies final link and tone cleanup before sending and storage.
+    """    
     max_len = 450
     parts: List[str] = []
+
     text_val = (text_val or "").strip()
     if not text_val:
         return
 
+    # ==== Final shaping ====
+    text_val = _add_personality_if_flat(text_val)
+    text_val = make_sms_reply(text_val)
+    text_val = ensure_not_link_ending(text_val)
+
+    # ==== One-time debug marker ====
+    DEBUG_MARKER = os.getenv("DEBUG_MARKER", "")
+    if DEBUG_MARKER:
+        text_val = text_val.rstrip() + f"\n{DEBUG_MARKER}"
+
+    # ==== POST to GHL ====
+    user_phone = os.getenv("TEST_PHONE") or "+15555555555"
+    GHL_WEBHOOK_URL = os.getenv("GHL_OUTBOUND_WEBHOOK_URL")
+    if GHL_WEBHOOK_URL:
+        ghl_payload = {
+            "phone": user_phone,
+            "message": text_val,
+            "user_id": user_id,
+            "convo_id": convo_id
+        }
+        try:
+            requests.post(GHL_WEBHOOK_URL, json=ghl_payload, timeout=6)
+        except Exception as e:
+            logger.warning("[GHL_SEND] Failed to POST to GHL: {}", e)
+
+    # ==== Break into SMS chunks ====
     while len(text_val) > max_len:
         split_point = text_val[:max_len].rfind(" ")
         if split_point == -1:
@@ -390,7 +426,6 @@ def _store_and_send(user_id: int, convo_id: int, text_val: str) -> None:
                 time.sleep(SMS_PART_DELAY_MS / 1000.0)
         except Exception:
             pass
-
 # ---------------------------------------------------------------------- #
 # Finalize + send (formatting, links, optional CTA - OFF by default)
 # ---------------------------------------------------------------------- #
@@ -404,48 +439,40 @@ def _finalize_and_send(
 ) -> None:
     """
     Final formatting before a single send.
-    - Link hygiene (Amazon search injection only if no links, optional Geniuslink wrap)
-    - Optional affiliate transforms via linkwrap
-    - SMS formatting for links
-    - CTA tail is disabled by default and only added if BESTIE_PRODUCT_CTA_ENABLED=1 AND add_cta=True
+    - Link hygiene (Amazon + optional Geniuslink rewrite)
+    - Personality injection if reply is flat
+    - Optional CTA line (off by default)
+    - Final cleanup for SMS delivery
     """
+    from app.linkwrap import make_sms_reply, ensure_not_link_ending
+
+    def _add_personality_if_flat(t: str) -> str:
+        if not t:
+            return t
+        if t.count("http") >= 2 and len(t) < 480:
+            opener = "Got you, babe. Here are a couple that actually work:"
+            t = opener + "\n" + t
+        return t
+
     reply = (reply or "").strip()
     if not reply:
         logger.warning("[Worker][Send] Empty reply. Skipping.")
         return
 
-    # Optional CTA tail (globally disabled unless env enabled)
     try:
+        # Optional CTA tail (globally disabled unless env enabled)
         if add_cta and BESTIE_PRODUCT_CTA_ENABLED:
             reply += "\n\nPS: Savings tip: try WELCOME10 or search brand + coupon."
     except Exception:
         pass
 
-    # Link hygiene order
-    reply = _ensure_amazon_links(reply)
-    reply = _rewrite_links_to_genius(reply)
-    reply = _fix_vip_links(reply)
-
-    # Optional affiliate rewrite + SMS-safe formatting
+    # === Link and tone hygiene ===
     try:
-        aff = linkwrap.rewrite_affiliate_links_in_text(reply)
-        if aff:
-            reply = aff
+        reply = _add_personality_if_flat(reply)
+        reply = make_sms_reply(reply)          # canonical Amazon links + tag
+        reply = ensure_not_link_ending(reply)  # avoid ending on a naked URL
     except Exception as e:
-        logger.debug("[Affiliate] rewrite_affiliate_links_in_text skipped: {}", e)
-
-    try:
-        if hasattr(linkwrap, "make_sms_reply"):
-            reply = linkwrap.make_sms_reply(reply, amazon_tag="schizobestie-20")
-        else:
-            if hasattr(linkwrap, "sms_ready_links"):
-                reply = linkwrap.sms_ready_links(reply)
-            if hasattr(linkwrap, "enforce_affiliate_tags"):
-                reply = linkwrap.enforce_affiliate_tags(reply, "schizobestie-20")
-    except Exception as e:
-        logger.warning("[Linkwrap] SMS formatting fallback failed: {}", e)   
-    reply = make_sms_reply(reply)           # unwrap redirect, canonicalize Amazon, tag
-    reply = ensure_not_link_ending(reply)   # never end on a URL
+        logger.warning("[Worker][Linkwrap/Tone] Error in reply cleanup: {}", e)
 
     _store_and_send(user_id, convo_id, reply)
 
@@ -774,3 +801,4 @@ def send_reengagement_job():
 
     except Exception as e:
         logger.exception("[Worker][Reengage] Exception: {}", e)
+
