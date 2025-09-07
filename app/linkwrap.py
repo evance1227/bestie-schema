@@ -21,6 +21,7 @@ GENIUSLINK_WRAP = (os.getenv("GENIUSLINK_WRAP") or "").strip()
 # Option B: domain style, e.g. geni.us   (we'll use https://{domain}/{ASIN})
 GENIUSLINK_DOMAIN = (os.getenv("GENIUSLINK_DOMAIN") or "").strip()
 GL_REWRITE = (os.getenv("GL_REWRITE") or "1").lower() not in ("0", "false", "")
+GL_ALLOW_REDIRECT_TEMPLATE = (os.getenv("GL_ALLOW_REDIRECT_TEMPLATE") or "0").lower() in ("1","true","yes")
 
 # NEW: make unwrapping and canonicalizing explicit toggles
 GL_UNWRAP_REDIRECTS = (os.getenv("GL_UNWRAP_REDIRECTS") or "1").lower() not in ("0", "false", "")
@@ -162,8 +163,12 @@ def _wrap_with_geniuslink(url: str) -> str:
             return url
 
         # Option A: {url}-template redirect
+        # Option A: {url}-template redirect (disabled unless explicitly allowed)
         if GENIUSLINK_WRAP:
-            return GENIUSLINK_WRAP.format(url=quote_plus(url))
+            if GL_ALLOW_REDIRECT_TEMPLATE:
+                return GENIUSLINK_WRAP.format(url=quote_plus(url))
+            else:
+                logger.debug("[Linkwrap] Redirect template present but disabled (GL_ALLOW_REDIRECT_TEMPLATE=0). Skipping.")
 
         # Option B: domain + ASIN path
         if GENIUSLINK_DOMAIN:
@@ -284,3 +289,22 @@ def make_sms_reply(reply: str, amazon_tag: str = "schizobestie-20") -> str:
     except Exception as e:
         logger.warning("[Linkwrap] make_sms_reply failed: {}", e)
         return reply
+# ==== Never end replies on a link ====
+_URL_END_RE = re.compile(r"(https?://[^\s)]+)\s*$", re.I)
+
+def ensure_not_link_ending(text: str) -> str:
+    """
+    If the message ends with a URL, append a short conversational closer
+    so SMS doesn't look ugly and the user is invited to reply.
+    """
+    if not text:
+        return text
+    if _URL_END_RE.search(text):
+        closers = [
+            "Want the lighter gel or a richer cream?",
+            "Under $30 or go-for-gold?",
+            "Do you want speed or maximum results? I can tune it."
+        ]
+        # simple deterministic pick
+        return text.rstrip() + "\n" + closers[0]
+    return text

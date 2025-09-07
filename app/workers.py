@@ -30,7 +30,7 @@ import time
 from typing import Optional, List, Dict, Tuple
 from datetime import datetime, timezone, timedelta
 from urllib.parse import quote_plus
-
+from app.linkwrap import make_sms_reply, ensure_not_link_ending
 # ----------------------------- Third party ----------------------------- #
 import redis
 from loguru import logger
@@ -443,7 +443,9 @@ def _finalize_and_send(
             if hasattr(linkwrap, "enforce_affiliate_tags"):
                 reply = linkwrap.enforce_affiliate_tags(reply, "schizobestie-20")
     except Exception as e:
-        logger.warning("[Linkwrap] SMS formatting fallback failed: {}", e)
+        logger.warning("[Linkwrap] SMS formatting fallback failed: {}", e)   
+    reply = make_sms_reply(reply)           # unwrap redirect, canonicalize Amazon, tag
+    reply = ensure_not_link_ending(reply)   # never end on a URL
 
     _store_and_send(user_id, convo_id, reply)
 
