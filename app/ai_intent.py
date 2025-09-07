@@ -127,6 +127,15 @@ def _norm(s: str) -> str:
     s = s.strip(" ?.!\"'()[]")
     return s
 
+def infer_form_factor(text: str) -> Optional[str]:
+    t = (text or "").lower()
+    score_top = sum(1 for w in _TOPICAL_HINTS if w in t)
+    score_ing = sum(1 for w in _INGEST_HINTS if w in t)
+    if score_top > score_ing and score_top >= 1:
+        return "topical"
+    if score_ing > score_top and score_ing >= 1:
+        return "ingestible"
+    return None
 def _category_guess(text_lower: str) -> Optional[str]:
     """
     Prefer 'printers' when a printer-ish term is present,
@@ -293,6 +302,9 @@ def extract_product_intent(user_text: str) -> Dict:
           "query": <string>,
           "category": <optional str>,
           "constraints": { ... }
+          "constraints": intent.get("constraints") or {}
+          "constraints["form"]" = ff
+          "intent["constraints"]" = constraints
         }
     If no product intent detected, returns {}.
     """
@@ -374,6 +386,12 @@ def extract_product_intent(user_text: str) -> Dict:
         if m:
             target_raw = m.group(1)
             target = _norm(target_raw)
+
+            # Skip if it's clearly garbage like a single letter
+            if not target or len(target) < 3:
+                logger.warning("[Intent] Ignored weak similar-to match: '{}'", target)
+                continue  # this is the valid way to skip inside a for-loop
+
             logger.info("[Intent] Parsed 'similar-to' target: {}", target)
             return {
                 "intent": "find_products",
@@ -381,6 +399,7 @@ def extract_product_intent(user_text: str) -> Dict:
                 "category": _category_guess(low),
                 "constraints": constraints,
             }
+
 
     # generic shopping phrasing
     if any(g in low for g in ["recommend", "recommendation", "suggest", "which", "buy", "find", "product", "looking for", "need", "link", "send me"]):
