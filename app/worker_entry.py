@@ -13,6 +13,11 @@ from __future__ import annotations
 
 import os
 from loguru import logger
+import os
+logger.info("[env] GL_REWRITE=%s GL_ALLOW_REDIRECT_TEMPLATE=%s GL_UNWRAP_REDIRECTS=%s AMAZON_CANONICALIZE=%s TAG=%s",
+            os.getenv("GL_REWRITE"), os.getenv("GL_ALLOW_REDIRECT_TEMPLATE"),
+            os.getenv("GL_UNWRAP_REDIRECTS"), os.getenv("AMAZON_CANONICALIZE"),
+            os.getenv("AMAZON_ASSOC_TAG"))
 
 def _fallback_worker() -> None:
     from redis import Redis
