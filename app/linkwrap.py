@@ -151,26 +151,15 @@ def _wrap_with_geniuslink(url: str) -> str:
         u = urlparse(url)
         host = u.netloc.lower()
 
-        # Already geni.us? leave it (we only unwrap the /redirect form earlier)
         if _GENIUS_HOST.search(host):
             return url
 
-        if "amazon." not in host:
+        if "amazon." not in host or host in _AMAZON_SHORTNERS:
             return url
 
-        # Shorteners: leave as-is
-        if host in _AMAZON_SHORTNERS:
-            return url
+        if GENIUSLINK_WRAP and GL_ALLOW_REDIRECT_TEMPLATE:
+            return GENIUSLINK_WRAP.format(url=quote_plus(url))
 
-        # Option A: {url}-template redirect
-        # Option A: {url}-template redirect (disabled unless explicitly allowed)
-        if GENIUSLINK_WRAP:
-            if GL_ALLOW_REDIRECT_TEMPLATE:
-                return GENIUSLINK_WRAP.format(url=quote_plus(url))
-            else:
-                logger.debug("[Linkwrap] Redirect template present but disabled (GL_ALLOW_REDIRECT_TEMPLATE=0). Skipping.")
-
-        # Option B: domain + ASIN path
         if GENIUSLINK_DOMAIN:
             asin = _asin_from_url(url)
             if asin:
@@ -204,7 +193,9 @@ def convert_to_geniuslink(url: str) -> str:
     if _is_amazon(clean):
         if AMAZON_TAG or AMAZON_CANONICALIZE:
             clean = _canonicalize_amazon(clean, AMAZON_TAG)
-        clean = _wrap_with_geniuslink(clean)
+        if GL_REWRITE:
+            clean = _wrap_with_geniuslink(clean)
+
 
     return clean + trail
 
@@ -274,21 +265,22 @@ def make_sms_reply(reply: str, amazon_tag: str = "schizobestie-20") -> str:
     try:
         t = (reply or "")
 
-        # 1) flatten markdown
+        # Flatten markdown like [label](url) → url
         t = sms_ready_links(t)
 
-        # 2) rewrite/clean any URLs
+        # Rewrite links (unwrap geni.us, canonicalize/tag amazon, wrap if configured)
         t = rewrite_affiliate_links_in_text(t)
 
-        # 3) ensure tag/canon
+        # Enforce final Amazon tag (in case any got skipped)
         t = enforce_affiliate_tags(t, amazon_tag)
 
-        # 4) collapse
+        # Final whitespace cleanup
         t = re.sub(r"\s{2,}", " ", t).strip()
         return t
     except Exception as e:
         logger.warning("[Linkwrap] make_sms_reply failed: {}", e)
         return reply
+
 # ==== Never end replies on a link ====
 _URL_END_RE = re.compile(r"(https?://[^\s)]+)\s*$", re.I)
 
