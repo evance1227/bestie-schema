@@ -602,9 +602,15 @@ def extract_product_intent(text: str) -> Optional[Dict[str, str]]:
     if not text:
         return None
     t = text.lower()
-    if any(k in t for k in PRODUCT_TRIGGERS):
+    
+    # Require at least 3 non-stopwords and one known trigger to activate
+    triggers = PRODUCT_TRIGGERS
+    words = re.findall(r"\b\w+\b", t)
+    if any(k in t for k in triggers) and len(words) > 3:
         return {"need_product": True, "query": text.strip()}
+    
     return None
+
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 
 def build_product_block(product_candidates: List[Dict]) -> str:
