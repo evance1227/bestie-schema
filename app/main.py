@@ -10,6 +10,12 @@ from sqlalchemy import text as sqltext
 
 from app import db
 from app.webhooks_gumroad import router as gumroad_router
+from fastapi import FastAPI
+app = FastAPI()
+
+@app.get("/healthz")
+def healthz():
+    return {"ok": True}
 
 CRON_SECRET = os.getenv("CRON_SECRET")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")  # << inbound shared secret (set in Web service env)
