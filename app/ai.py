@@ -281,112 +281,22 @@ def _load_recent_turns(user_id: Optional[int], limit: int = 12) -> List[Dict]:
     except Exception as e:
         logger.debug("[AI][Mem] load_recent_turns error: {}", e)
         return []
-
-# ------------------ Message builder ----------------- #
 def build_messages(
-    user_id: Optional[int],
     user_text: str,
-    *,
-    session_goal: Optional[str] = None,
-    product_candidates: Optional[List[Dict]] = None,
-    context: Optional[Dict] = None,
-) -> List[Dict]:
-    """
-    Assemble messages for OpenAI:
-      [system persona] + recent 8–12 turns + current user ask (+ product context)
-    """
-    persona = compose_persona(user_id, session_goal=session_goal)
-    recent = _load_recent_turns(user_id, limit=12)
-
-    # Optional product context for the model to reference
-    product_block = ""
-    pcs = product_candidates or []
-    if pcs:
-# Convert to Geniuslink when possible (safe no-op if impl not present)
-        
-# Optional product context for the model to reference       f
-
-        product_block = ""
-        pcs = product_candidates or []
-        if pcs:
-            safe: List[Dict] = []
-            for p in pcs[:3]:
-                url = str(p.get("url") or "")
-                final = url
-    try:
-        gl = linkwrap.convert_to_geniuslink(url) if url else ""
-
-        if gl and "geni.us" in gl and os.getenv("GL_REWRITE", "0").lower() in ("1", "true"):
-            final = gl
-
-        elif "amazon.com" in url:
-            parsed = urlparse(url)
-            q = parse_qs(parsed.query)
-            q["tag"] = ["schizobestie-20"]
-            new_query = urlencode(q, doseq=True)
-            final = urlunparse(parsed._replace(query=new_query))
-    except Exception as e:
-        logger.debug("[Linkwrap] URL tweak failed: {}", e)
-
-        safe.append(
-                {
-                    "name": str(p.get("name") or p.get("title") or "Product"),
-                    "category": str(p.get("category") or ""),
-                    "url": final,
-                    "review": str(p.get("review") or ""),
-                }
-            )
-
-    lines = []
-    for p in safe:
-        lines.append(
-            f"- {p['name']} ({p['category']}) | {p['url']} | Review: {p['review']}"
-        )
-    product_block = "Here are product candidates (already monetized if possible):\n" + "\n".join(lines)
-
-    lines = []
-    for p in safe:
-            lines.append(f"- {p['name']} (Category: {p['category']}) | {p['url']} | Review: {p['review']}")
-    product_block = "Here are product candidates (already monetized if possible):\n" + "\n".join(lines)
-
-    # Sentiment hint
-    hint = _sentiment_hint(user_text)
-    if hint:
-        persona = f"{persona}\n\nRUNTIME CONTEXT: {hint}"
-
-    # Build the user content
-    ask = user_text.strip()
-    if "[IMG:" in ask:
-        ask_mm = _to_mm_user_content(ask)
-        user_msg = {"role": "user", "content": ask_mm}
-        # Attach product block as a separate assistant planning note (system text)
-        if product_block:
-            persona = f"{persona}\n\n{product_block}"
-    else:
-        user_payload = f"User said: {ask}"
-        if context:
-            ctx_lines = [f"{k}: {v}" for k, v in context.items()]
-            if ctx_lines:
-                user_payload += "\n" + "\n".join(ctx_lines)
-        if product_block:
-            user_payload += "\n\n" + product_block
-        user_msg = {"role": "user", "content": user_payload}
-
-    # Final message list
-def _build_messages(
-    user_text: str,
+    user_id: int,
+    session_goal: Optional[str],
     product_candidates: Optional[List[Dict]] = None,
     recent: Optional[List[Dict]] = None,
     persona: Optional[str] = None,
-    context: Optional[Dict] = None
+    context: Optional[Dict] = None,
 ) -> List[Dict]:
-    msgs: List[Dict] = [{"role": "system", "content": persona or ""}]
+    persona = persona or compose_persona(user_id, session_goal=session_goal)
+    recent = recent or _load_recent_turns(user_id, limit=12)
+    msgs: List[Dict] = [{"role": "system", "content": persona}]
 
-    # Add past memory (last few turns)
     if recent:
         msgs.extend(recent)
 
-    # Build the user content
     user_payload = user_text.strip()
 
     if context:
@@ -399,8 +309,9 @@ def _build_messages(
 
     user_msg = {"role": "user", "content": user_payload}
     msgs.append(user_msg)
-    return msgs
 
+    return msgs
+  
 # ------------------ Core: generate_reply ------------ #
 def generate_reply(
     user_text: str,
@@ -603,7 +514,7 @@ def rewrite_different(
     )
     out = (resp.choices[0].message.content or "").strip()
     return _sanitize_output(out)
-# ------------------ Routine audit (AM/PM map) ------------------ #
+
 # ------------------ Routine audit (AM/PM map) ------------------ #
 from typing import Optional, Dict  # safe if already imported; Python ignores duplicates
 
@@ -697,13 +608,18 @@ def extract_product_intent(text: str) -> Optional[Dict[str, str]]:
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 
 def build_product_block(product_candidates: List[Dict]) -> str:
-    safe = []
+    """
+    Format product block for GPT input.
+    """
+    if not product_candidates:
+        return ""
+
+    safe: List[Dict] = []
+
     for p in product_candidates[:3]:
         url = str(p.get("url") or "")
         final = url
-
         try:
-            # Geniuslink wrap only if GL_REWRITE is ON
             gl = linkwrap.convert_to_geniuslink(url) if url else ""
             if gl and "geni.us" in gl and os.getenv("GL_REWRITE", "0").lower() in ("1", "true"):
                 final = gl
@@ -716,14 +632,17 @@ def build_product_block(product_candidates: List[Dict]) -> str:
         except Exception as e:
             logger.debug("[Linkwrap] URL tweak failed: {}", e)
 
-        safe.append({
-            "name": str(p.get("name") or p.get("title") or "Product"),
-            "category": str(p.get("category") or ""),
-            "url": final,
-            "review": str(p.get("review") or "")
-        })
+        safe.append(
+            {
+                "name": str(p.get("name") or p.get("title") or "Product"),
+                "category": str(p.get("category") or ""),
+                "url": final,
+                "review": str(p.get("review") or ""),
+            }
+        )
 
     lines = []
     for p in safe:
-        lines.append(f"**{p['name']}**: {p['review']} {p['url']}")
-    return "\n".join(lines)
+        lines.append(f"- {p['name']} (Category: {p['category']}) | {p['url']} | Review: {p['review']}")
+
+    return "Here are product candidates (already monetized if possible):\n" + "\n".join(lines)
