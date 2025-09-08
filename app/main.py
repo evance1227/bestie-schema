@@ -20,6 +20,60 @@ def healthz():
 
 CRON_SECRET = os.getenv("CRON_SECRET")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")  # << inbound shared secret (set in Web service env)
+import re
+from typing import Optional, List, Any
+
+_URL_RE = re.compile(r"https?://[^\s)>\]]+", re.I)
+_IMG_EXTS = (".jpg", ".jpeg", ".png", ".gif", ".webp")
+_AUD_EXTS = (".mp3", ".m4a", ".wav", ".ogg")
+
+def _collect_urls_anywhere(obj: Any, bucket: List[str]) -> None:
+    """Recursively walk the inbound payload collecting any http(s) URLs."""
+    try:
+        if isinstance(obj, dict):
+            for v in obj.values():
+                _collect_urls_anywhere(v, bucket)
+        elif isinstance(obj, list):
+            for v in obj:
+                _collect_urls_anywhere(v, bucket)
+        elif isinstance(obj, str):
+            for m in _URL_RE.findall(obj):
+                if m.startswith("http"):
+                    bucket.append(m.strip())
+    except Exception:
+        pass
+
+def _extract_media_urls(body: dict) -> List[str]:
+    """Try well-known locations first; fall back to recursive scan of payload."""
+    urls: List[str] = []
+
+    # Known GHL shapes
+    top = body.get("attachments")
+    if isinstance(top, list):
+        for a in top:
+            u = (a.get("url") or a.get("file_url") or a.get("link") or a.get("source") or "").strip()
+            if u.startswith("http"):
+                urls.append(u)
+
+    msg = body.get("message")
+    if isinstance(msg, dict) and isinstance(msg.get("attachments"), list):
+        for a in msg["attachments"]:
+            u = (a.get("url") or a.get("file_url") or a.get("link") or a.get("source") or "").strip()
+            if u.startswith("http"):
+                urls.append(u)
+
+    # If still empty, deep scan entire payload
+    if not urls:
+        _collect_urls_anywhere(body, urls)
+
+    # Dedup while preserving order
+    seen = set()
+    out = []
+    for u in urls:
+        if u not in seen:
+            seen.add(u)
+            out.append(u)
+    return out
 
 # Explicitly set docs & openapi so /docs exists
 app = FastAPI(
@@ -187,7 +241,7 @@ async def incoming_message_any(req: Request, background_tasks: BackgroundTasks):
     text_val = str(text_val or "")
 
     # --- extract attachments/media urls from common GHL shapes ---
-    media_urls: list[str] = []
+    media_urls: List[str] = _extract_media_urls(body)
 
     # 1) top-level "attachments" (some GHL integrations)
     top_attachments = body.get("attachments")
@@ -204,20 +258,28 @@ async def incoming_message_any(req: Request, background_tasks: BackgroundTasks):
             u = (a.get("url") or a.get("file_url") or a.get("link") or a.get("source") or "").strip()
             if u.startswith("http"):
                 media_urls.append(u)
-
+    if not (text_val and text_val.strip()):
+        logger.info("[API][Webhook] Empty text. media_urls={} keys(body)={} keys(message)={}",
+                media_urls,
+                list(body.keys()) if isinstance(body, dict) else type(body),
+                list(body.get('message', {}).keys()) if isinstance(body.get('message'), dict) else type(body.get('message')))
     # Do not reject if text is empty but we have media
     if not (text_val and text_val.strip()) and not media_urls:
         logger.warning("⚠️ [API][Webhook] Missing required fields. phone={} text=''", user_phone)
         return {"ok": True}
 
     # Hand off directly (synchronous) so jobs always enqueue
+    # Hand off directly (synchronous) so jobs always enqueue
     try:
+        logger.info("[API] Handing off to process_incoming: msg_id={} phone={} text_len={} media_cnt={}",
+                    message_id, user_phone, len(text_val or ""), len(media_urls or []))
         process_incoming(message_id, user_phone, text_val, body, media_urls)
     except Exception as e:
         logger.exception("[API] process_incoming failed: {}", e)
 
     logger.info("[API][Webhook] ✅ Final ACK sent to GHL")
     return {"ok": True}
+
 
 
 from typing import Optional, List
