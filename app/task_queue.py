@@ -4,7 +4,7 @@ from __future__ import annotations
 import os
 import hashlib
 from urllib.parse import urlparse
-from typing import Optional
+from typing import Optional, List
 
 from loguru import logger
 from rq import Queue
@@ -56,30 +56,34 @@ def _should_skip_enqueue(key: str) -> bool:
         return False
 
 # ---------- Public API ----------
-def enqueue_generate_reply(convo_id: int, user_id: int, text_val: str, *, user_phone: str | None = None):
+def enqueue_generate_reply(
+    user_id: int,
+    convo_id: int,
+    text_val: str,
+    user_phone: Optional[str] = None,
+    media_urls: Optional[List[str]] = None,
+):
     """
-    Enqueue the reply job. We pass user_phone so workers can apply
-    usage gates and per-tier reply-length ceilings correctly.
+    Enqueue the reply job. We pass user_phone and media_urls so workers
+    can apply usage gates and handle media (images/audio) correctly.
     """
     # De-dupe guard for rapid duplicate webhooks/retries
     key = _enqueue_key(convo_id, user_id, text_val, user_phone)
     if _should_skip_enqueue(key):
         logger.warning("[Queue] duplicate suppressed convo_id={} user_id={}", convo_id, user_id)
-        # Return a stub with an id so caller logs don't break
+        # Return a stub with an id so caller logs don’t break
         return type("JobStub", (), {"id": f"dedup-{key[-8:]}"})()
 
-    logger.info("[Queue] enqueue_generate_reply phone={} chars={}", (user_phone or "")[-4:], len(text_val or ""))
-
-    return q.enqueue(
+    job = q.enqueue(
         workers.generate_reply_job,
-        args=(convo_id, user_id, text_val),
-        kwargs={"user_phone": user_phone},  # keep passing phone
-        job_timeout=JOB_TIMEOUT_SEC,
-        result_ttl=RESULT_TTL_SEC,
-        ttl=RESULT_TTL_SEC + 60,
-        failure_ttl=RESULT_TTL_SEC,
-        description=f"reply:{convo_id}:{user_id}",
+        convo_id,
+        user_id,
+        text_val,
+        user_phone=user_phone,
+        media_urls=media_urls,
     )
+    return job
+
 
 # Optional: keep your affiliate link wrapper as-is
 def enqueue_wrap_link(convo_id: int, raw_url: str, campaign: str = "default"):

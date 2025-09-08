@@ -6,6 +6,8 @@ from urllib.parse import urlparse, quote_plus
 
 from loguru import logger
 from app.amazon_api import search_amazon_products
+import os
+RF_ENABLED = (os.getenv("RAINFOREST_ENABLED") or "1").lower() in ("1", "true", "yes")
 
 AMAZON_TAG = "schizobestie-20"
 
@@ -137,6 +139,9 @@ def build_product_candidates(intent: Optional[Dict]) -> List[Dict]:
     # PATCH: if the query is low-signal, skip shopping entirely → let Bestie chat
     if _is_low_signal(query):
         logger.info("[ProductSearch] Low-signal query '{}'; returning []", query)
+        return []
+    if not RF_ENABLED:
+        logger.info("[ProductSearch] RF disabled by env; returning [] for '{}'", query)
         return []
 
     try:
