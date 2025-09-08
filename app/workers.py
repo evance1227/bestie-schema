@@ -77,6 +77,15 @@ GENIUSLINK_WRAP   = (os.getenv("GENIUSLINK_WRAP") or "").strip()  # e.g. https:/
 GL_REWRITE        = os.getenv("GL_REWRITE", "1").lower() not in ("0", "false", "")
 _AMZN_RE          = re.compile(r"https?://(?:www\.)?amazon\.[^\s)\]]+", re.I)
 
+_AMZ_SEARCH_RE = re.compile(r"https?://(?:www\.)?amazon\.[^/\s]+/s\?[^)\s]+", re.I)
+
+def _strip_amazon_search_links(text: str) -> str:
+    """Remove Amazon search URLs; we only allow direct DP links (handled upstream) or non-Amazon tutorials."""
+    try:
+        return _AMZ_SEARCH_RE.sub("", text or "")
+    except Exception:
+        return text
+
 # Opening/tone guards
 OPENING_BANNED = [
     "it sounds like", "i understand that", "you're not alone",
@@ -472,6 +481,7 @@ def _finalize_and_send(
 
     # === Link and tone hygiene ===
     try:
+        reply = _strip_amazon_search_links(reply)
         reply = _add_personality_if_flat(reply)
         reply = make_sms_reply(reply)          # canonical Amazon links + tag
         reply = ensure_not_link_ending(reply)  # avoid ending on a naked URL
@@ -568,8 +578,6 @@ def generate_reply_job(convo_id: int, user_id: int, text_val: str, user_phone: O
         logger.exception("[Gate] snapshot/build error: {}", e)
         _store_and_send(user_id, convo_id, "Babe, I glitched. Give me one sec to reboot my attitude. 💅")
         return
-
-
    
     # 1) First message onboarding
     with db.session() as s:

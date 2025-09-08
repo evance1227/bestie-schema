@@ -356,6 +356,18 @@ When product candidates are present:
     else:
         # Append guidance to composed persona
         messages[0]["content"] = f"{messages[0]['content']}\n\n{shopping_guidance}"
+        # --- Tutorial / how-to guard: avoid Amazon search links for technique questions ---
+    is_tutorial = any(
+        k in (user_text or "").lower()
+        for k in ["how to", "application", "apply", "tips", "tutorial", "best way to", "how best to"]
+    )
+    if (not product_candidates) and is_tutorial and messages and messages[0]["role"] == "system":
+        messages[0]["content"] = (
+            f"{messages[0]['content']}\n\n"
+            "When giving technique tips, do NOT include Amazon search links. "
+            "If you include a link, prefer a reputable brand how-to page or a YouTube tutorial. "
+            "If you're not sure, skip the link and keep the advice concise and practical."
+        )
 
     # 3) Call OpenAI (prefer app.integrations if present)
     text_out = ""

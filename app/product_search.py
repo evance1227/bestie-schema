@@ -2,32 +2,72 @@ from __future__ import annotations
 
 import re
 from typing import List, Dict, Optional, Tuple
-from urllib.parse import urlparse
+from urllib.parse import urlparse, quote_plus
 
 from loguru import logger
 from app.amazon_api import search_amazon_products
 
+AMAZON_TAG = "schizobestie-20"
+
+def _dp_link(asin: str) -> str:
+    """Build a clean Amazon DP link with affiliate tag."""
+    asin = (asin or "").strip().upper()
+    if not asin:
+        return ""
+    return f"https://www.amazon.com/dp/{asin}?tag={AMAZON_TAG}"
 
 def _normalize(items: List[Dict]) -> List[Dict]:
     """
     Normalize heterogeneous vendor rows into a single shape the rest of the app expects.
     Keys kept: title, name, url, review, merchant (+ meta passthrough).
+    Prefer clean DP links using ASIN; only fall back to Amazon search when no ASIN is available.
     """
     out: List[Dict] = []
     for it in items or []:
         title = (it.get("title") or it.get("name") or "").strip()
         if not title:
             continue
+
+        raw_url = (it.get("url") or it.get("link") or "").strip()
+        merchant = (it.get("merchant") or "amazon.com").strip()
+        meta = it.get("meta") or {}
+
+        # Try to find an ASIN in common places from different providers
+        asin = (
+            it.get("asin") or it.get("ASIN") or
+            (it.get("product") or {}).get("asin") or
+            meta.get("asin")
+        )
+        # If none, try to extract from any raw Amazon URL
+        if not asin and "amazon." in (raw_url or ""):
+            m = re.search(r"/dp/([A-Z0-9]{10})(?:[/?]|$)", raw_url, flags=re.I)
+            if m:
+                asin = m.group(1).upper()
+
+        # Determine final URL
+        if asin:
+            final_url = _dp_link(asin)
+        else:
+            # No ASIN — prefer the given URL if it's already amazon search/product; else build a clean search
+            if raw_url and "amazon." in raw_url:
+                final_url = raw_url
+                # append tag if missing
+                if "tag=" not in final_url:
+                    sep = "&" if "?" in final_url else "?"
+                    final_url = f"{final_url}{sep}tag={AMAZON_TAG}"
+            else:
+                q = quote_plus(title)
+                final_url = f"https://www.amazon.com/s?k={q}&tag={AMAZON_TAG}"
+
         out.append({
             "title": title,
             "name": (it.get("name") or title).strip(),
-            "url": (it.get("url") or "").strip(),  # Do NOT wrap upstream. Leave clean.
+            "url": final_url,             # now always a DP link (when ASIN exists) or clean search
             "review": (it.get("review") or "").strip(),
-            "merchant": (it.get("merchant") or "amazon.com").strip(),
-            "meta": it.get("meta") or {},
+            "merchant": merchant,
+            "meta": meta,
         })
     return out
-
 
 def _fallback_from_query(query: str, max_items: int = 3) -> List[Dict]:
     """
