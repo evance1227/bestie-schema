@@ -336,12 +336,19 @@ def generate_reply(
     # 2) Model instruction for Good/Better/Best + budget alt if luxury
     shopping_guidance = """
 When product candidates are present:
-- Return 1-3 options total.
-- Prefer a simple Good / Better / Best ordering.
-- If any pick is luxury, include a short "Budget alt:" line for that item.
-- For each item, include a crisp one-liner benefit (use PRODUCT ONE-LINERS vibe).
+- Start with 1–2 friendly sentences reacting to the user's message (no lists yet).
+- Return 1–3 options total, each with a crisp one-liner benefit (use PRODUCT ONE-LINERS vibe).
+- Prefer a simple Good / Better / Best ordering when user wants a list.
+- If the user asks “which one”, “only buy one”, “best”, or mentions a budget constraint,
+  pick EXACTLY ONE and justify why in 1–2 lines (do not repeat the full list).
 - Keep the whole reply ~450 characters. No disclaimers. Do not alter provided URLs.
 """.strip()
+    force_choice = any(
+        k in (user_text or "").lower()
+        for k in ["which one", "only buy one", "only afford", "best one", "pick one"]
+    )
+    if force_choice and messages and messages[0]["role"] == "system":
+        messages[0]["content"] = f"{messages[0]['content']}\n\nUser may only buy one: pick exactly one and explain why in 1–2 lines."
 
     # Replace system content if workers passed an explicit system_prompt
     if system_prompt and messages and messages[0]["role"] == "system":

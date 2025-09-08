@@ -20,7 +20,8 @@ AMAZON_TAG = (
 GENIUSLINK_WRAP = (os.getenv("GENIUSLINK_WRAP") or "").strip()
 # Option B: domain style, e.g. geni.us   (we'll use https://{domain}/{ASIN})
 GENIUSLINK_DOMAIN = (os.getenv("GENIUSLINK_DOMAIN") or "").strip()
-GL_REWRITE = (os.getenv("GL_REWRITE") or "1").lower() not in ("0", "false", "")
+# current (defaults ON) -> change to default OFF
+GL_REWRITE = (os.getenv("GL_REWRITE") or "0").lower() in ("1", "true", "yes")
 GL_ALLOW_REDIRECT_TEMPLATE = (os.getenv("GL_ALLOW_REDIRECT_TEMPLATE") or "0").lower() in ("1","true","yes")
 
 # NEW: make unwrapping and canonicalizing explicit toggles
@@ -145,6 +146,10 @@ def _wrap_with_geniuslink(url: str) -> str:
     If neither is set, return url unchanged.
     """
     if not GL_REWRITE:
+        if "amazon." in url:
+            if "tag=" not in url:
+                sep = "&" if "?" in url else "?"
+            return f"{url}{sep}tag=schizobestie-20"
         return url
 
     try:

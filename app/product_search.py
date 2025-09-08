@@ -43,7 +43,41 @@ def _fallback_from_query(query: str, max_items: int = 3) -> List[Dict]:
         seeds = [q]
     # Keep tidy names
     seeds = [s[:80] for s in seeds]
-    return [{"title": s, "name": s, "url": "", "review": "", "merchant": "amazon.com"} for s in seeds[:max_items]]
+    return [{
+    "title": s,
+    "name": s,
+    "url": f"https://www.amazon.com/s?k={s.replace(' ', '+')}&tag=schizobestie-20",
+    "review": "",
+    "merchant": "amazon.com"
+} for s in seeds[:max_items]]
+
+# -------------------- PATCH: small guards only -------------------- #
+_LOW_SIGNAL_FILLERS = {"hi", "hey", "hello", "help", "blah", "ok", "okay", "yo", "hey there"}
+
+def _is_low_signal(q: str) -> bool:
+    """
+    Returns True when query is too weak to safely drive shopping.
+    - less than 3 alnum chars after cleaning
+    - or filler words only
+    """
+    if not q:
+        return True
+    clean = re.sub(r"[^A-Za-z0-9 ]+", "", q).strip().lower()
+    if not clean:
+        return True
+    if clean in _LOW_SIGNAL_FILLERS:
+        return True
+    # fewer than 3 alphanumeric characters (e.g., "y", "go", "idk")
+    alnum = re.sub(r"[^A-Za-z0-9]", "", clean)
+    return len(alnum) < 3
+
+def _looks_itemized(q: str) -> bool:
+    """
+    True if user listed multiple items (comma, slash, 'and', 'or'):
+    only then do we use name-only fallback to keep some utility.
+    """
+    return bool(re.search(r"(,|/| and | or )", q))
+# ----------------------------------------------------------------- #
 
 
 def build_product_candidates(intent: Optional[Dict]) -> List[Dict]:
@@ -59,8 +93,10 @@ def build_product_candidates(intent: Optional[Dict]) -> List[Dict]:
 
     query = (intent.get("query") or "").strip()
     constraints = intent.get("constraints") or {}
-    if not query:
-        logger.info("[ProductSearch] Missing query in intent; returning []")
+
+    # PATCH: if the query is low-signal, skip shopping entirely → let Bestie chat
+    if _is_low_signal(query):
+        logger.info("[ProductSearch] Low-signal query '{}'; returning []", query)
         return []
 
     try:
@@ -71,12 +107,21 @@ def build_product_candidates(intent: Optional[Dict]) -> List[Dict]:
             logger.info("[ProductSearch] {} candidates from Amazon for '{}'", len(norm), query)
             return norm
 
-        # Fallback: name-only candidates so the worker can inject safe Amazon search links.
-        fallback = _fallback_from_query(query, max_items=int(constraints.get("count") or 3))
-        logger.info("[ProductSearch] Amazon empty; using {} fallback seed(s) for '{}'", len(fallback), query)
-        return fallback
+        # PATCH: only use fallback when the query looks itemized (A, B or C).
+        if _looks_itemized(query):
+            fallback = _fallback_from_query(query, max_items=int(constraints.get("count") or 3))
+            logger.info("[ProductSearch] Amazon empty; using {} fallback seed(s) for '{}'", len(fallback), query)
+            return fallback
+
+        logger.info("[ProductSearch] Amazon empty; returning [] for non-itemized query '{}'", query)
+        return []
 
     except Exception as e:
+        # PATCH: on API errors (e.g., 500 / 402), avoid junk fallbacks for non-itemized single-word junk.
+        msg = str(e)
+        if any(code in msg for code in ("402", "500", "503", "Client Error", "Server Error")) and not _looks_itemized(query):
+            logger.warning("[ProductSearch] RF/HTTP error for '{}'; no fallback due to non-itemized query. Err={}", query, msg)
+            return []
         logger.exception("[ProductSearch] Error building candidates: {}", e)
         return _fallback_from_query(query, max_items=int((intent.get("constraints") or {}).get("count") or 3))
 
