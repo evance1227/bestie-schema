@@ -545,7 +545,7 @@ def generate_reply_job(convo_id: int, user_id: int, text_val: str, user_phone: O
     user_text = str(text_val or "")
     normalized_text = user_text.lower().strip()
 
-    # 0) Gate
+        # 0) Gate
     try:
         gate_snapshot = _ensure_profile_defaults(user_id)
         logger.info("[Gate] user_id={} -> {}", user_id, gate_snapshot)
@@ -556,19 +556,18 @@ def generate_reply_job(convo_id: int, user_id: int, text_val: str, user_phone: O
 
         if not dev_bypass:
             if not gate_snapshot.get("allowed", False):
-                reason = gate_snapshot.get("reason", "pending")
-                if reason in ("pending", "canceled"):
-                    _store_and_send(user_id, convo_id, _wall_start_message(user_id))
-                    return
-                if reason == "expired":
-                    _store_and_send(user_id, convo_id, _wall_trial_expired_message())
-                    return
+                _store_and_send(
+                    user_id,
+                    convo_id,
+                    "Before we chat, start your access so I can remember everything and tailor recs to you. Tap here and you’ll go straight to your quiz after signup:\nhttps://schizobestie.gumroad.com/l/gexqp\nNo refunds. Cancel anytime. 💅"
+                )
+                return
 
     except Exception as e:
         logger.exception("[Gate] snapshot/build error: {}", e)
         _store_and_send(user_id, convo_id, "Babe, I glitched. Give me one sec to reboot my attitude. 💅")
         return
-
+   
     # 1) First message onboarding
     with db.session() as s:
         first_msg_count = s.execute(
