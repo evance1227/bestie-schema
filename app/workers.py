@@ -27,6 +27,7 @@ import hashlib
 import random
 import time
 import requests
+from typing import Optional, List
 from typing import Optional, List, Dict, Tuple
 from datetime import datetime, timezone, timedelta
 from urllib.parse import quote_plus
@@ -83,6 +84,17 @@ def _strip_amazon_search_links(text: str) -> str:
     """Remove Amazon search URLs; we only allow direct DP links (handled upstream) or non-Amazon tutorials."""
     try:
         return _AMZ_SEARCH_RE.sub("", text or "")
+    except Exception:
+        return text
+# Strip bracketed link placeholders like: [link for ideas: ...]
+_LINK_PLACEHOLDER_RE = re.compile(r"\[(?:link|links)[^\]]*\]", re.I)
+_URL_WORD_RE = re.compile(r"\bURL\b[: ]?", re.I)
+
+def _strip_link_placeholders(text: str) -> str:
+    try:
+        t = _LINK_PLACEHOLDER_RE.sub("", text or "")
+        t = _URL_WORD_RE.sub("", t)
+        return t
     except Exception:
         return text
 
@@ -481,6 +493,7 @@ def _finalize_and_send(
 
     # === Link and tone hygiene ===
     try:
+        reply = _strip_link_placeholders(reply)
         reply = _strip_amazon_search_links(reply)
         reply = _add_personality_if_flat(reply)
         reply = make_sms_reply(reply)          # canonical Amazon links + tag
@@ -538,7 +551,13 @@ def _fix_cringe_opening(reply: str) -> str:
 # ---------------------------------------------------------------------- #
 # Main worker entrypoint
 # ---------------------------------------------------------------------- #
-def generate_reply_job(convo_id: int, user_id: int, text_val: str, user_phone: Optional[str] = None) -> None:
+def generate_reply_job(
+    convo_id: int,
+    user_id: int,
+    text_val: str,
+    user_phone: Optional[str] = None,
+    media_urls: Optional[List[str]] = None,
+) -> None:
     """
     Routing:
       0) Plan gate
@@ -595,6 +614,37 @@ def generate_reply_job(convo_id: int, user_id: int, text_val: str, user_phone: O
         ])
         _store_and_send(user_id, convo_id, onboarding_reply)
         return
+        # 2) Media routing
+
+    # --- attachments passed from webhook (preferred) ---
+    if media_urls:
+        first = (media_urls[0] or "").strip()
+        lower = first.lower()
+        try:
+            if any(lower.endswith(ext) for ext in [".jpg", ".jpeg", ".png", ".gif", ".webp"]):
+                logger.info("[Worker][Media] Attachment image detected: {}", first)
+                reply = ai.describe_image(first)
+                _finalize_and_send(user_id, convo_id, reply, add_cta=False)
+                return
+            if any(lower.endswith(ext) for ext in [".mp3", ".m4a", ".wav", ".ogg"]):
+                logger.info("[Worker][Media] Attachment audio detected: {}", first)
+                reply = ai.transcribe_and_respond(first, user_id=user_id)
+                _finalize_and_send(user_id, convo_id, reply, add_cta=False)
+                return
+            # Extensionless: try image, then audio
+            logger.info("[Worker][Media] Attachment extless; trying image describe: {}", first)
+            try:
+                reply = ai.describe_image(first)
+                _finalize_and_send(user_id, convo_id, reply, add_cta=False)
+                return
+            except Exception:
+                logger.info("[Worker][Media] describe_image failed; trying audio transcribe: {}", first)
+                reply = ai.transcribe_and_respond(first, user_id=user_id)
+                _finalize_and_send(user_id, convo_id, reply, add_cta=False)
+                return
+        except Exception as e:
+            logger.warning("[Worker][Media] Attachment handling failed: {}", e)
+            # fall through to your existing text-based routing below
 
     # 2) Media routing
     if "http" in user_text:

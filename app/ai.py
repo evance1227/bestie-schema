@@ -341,6 +341,7 @@ When product candidates are present:
 - Prefer a simple Good / Better / Best ordering when user wants a list.
 - If the user asks “which one”, “only buy one”, “best”, or mentions a budget constraint,
   pick EXACTLY ONE and justify why in 1–2 lines (do not repeat the full list).
+-- Do NOT write the literal word "URL". Use links only if they are provided; otherwise omit.
 - Keep the whole reply ~450 characters. No disclaimers. Do not alter provided URLs.
 """.strip()
     force_choice = any(
@@ -368,6 +369,29 @@ When product candidates are present:
             "If you include a link, prefer a reputable brand how-to page or a YouTube tutorial. "
             "If you're not sure, skip the link and keep the advice concise and practical."
         )
+    # --- Style booster for non-product replies: keep it warm, witty, short ---
+    is_tutorial = any(
+        k in (user_text or "").lower()
+        for k in ["how to", "application", "apply", "tips", "tutorial", "best way to", "how best to"]
+    )
+    has_products = bool(product_candidates)
+
+    if (not has_products) and messages and messages[0]["role"] == "system":
+        messages[0]["content"] = (
+            f"{messages[0]['content']}\n\n"
+            "Style for chat:\n"
+            "- Warm, witty, one playful quip or emoji max.\n"
+            "- 1–3 short lines, no therapy clichés.\n"
+            "- Offer a tiny next step or a question back."
+        )
+
+    # If user asks 'which one' or budget-limited, force a single pick with justification
+    force_choice = any(
+        k in (user_text or "").lower()
+        for k in ["which one", "only buy one", "only afford", "best one", "pick one"]
+    )
+    if force_choice and messages and messages[0]["role"] == "system":
+        messages[0]["content"] = f"{messages[0]['content']}\n\nUser may only buy one: pick exactly one and explain why in 1–2 lines."
 
     # 3) Call OpenAI (prefer app.integrations if present)
     text_out = ""
