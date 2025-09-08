@@ -36,6 +36,25 @@ LC_URL = os.getenv(
 SMS_DEDUPE_TTL_SEC = int(os.getenv("SMS_DEDUPE_TTL_SEC", "20"))
 
 __all__ = ["send_sms", "send_sms_reply"]
+def openai_complete(messages: list, user_id: Optional[int] = None, context: Optional[Dict] = None) -> str:
+    """
+    Centralized OpenAI chat call used by ai.generate_reply().
+    Minimal dependencies; returns text or raises for caller to handle.
+    """
+    from openai import OpenAI  # local import so worker boot never fails if lib missing in other jobs
+    api_key = os.getenv("OPENAI_API_KEY", "")
+    model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+    if not api_key:
+        raise RuntimeError("OPENAI_API_KEY not set")
+
+    client = OpenAI(api_key=api_key)
+    resp = client.chat.completions.create(
+        model=model,
+        messages=messages,
+        temperature=0.9,
+        max_tokens=360,
+    )
+    return (resp.choices[0].message.content or "").strip()
 
 # ---------- helpers ----------
 
