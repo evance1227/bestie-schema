@@ -31,6 +31,7 @@ SYL_WRAP_TEMPLATE = (os.getenv("SYL_WRAP_TEMPLATE") or "").strip()
 SYL_PUBLISHER_ID = (os.getenv("SYL_PUBLISHER_ID") or "").strip()
 SYL_API_KEY = (os.getenv("SYL_API_KEY") or "").strip()
 _SYL_RETAILERS = tuple([d.strip().lower() for d in (os.getenv("SYL_RETAILERS") or "").split(",") if d.strip()])
+_SYL_DENY = tuple([d.strip().lower() for d in (os.getenv("SYL_DENYLIST") or "").split(",") if d.strip()])
 
 # -------------------- Regex ------------------ #
 _URL = re.compile(r"https?://[^\s)\]]+", re.I)
@@ -53,8 +54,25 @@ def wrap_shopurl(url: str) -> str:
     # TODO: you’ll pull your ShopYourLikes retailer ID/handle
     return f"{SHOPYOURLIKES_PREFIX}?url={url}"
 
+# add below other SYL env reads
+_SYL_DENY = tuple([d.strip().lower() for d in (os.getenv("SYL_DENYLIST") or "").split(",") if d.strip()])
+
 def _is_syl_retailer(host: str) -> bool:
+    """
+    True if host should be wrapped by ShopYourLikes.
+    - If SYL_RETAILERS="*", wrap all non-Amazon/non-denylisted hosts.
+    - Else wrap if host endswith any domain in SYL_RETAILERS.
+    """
     host = (host or "").lower()
+    # never wrap denylisted or Amazon/Genius
+    if any(host.endswith(d) for d in _SYL_DENY) or "amazon." in host or _GENIUS_HOST.search(host):
+        return False
+
+    # wrap-all mode
+    if "*" in _SYL_RETAILERS:
+        return True
+
+    # whitelist mode
     return any(host.endswith(dom) for dom in _SYL_RETAILERS)
 
 def _wrap_with_shopyourlikes(url: str) -> str:
