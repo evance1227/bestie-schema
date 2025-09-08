@@ -263,29 +263,10 @@ async def incoming_message_any(req: Request, background_tasks: BackgroundTasks):
                 media_urls,
                 list(body.keys()) if isinstance(body, dict) else type(body),
                 list(body.get('message', {}).keys()) if isinstance(body.get('message'), dict) else type(body.get('message')))
-    # Do not reject if text is empty but we have media
-    if not (text_val and text_val.strip()) and not media_urls:
-        logger.warning("⚠️ [API][Webhook] Missing required fields. phone={} text=''", user_phone)
-        return {"ok": True}
-
-    # Hand off directly (synchronous) so jobs always enqueue
-    # Hand off directly (synchronous) so jobs always enqueue
-    try:
-        logger.info("[API] Handing off to process_incoming: msg_id={} phone={} text_len={} media_cnt={}",
-                    message_id, user_phone, len(text_val or ""), len(media_urls or []))
-        process_incoming(message_id, user_phone, text_val, body, media_urls)
-    except Exception as e:
-        logger.exception("[API] process_incoming failed: {}", e)
 
     logger.info("[API][Webhook] ✅ Final ACK sent to GHL")
     return {"ok": True}
 
-
-
-from typing import Optional, List
-def process_incoming(message_id: str, user_phone: str, text_val: str, raw_body: dict, media_urls: Optional[List[str]] = None):
-
-     return {"ok": True, "message_id": locals().get("message_id", "fallback")}
 # -------------------- Secure re-engagement for Cron -------------------- #
 @app.post("/jobs/reengage")
 def jobs_reengage(request: Request):
