@@ -10,23 +10,27 @@ from urllib.parse import (
 from loguru import logger
 
 # -------------------- Env -------------------- #
+# -------------------- Env -------------------- #
 AMAZON_TAG = (
     os.getenv("AMAZON_ASSOCIATE_TAG")
     or os.getenv("AMAZON_ASSOC_TAG")
     or ""
 ).strip()
 
-# Option A: full redirect template, e.g. https://geni.us/redirect?url={url}
 GENIUSLINK_WRAP = (os.getenv("GENIUSLINK_WRAP") or "").strip()
-# Option B: domain style, e.g. geni.us   (we'll use https://{domain}/{ASIN})
 GENIUSLINK_DOMAIN = (os.getenv("GENIUSLINK_DOMAIN") or "").strip()
-# current (defaults ON) -> change to default OFF
 GL_REWRITE = (os.getenv("GL_REWRITE") or "0").lower() in ("1", "true", "yes")
 GL_ALLOW_REDIRECT_TEMPLATE = (os.getenv("GL_ALLOW_REDIRECT_TEMPLATE") or "0").lower() in ("1","true","yes")
 
-# NEW: make unwrapping and canonicalizing explicit toggles
 GL_UNWRAP_REDIRECTS = (os.getenv("GL_UNWRAP_REDIRECTS") or "1").lower() not in ("0", "false", "")
 AMAZON_CANONICALIZE = (os.getenv("AMAZON_CANONICALIZE") or "1").lower() not in ("0", "false", "")
+
+# ShopYourLikes
+SYL_ENABLED = (os.getenv("SYL_ENABLED") or "0").lower() in ("1","true","yes")
+SYL_WRAP_TEMPLATE = (os.getenv("SYL_WRAP_TEMPLATE") or "").strip()
+SYL_PUBLISHER_ID = (os.getenv("SYL_PUBLISHER_ID") or "").strip()
+SYL_API_KEY = (os.getenv("SYL_API_KEY") or "").strip()
+_SYL_RETAILERS = tuple([d.strip().lower() for d in (os.getenv("SYL_RETAILERS") or "").split(",") if d.strip()])
 
 # -------------------- Regex ------------------ #
 _URL = re.compile(r"https?://[^\s)\]]+", re.I)
@@ -41,6 +45,26 @@ _ASIN_RE = re.compile(
 )
 
 _AMAZON_SHORTNERS = {"a.co", "amzn.to"}
+SHOPYOURLIKES_PREFIX = "https://shop-links.co/"
+
+def wrap_shopurl(url: str) -> str:
+    if not url:
+        return url
+    # TODO: you’ll pull your ShopYourLikes retailer ID/handle
+    return f"{SHOPYOURLIKES_PREFIX}?url={url}"
+
+def _is_syl_retailer(host: str) -> bool:
+    host = (host or "").lower()
+    return any(host.endswith(dom) for dom in _SYL_RETAILERS)
+
+def _wrap_with_shopyourlikes(url: str) -> str:
+    """Return ShopYourLikes redirect if enabled and template is configured, else original url."""
+    if not (SYL_ENABLED and SYL_WRAP_TEMPLATE and url):
+        return url
+    try:
+        return SYL_WRAP_TEMPLATE.format(url=quote_plus(url))
+    except Exception:
+        return url
 
 # -------------------- Helpers ---------------- #
 def _strip_trailing_punct(url: str) -> tuple[str, str]:
@@ -140,31 +164,27 @@ def _canonicalize_amazon(url: str, tag: str) -> str:
 
 def _wrap_with_geniuslink(url: str) -> str:
     """
-    Wrap Amazon URLs for Geniuslink in one of two ways:
-      - GENIUSLINK_WRAP template -> {url} gets percent-encoded original
-      - GENIUSLINK_DOMAIN + ASIN -> https://{domain}/{ASIN}
-    If neither is set, return url unchanged.
+    Wrap Amazon URLs for Geniuslink when GL_REWRITE is enabled; otherwise just ensure tag.
     """
     if not GL_REWRITE:
-        if "amazon." in url:
-            if "tag=" not in url:
-                sep = "&" if "?" in url else "?"
-            return f"{url}{sep}tag=schizobestie-20"
-        return url
+        # When GL is off, just guarantee the Amazon tag is present
+        return _ensure_amazon_tag(url, AMAZON_TAG) if _is_amazon(url) else url
 
     try:
         u = urlparse(url)
         host = u.netloc.lower()
 
+        # Already a geni.us link or not amazon → leave it
         if _GENIUS_HOST.search(host):
             return url
-
         if "amazon." not in host or host in _AMAZON_SHORTNERS:
             return url
 
+        # Option A: redirect template
         if GENIUSLINK_WRAP and GL_ALLOW_REDIRECT_TEMPLATE:
             return GENIUSLINK_WRAP.format(url=quote_plus(url))
 
+        # Option B: domain + ASIN path
         if GENIUSLINK_DOMAIN:
             asin = _asin_from_url(url)
             if asin:
@@ -174,6 +194,7 @@ def _wrap_with_geniuslink(url: str) -> str:
         logger.debug("[Linkwrap] geniuslink wrap failed: {}", e)
 
     return url
+
 
 # -------------------- Public API ---------------- #
 def convert_to_geniuslink(url: str) -> str:
@@ -193,6 +214,13 @@ def convert_to_geniuslink(url: str) -> str:
         pass
 
     clean = _strip_utm(clean)
+    # Non-Amazon path: ShopYourLikes for supported retailers
+    try:
+        u = urlparse(clean)
+        if _is_syl_retailer(u.netloc):
+            return _wrap_with_shopyourlikes(clean)
+    except Exception:
+        pass
 
     # Amazon path: canonicalize or tag, then optional wrap
     if _is_amazon(clean):
@@ -200,8 +228,6 @@ def convert_to_geniuslink(url: str) -> str:
             clean = _canonicalize_amazon(clean, AMAZON_TAG)
         if GL_REWRITE:
             clean = _wrap_with_geniuslink(clean)
-
-
     return clean + trail
 
 # Back-compat alias used elsewhere
