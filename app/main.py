@@ -210,10 +210,15 @@ async def incoming_message_any(req: Request, background_tasks: BackgroundTasks):
         logger.warning("⚠️ [API][Webhook] Missing required fields. phone={} text=''", user_phone)
         return {"ok": True}
 
-    # Hand off to background task
-    background_tasks.add_task(process_incoming, message_id, user_phone, text_val, body, media_urls)
+    # Hand off directly (synchronous) so jobs always enqueue
+    try:
+        process_incoming(message_id, user_phone, text_val, body, media_urls)
+    except Exception as e:
+        logger.exception("[API] process_incoming failed: {}", e)
+
     logger.info("[API][Webhook] ✅ Final ACK sent to GHL")
-    return {"ok": True}   
+    return {"ok": True}
+
 
 from typing import Optional, List
 def process_incoming(message_id: str, user_phone: str, text_val: str, raw_body: dict, media_urls: Optional[List[str]] = None):
