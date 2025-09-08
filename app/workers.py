@@ -554,19 +554,22 @@ def generate_reply_job(convo_id: int, user_id: int, text_val: str, user_phone: O
         nb = _norm_phone(DEV_BYPASS_PHONE)
         dev_bypass = bool(np and nb and np == nb)
 
-        if not dev_bypass:
-            if not gate_snapshot.get("allowed", False):
-                _store_and_send(
-                    user_id,
-                    convo_id,
-                    "Before we chat, start your access so I can remember everything and tailor recs to you. Tap here and you’ll go straight to your quiz after signup:\nhttps://schizobestie.gumroad.com/l/gexqp\nNo refunds. Cancel anytime. 💅"
-                )
-                return
+        allowed = gate_snapshot.get("allowed", False)
+        reason = gate_snapshot.get("reason", "pending")
 
+        if not dev_bypass and not allowed:
+            logger.info("[Gate] Access blocked: reason={}", reason)
+            _store_and_send(
+                user_id,
+                convo_id,
+                "Before we chat, start your access so I can remember everything and tailor recs to you. Tap here and you’ll go straight to your quiz after signup:\nhttps://schizobestie.gumroad.com/l/gexqp\nNo refunds. Cancel anytime. 💅"
+            )
+            return
     except Exception as e:
         logger.exception("[Gate] snapshot/build error: {}", e)
         _store_and_send(user_id, convo_id, "Babe, I glitched. Give me one sec to reboot my attitude. 💅")
         return
+
    
     # 1) First message onboarding
     with db.session() as s:
