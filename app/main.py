@@ -1,5 +1,6 @@
 # app/main.py
 from dotenv import load_dotenv
+from fastapi.params import Body
 load_dotenv()
 
 import os, time, re
@@ -163,9 +164,6 @@ from . import models
 from .task_queue import enqueue_generate_reply
 from .workers import send_reengagement_job
 
-# -------------------- Core processing -------------------- #
-from typing import Optional, List
-
 def process_incoming(message_id: str, user_phone: str, text_val: str, raw_body: dict, media_urls: Optional[List[str]] = None):
     """Run DB insert + enqueue safely in background after GHL gets 200."""
     try:
@@ -186,6 +184,17 @@ def process_incoming(message_id: str, user_phone: str, text_val: str, raw_body: 
 
     except Exception as e:
         logger.exception("💥 [API][Process] Exception in background process: {}", e)
+    # -------------- Core processing -------------- #
+    # Hand off directly (synchronous) so jobs always enqueue
+    try:
+        logger.info("[API] Handing off to process_incoming: msg_id={} phone={} text_len={} media_cnt={}",
+                    message_id, user_phone, len(text_val or ""), len(media_urls or []))
+        process_incoming(message_id, user_phone, text_val, Body, media_urls)
+    except Exception as e:
+        logger.exception("[API] process_incoming failed: {}", e)
+
+    logger.info("[API][Webhook] ✅ Final ACK sent to GHL")
+    return {"ok": True}
 
 # -------------------- Inbound webhook -------------------- #
 @app.post("/webhook/incoming_message")

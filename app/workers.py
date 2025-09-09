@@ -573,6 +573,8 @@ def generate_reply_job(
 
     user_text = str(text_val or "")
     normalized_text = user_text.lower().strip()
+    logger.info("[Worker][Start] Job: convo_id=%s user_id=%s text_len=%d media_cnt=%d",
+                convo_id, user_id, len(text_val or ""), len(media_urls or []))
 
         # 0) Gate
     try:
