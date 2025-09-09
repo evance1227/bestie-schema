@@ -30,6 +30,7 @@ from loguru import logger
 from openai import OpenAI
 from sqlalchemy import text as sqltext
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
+from app.bestie_oneliners import render_oneliner_with_link
 
 from app import db, linkwrap
 from app.personas.bestie_altare import BESTIE_SYSTEM_PROMPT

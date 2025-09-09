@@ -4,6 +4,7 @@ from __future__ import annotations
 from typing import Dict, Optional, List, Tuple
 import re
 from loguru import logger
+from app.bestie_oneliners import render_oneliner_with_link
 
 __all__ = ["extract_product_intent", "CATEGORY_KEYWORDS"]
 
@@ -399,7 +400,6 @@ def extract_product_intent(user_text: str) -> Dict:
                 "category": _category_guess(low),
                 "constraints": constraints,
             }
-
 
     # generic shopping phrasing
     if any(g in low for g in ["recommend", "recommendation", "suggest", "which", "buy", "find", "product", "looking for", "need", "link", "send me"]):
