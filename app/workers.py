@@ -32,6 +32,8 @@ from typing import Optional, List, Dict, Tuple
 from datetime import datetime, timezone, timedelta
 from urllib.parse import quote_plus
 from app.linkwrap import make_sms_reply, ensure_not_link_ending
+from app.bestie_oneliners import render_oneliner_with_link
+
 # ----------------------------- Third party ----------------------------- #
 import redis
 from loguru import logger
@@ -691,6 +693,19 @@ def generate_reply_job(
         logger.warning("[Intent] Extractor failed: {}", e)
         intent_data = {}
     logger.info("[Intent] intent_data: {}", intent_data)
+    # --- Catch-all: infer product intent from keywords when extractor returns {} ---
+    if not intent_data:
+        shopping_keywords = {
+            "boots", "dress", "mascara", "sunscreen", "serum", "moisturizer",
+            "self tanner", "cowgirl boots", "western boots", "jeans", "sneakers",
+        }
+        if any(k in normalized_text for k in shopping_keywords):
+            intent_data = {
+                "intent": "find_products",
+                "query": user_text.strip(),          # preserve user words (brand/retailer/range)
+                "constraints": {},                   # (optional) you can parse price range later
+            }
+            logger.info("[Intent] Fallback keyword-based product intent: {}", intent_data)
 
     # 5a) Routine audit path (map first, optional product follow-up)
     if intent_data.get("intent") == "routine_audit":
@@ -748,6 +763,16 @@ def generate_reply_job(
     _supported_retailers = ("free people", "sephora", "ulta", "nordstrom")
     retailer_in_text = next((r for r in _supported_retailers if r in normalized_text), None)
 
+    # Heuristic: quality boots → prefer Nordstrom
+    if not retailer_in_text and "boot" in normalized_text and any(w in normalized_text for w in ("quality", "cowgirl", "western")):
+        retailer_in_text = "nordstrom"
+
+    intent_for_search = dict(intent_data or {})
+    if retailer_in_text:
+        q0 = (intent_for_search.get("query") or "").strip()
+        intent_for_search["query"] = (user_text if user_text else q0) or retailer_in_text
+
+
     # If user explicitly named a retailer, force those words into the search query
     # so product_search._retailer_candidates() can trigger SYL.
     intent_for_search = dict(intent_data or {})
@@ -799,8 +824,32 @@ def generate_reply_job(
             context=context,
         )
         reply = _fix_cringe_opening(reply)
+        # Optional opener quip (keep very short; safe-guarded)
+        try:
+            opener = render_oneliner_with_link(
+                category=(intent_data or {}).get("category") or "skincare",
+                prefer_tag="rec",
+                rec_product_name=gpt_products[0]["name"],
+                rec_affiliate_url=gpt_products[0]["url"],
+            )
+            if opener and len(opener) < 120:
+                reply = opener + "\n" + reply
+        except Exception as e:
+            logger.info("[Oneliner] skipped opener: {}", e)
         _finalize_and_send(user_id, convo_id, reply, add_cta=False)
         return
+# If we reached here and product_candidates is empty, try a relevant quip instead of dead air
+    if not product_candidates and any(w in normalized_text for w in ("hair", "hairspray", "frizz", "hold")):
+        msg = render_oneliner_with_link(
+            category="haircare",
+            prefer_tag="anti_rec_to_rec",
+            anti_rec_alt_name="Living Proof Flex Hairspray",
+            anti_rec_alt_url="https://shop-links.co/your-flex-hairspray-link",
+            reason="no helmet hair, flexible hold",
+        )
+        if msg:
+            _finalize_and_send(user_id, convo_id, msg, add_cta=False)
+            return
    
 # ---------------------------------------------------------------------- #
 # Debug and re-engagement jobs
