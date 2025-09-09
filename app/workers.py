@@ -364,11 +364,6 @@ def _fix_vip_links(text: str) -> str:
 # ---------------------------------------------------------------------- #
 # Final storage and SMS send
 # ---------------------------------------------------------------------- #
-# ==== Final shaping ====
-    text_val = _add_personality_if_flat(text_val)
-    text_val = make_sms_reply(text_val)
-    text_val = ensure_not_link_ending(text_val)
-
 def _add_personality_if_flat(text: str) -> str:
     if not text:
         return text
@@ -574,7 +569,6 @@ def generate_reply_job(
     user_text = str(text_val or "")
     normalized_text = user_text.lower().strip()
     logger.info("[Worker][Start] Job: convo_id=%s user_id=%s text_len=%d media_cnt=%d",
-                convo_id, user_id, len(text_val or ""), len(media_urls or []))
 
         # 0) Gate
     try:
@@ -769,10 +763,11 @@ def generate_reply_job(
 
         with db.session() as s:
             profile = s.execute(
-                sqltext("SELECT is_vip, has_completed_quiz FROM user_profiles WHERE user_id = :uid"),
+                sqltext("SELECT is_vip, is_quiz_completed FROM user_profiles WHERE user_id = :uid"),
                 {"uid": user_id}
             ).first()
         context = {"is_vip": bool(profile and profile[0]), "has_completed_quiz": bool(profile and profile[1])}
+
 
         reply = ai.generate_reply(
             user_text=user_text,

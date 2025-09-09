@@ -1,6 +1,6 @@
 # app/main.py
 from dotenv import load_dotenv
-from fastapi.params import Body
+from fastapi.params import body
 load_dotenv()
 
 import os, time, re
@@ -164,8 +164,9 @@ from . import models
 from .task_queue import enqueue_generate_reply
 from .workers import send_reengagement_job
 
-def process_incoming(message_id: str, user_phone: str, text_val: str, raw_body: dict, media_urls: Optional[List[str]] = None):
-    """Run DB insert + enqueue safely in background after GHL gets 200."""
+def process_incoming(message_id: str, user_phone: str, text_val: str, raw_body: dict,
+                     media_urls: Optional[List[str]] = None):
+    """DB insert + enqueue; no recursion, no background task."""
     try:
         logger.info("[API][Process] Starting DB insert for msg_id={} phone={} text={}",
                     message_id, user_phone, text_val)
@@ -175,21 +176,22 @@ def process_incoming(message_id: str, user_phone: str, text_val: str, raw_body: 
             convo = models.get_or_create_conversation(s, user.id)
             models.insert_message(s, convo.id, "in", message_id, text_val)
             s.commit()
-            logger.info("[API][Process] 💾 Stored inbound: convo_id={} user_id={}",
-                        convo.id, user.id)
+            logger.info("[API][Process] 💾 Stored inbound: convo_id={} user_id={}", convo.id, user.id)
 
         job = enqueue_generate_reply(convo.id, user.id, text_val, user_phone=user_phone, media_urls=media_urls)
         logger.success("[API][Queue] ✅ Enqueued job={} convo_id={} user_id={} text={}",
-                       job.id, convo.id, user.id, text_val)
-
+                       getattr(job, "id", "n/a"), convo.id, user.id, text_val)
+        return {"ok": True, "job_id": getattr(job, "id", None), "convo_id": convo.id, "user_id": user.id}
     except Exception as e:
-        logger.exception("💥 [API][Process] Exception in background process: {}", e)
+        logger.exception("💥 [API][Process] Exception: {}", e)
+        return {"ok": True, "error": "process_incoming_failed"}
+
     # -------------- Core processing -------------- #
     # Hand off directly (synchronous) so jobs always enqueue
     try:
         logger.info("[API] Handing off to process_incoming: msg_id={} phone={} text_len={} media_cnt={}",
                     message_id, user_phone, len(text_val or ""), len(media_urls or []))
-        process_incoming(message_id, user_phone, text_val, Body, media_urls)
+        process_incoming(message_id, user_phone, text_val, body, media_urls)
     except Exception as e:
         logger.exception("[API] process_incoming failed: {}", e)
 
@@ -198,83 +200,62 @@ def process_incoming(message_id: str, user_phone: str, text_val: str, raw_body: 
 
 # -------------------- Inbound webhook -------------------- #
 @app.post("/webhook/incoming_message")
-async def incoming_message_any(req: Request, background_tasks: BackgroundTasks):
-    """Inbound webhook from GHL → normalize payload → enqueue reply job."""
-    # 🔐 Optional inbound verification: require matching shared secret header
+async def incoming_message_any(req: Request):
+    # 🔐 Optional shared secret
     if WEBHOOK_SECRET:
         sec = req.headers.get("X-Webhook-Secret") or req.headers.get("x-webhook-secret")
         if sec != WEBHOOK_SECRET:
             logger.warning("[API][Webhook] Forbidden: bad or missing X-Webhook-Secret")
             return JSONResponse(status_code=403, content={"ok": False, "error": "forbidden"})
 
+    # Parse body
     try:
         body = await req.json()
-        logger.info("[API][Webhook] >>> Incoming webhook hit! Raw body: {}", body)
+        logger.info("[API][Webhook] >>> Incoming: {}", body)
     except Exception:
-        logger.exception("[API][Webhook] Invalid JSON received")
+        logger.exception("[API][Webhook] Invalid JSON")
         return JSONResponse(status_code=200, content={"ok": True, "error": "invalid json"})
 
-# parse payload / custom data
+    # Choose correct payload root
     cd = body.get("customData") or body.get("custom_data")
     payload = cd if cd and isinstance(cd, dict) else body
 
-    base_id = (
-            payload.get("message_id")
-            or body.get("message_id")
-            or f"{body.get('contact', {}).get('id', 'contact')}"
-        )
+    # IDs & phone
+    base_id = payload.get("message_id") or body.get("message_id") or f"{body.get('contact', {}).get('id','contact')}"
     message_id = f"{base_id}-{int(time.time())}"
-    logger.info("[API][Webhook] Generated unique message_id={}", message_id)
 
     user_phone = (
-            payload.get("user_phone")
-            or body.get("user_phone")
-            or body.get("phone")
-            or body.get("contact", {}).get("phone")
-        )
+        payload.get("user_phone") or body.get("user_phone") or body.get("phone") or body.get("contact", {}).get("phone")
+    )
     if user_phone:
-            digits = re.sub(r"\D", "", str(user_phone))
-            if len(digits) == 10:
-                user_phone = "+1" + digits
-            elif not str(user_phone).startswith("+"):
-                user_phone = "+" + digits
-    logger.info("[API][Webhook] Normalized phone={}", user_phone)
+        digits = re.sub(r"\D", "", str(user_phone))
+        if len(digits) == 10:
+            user_phone = "+1" + digits
+        elif not str(user_phone).startswith("+"):
+            user_phone = "+" + digits
 
+    # Text & media
     text_val = (
-            payload.get("text")
-            or body.get("text")
-            or body.get("message", {}).get("body")
-            or body.get("activity", {}).get("body")
-            or body.get("contact", {}).get("last_message")
-        )
+        payload.get("text") or body.get("text") or body.get("message", {}).get("body")
+        or body.get("activity", {}).get("body") or body.get("contact", {}).get("last_message")
+    )
     text_val = str(text_val or "")
-
-    # --- extract attachments/media urls from common GHL shapes ---
     media_urls: List[str] = _extract_media_urls(body)
 
-    # 1) top-level "attachments" (some GHL integrations)
-    top_attachments = body.get("attachments")
-    if isinstance(top_attachments, list):
-        for a in top_attachments:
-            u = (a.get("url") or a.get("file_url") or a.get("link") or a.get("source") or "").strip()
-            if u.startswith("http"):
-                media_urls.append(u)
+    # Guard: process if EITHER text or media is present
+    if not (text_val.strip() or media_urls):
+        logger.warning("⚠️ [API][Webhook] Missing fields: phone=%s text='' media_cnt=0", user_phone)
+        return {"ok": True}
 
-    # 2) inside "message": {"attachments": [...]}
-    msg = body.get("message")
-    if isinstance(msg, dict) and isinstance(msg.get("attachments"), list):
-        for a in msg["attachments"]:
-            u = (a.get("url") or a.get("file_url") or a.get("link") or a.get("source") or "").strip()
-            if u.startswith("http"):
-                media_urls.append(u)
-    if not (text_val and text_val.strip()):
-        logger.info("[API][Webhook] Empty text. media_urls={} keys(body)={} keys(message)={}",
-                media_urls,
-                list(body.keys()) if isinstance(body, dict) else type(body),
-                list(body.get('message', {}).keys()) if isinstance(body.get('message'), dict) else type(body.get('message')))
+    logger.info("[API] Handoff → process_incoming msg_id=%s phone=%s text_len=%d media_cnt=%d",
+                message_id, user_phone, len(text_val or ""), len(media_urls or []))
+
+    # Synchronous handoff (no BackgroundTasks for now)
+    _ = process_incoming(message_id, user_phone, text_val, body, media_urls)
 
     logger.info("[API][Webhook] ✅ Final ACK sent to GHL")
     return {"ok": True}
+
 
 # -------------------- Secure re-engagement for Cron -------------------- #
 @app.post("/jobs/reengage")
