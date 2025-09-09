@@ -711,8 +711,27 @@ def generate_reply_job(
 
             intent_data = {"intent": "find_products", "query": user_text.strip(), "constraints": constraints}
             logger.info("[Intent] Fallback keyword-based product intent: {}", intent_data)
-
-
+        BRAND_TO_DOMAIN = {
+            "free people": "freepeople.com",
+            "fp": "freepeople.com",
+            "spanx": "spanx.com",
+            "everlane": "everlane.com",
+            "madewell": "madewell.com",
+            "skims": "skims.com",
+            "ganni": "ganni.com",
+            "samsung": "samsung.com",
+            "dyson": "dyson.com",
+        }
+        RETAILER_DEFAULTS = {
+            "boots": "nordstrom.com",
+            "dress": "nordstrom.com",
+            "cowgirl boots": "nordstrom.com",
+            "western boots": "nordstrom.com",
+            "mascara": "sephora.com",
+            "sunscreen": "sephora.com",
+            "serum": "sephora.com",
+            "foundation": "sephora.com",
+        }
 
     # 5a) Routine audit path (map first, optional product follow-up)
     if intent_data.get("intent") == "routine_audit":
@@ -766,21 +785,53 @@ def generate_reply_job(
             logger.warning("[Routine+Products] Secondary picks failed: {}", e)
 
         return
-    # --- Retailer hint shim: let product_search see retailer words so SYL can trigger ---
-    _supported_retailers = ("free people", "sephora", "ulta", "nordstrom")
-    retailer_in_text = next((r for r in _supported_retailers if r in normalized_text), None)
+    # --- Retailer hint shim (no "not amazon" needed) ------------------------
+    _supported_retailers = ("free people", "sephora", "ulta", "nordstrom", "madewell", "everlane", "spanx")
 
-    # Heuristic: quality/cowgirl/western boots -> prefer Nordstrom
-    if not retailer_in_text and "boot" in normalized_text and any(w in normalized_text for w in ("quality","cowgirl","western")):
-        retailer_in_text = "nordstrom"
+    def _detect_retailer_from_text(txt: str) -> Optional[str]:
+        low = txt.lower()
 
+        # 1) direct retailer mention
+        for key in _supported_retailers:
+            if key in low:
+                return BRAND_TO_DOMAIN.get(key, f"{key.replace(' ', '')}.com")
+
+        # 2) brand mentions
+        for brand, dom in BRAND_TO_DOMAIN.items():
+            if brand in low:
+                return dom
+
+        # 3) category + quality/price heuristics
+        price = None
+        m = re.search(r"\$?\s*(\d{2,4})\s*[-–]\s*\$?\s*(\d{2,4})", low)
+        if m:
+            lo, hi = sorted(map(int, [m.group(1), m.group(2)]))
+            price = (lo + hi) / 2
+        m2 = re.search(r"\bunder\s*\$?\s*(\d{2,4})\b", low)
+        if price is None and m2:
+            price = int(m2.group(1)) * 0.8  # rough target
+
+        quality_flag = any(w in low for w in ("quality", "high-quality", "nice", "premium", "designer"))
+
+        # map a few high-value categories to a default retailer
+        for key, dom in RETAILER_DEFAULTS.items():
+            if key in low and (quality_flag or (price and price >= 150)):
+                return dom
+
+        return None
+
+    retailer_domain = _detect_retailer_from_text(user_text)
+
+    # Build the intent we’ll actually search with (keep constraints from extractor/fallback)
     intent_for_search = dict(intent_data or {})
-    if retailer_in_text:
-        # Prepend retailer words so product_search._retailer_candidates() fires
+    if retailer_domain:
         q0 = (intent_for_search.get("query") or "").strip()
-        intent_for_search["query"] = f"{retailer_in_text} {q0}".strip() or retailer_in_text
+        # Prepend retailer signal so product_search._retailer_candidates() triggers SYL
+        retailer_words = retailer_domain.split(".")[0]  # e.g. "nordstrom"
+        intent_for_search["query"] = f"{retailer_words} {q0}".strip()
     else:
-        intent_for_search = intent_data  # use as-is
+        intent_for_search = intent_data
+# -----------------------------------------------------------------------
 
    # 6) Product candidates path
     product_candidates: List[Dict] = []

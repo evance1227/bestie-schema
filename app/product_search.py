@@ -216,10 +216,6 @@ def build_product_candidates(intent: Optional[Dict]) -> List[Dict]:
         return _fallback_from_query(query, max_items=int((intent.get("constraints") or {}).get("count") or 3))
 
 def prefer_amazon_first(candidates: List[Dict]) -> List[Dict]:
-    """
-    Preserve RF ranking if all results are Amazon; only lift non-Amazon
-    (retailers) to the top, otherwise keep original order.
-    """
     if not candidates:
         return []
 
@@ -227,8 +223,8 @@ def prefer_amazon_first(candidates: List[Dict]) -> List[Dict]:
         try: return "amazon." in urlparse(u or "").netloc.lower()
         except Exception: return False
 
-    if all(_is_amz((c.get("url") or "")) for c in candidates):
-        return candidates
+    if all(_is_amz(c.get("url") or "") for c in candidates):
+        return candidates  # preserve RF ranking
 
     with_idx = list(enumerate(candidates))
     with_idx.sort(key=lambda t: (0 if not _is_amz(t[1].get("url") or "") else 1, t[0]))
