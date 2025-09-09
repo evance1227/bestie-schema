@@ -744,10 +744,22 @@ def generate_reply_job(
             logger.warning("[Routine+Products] Secondary picks failed: {}", e)
 
         return
-    # 6) Product candidates path
+    # --- Retailer hint shim: make sure product_search sees retailer words ---
+    _supported_retailers = ("free people", "sephora", "ulta", "nordstrom")
+    retailer_in_text = next((r for r in _supported_retailers if r in normalized_text), None)
+
+    # If user explicitly named a retailer, force those words into the search query
+    # so product_search._retailer_candidates() can trigger SYL.
+    intent_for_search = dict(intent_data or {})
+    if retailer_in_text:
+        q0 = (intent_for_search.get("query") or "").strip()
+        # keep the user’s words so "free people" appears inside the query
+        intent_for_search["query"] = (user_text if user_text else q0) or retailer_in_text
+
+   # 6) Product candidates path
     product_candidates: List[Dict] = []
     try:
-        product_candidates = prefer_amazon_first(build_product_candidates(intent_data))
+        product_candidates = prefer_amazon_first(build_product_candidates(intent_for_search))
     except Exception as e:
         logger.warning("[Products] Candidate build failed: {}", e)
 
@@ -780,17 +792,15 @@ def generate_reply_job(
             product_candidates=gpt_products,
             user_id=user_id,
             system_prompt=(
-                "You are Bestie. Use the provided product candidates (already monetized DP URLs).\n"
-                "FORMAT AS A NUMBERED LIST with bold names so link hygiene can attach if needed:\n"
-                "1. **Name**: one-liner benefit. URL\n"
-                "Keep the whole reply ~450 chars. 1–3 options max. No disclaimers. Do not alter or replace URLs."
+                "You are Bestie. Use the provided product candidates (already monetized). "
+                "FORMAT EXACTLY:\n1. **Name** — one-liner benefit. URL\n"
+                "Max 3 items, ~450 chars. No disclaimers. Do not alter or replace URLs."
             ),
             context=context,
         )
         reply = _fix_cringe_opening(reply)
         _finalize_and_send(user_id, convo_id, reply, add_cta=False)
         return
-
    
 # ---------------------------------------------------------------------- #
 # Debug and re-engagement jobs
