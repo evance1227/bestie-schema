@@ -71,34 +71,23 @@ def _should_skip_enqueue(key: str) -> bool:
 
 # ---------- Public API ----------
 def enqueue_generate_reply(
-    user_id: int,
     convo_id: int,
+    user_id: int,
     text_val: str,
     user_phone: Optional[str] = None,
     media_urls: Optional[List[str]] = None,
 ):
-    """
-    Enqueue the reply job. We pass user_phone and media_urls so workers
-    can apply usage gates and handle media (images/audio) correctly.
-    """
-    # De-dupe key (visible in logs while we debug)
     key = _enqueue_key(convo_id, user_id, text_val, user_phone)
     logger.info("[Queue] enqueue key=%s", key)
 
     if _should_skip_enqueue(key):
         logger.warning("[Queue] duplicate suppressed convo_id=%s user_id=%s", convo_id, user_id)
-        # Return a stub with an id so caller logs don’t break
         return type("JobStub", (), {"id": f"dedup-{key[-8:]}"})()
 
-    # Explicit enqueue log
     logger.info(
         "[Queue] enqueue_generate_reply → q=%s user_id=%s convo_id=%s media_cnt=%d",
-        getattr(q, "name", "bestie_queue"),
-        user_id,
-        convo_id,
-        len(media_urls or []),
+        getattr(q, "name", "bestie_queue"), user_id, convo_id, len(media_urls or []),
     )
-
     job = q.enqueue(
         workers.generate_reply_job,
         convo_id,
@@ -110,7 +99,6 @@ def enqueue_generate_reply(
         result_ttl=RESULT_TTL_SEC,
     )
     return job
-
 
 def enqueue_wrap_link(convo_id: int, raw_url: str, campaign: str = "default"):
     """
