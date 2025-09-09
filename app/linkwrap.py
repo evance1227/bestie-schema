@@ -10,7 +10,6 @@ from urllib.parse import (
 from loguru import logger
 
 # -------------------- Env -------------------- #
-# -------------------- Env -------------------- #
 AMAZON_TAG = (
     os.getenv("AMAZON_ASSOCIATE_TAG")
     or os.getenv("AMAZON_ASSOC_TAG")
