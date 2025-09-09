@@ -1,31 +1,26 @@
+from __future__ import annotations
 # app/main.py
+import os, time, re
+from typing import Any, List, Optional
+_URL_RE = re.compile(r"https?://[^\s)\]]+", re.I)
+_IMG_EXTS = (".jpg", ".jpeg", ".png", ".gif", ".webp")
+_AUD_EXTS = (".mp3", ".m4a", ".wav", ".ogg")
+CRON_SECRET = os.getenv("CRON_SECRET")
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
 from dotenv import load_dotenv
 load_dotenv()
 
-import os, time, re
-from fastapi import FastAPI, Request, BackgroundTasks, HTTPException
+from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
 from loguru import logger
 from sqlalchemy import text as sqltext
-from typing import Optional, List
 
 from app import db
 from app.webhooks_gumroad import router as gumroad_router
-from fastapi import FastAPI
-app = FastAPI()
 
-@app.get("/healthz")
-def healthz():
-    return {"ok": True}
+# Env
 
-CRON_SECRET = os.getenv("CRON_SECRET")
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")  # << inbound shared secret (set in Web service env)
-import re
-from typing import Optional, List, Any
-
-_URL_RE = re.compile(r"https?://[^\s)>\]]+", re.I)
-_IMG_EXTS = (".jpg", ".jpeg", ".png", ".gif", ".webp")
-_AUD_EXTS = (".mp3", ".m4a", ".wav", ".ogg")
+# URL + media helpers
 
 def _collect_urls_anywhere(obj: Any, bucket: List[str]) -> None:
     """Recursively walk the inbound payload collecting any http(s) URLs."""
@@ -41,6 +36,7 @@ def _collect_urls_anywhere(obj: Any, bucket: List[str]) -> None:
                 if m.startswith("http"):
                     bucket.append(m.strip())
     except Exception:
+        # Be permissive; this is best-effort harvesting
         pass
 
 def _extract_media_urls(body: dict) -> List[str]:
@@ -68,14 +64,14 @@ def _extract_media_urls(body: dict) -> List[str]:
 
     # Dedup while preserving order
     seen = set()
-    out = []
+    out: List[str] = []
     for u in urls:
         if u not in seen:
             seen.add(u)
             out.append(u)
     return out
 
-# Explicitly set docs & openapi so /docs exists
+# App + routes (single instance)
 app = FastAPI(
     title="Bestie Backend",
     docs_url="/docs",
@@ -90,6 +86,7 @@ def healthz():
     return {"ok": True}
 
 # -------------------- Secure env snapshot -------------------- #
+
 SENSITIVE = re.compile(r"(secret|key|token|pwd|password|auth|api)", re.I)
 
 def _masked_env(snapshot: dict[str, str]) -> dict[str, str]:
