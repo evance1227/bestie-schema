@@ -564,14 +564,14 @@ def generate_reply_job(
       6) Product intent -> candidates -> GPT reply
       7) General chat GPT reply
     """
+    logger.info("[Worker][Start] Job: convo_id={} user_id={} text={}", convo_id, user_id, text_val)
 
     user_text = str(text_val or "")
     normalized_text = user_text.lower().strip()
-    logger.info(
-        "[Worker][Start] Job: convo_id=%s user_id=%s text_len=%d media_cnt=%d",
-        convo_id, user_id, len(text_val or ""), len(media_urls or [])
-    )
-    # 0) Gate
+    logger.info("[Worker][Start] Job: convo_id=%s user_id=%s text_len=%d media_cnt=%d",
+                convo_id, user_id, len(text_val or ""), len(media_urls or []))
+
+        # 0) Gate
     try:
         gate_snapshot = _ensure_profile_defaults(user_id)
         logger.info("[Gate] user_id={} -> {}", user_id, gate_snapshot)
@@ -744,7 +744,6 @@ def generate_reply_job(
             logger.warning("[Routine+Products] Secondary picks failed: {}", e)
 
         return
-
     # 6) Product candidates path
     product_candidates: List[Dict] = []
     try:
@@ -753,6 +752,13 @@ def generate_reply_job(
         logger.warning("[Products] Candidate build failed: {}", e)
 
     if product_candidates:
+        # ✅ If only one survives after dedupe, skip GPT list formatting
+        if len(product_candidates) == 1:
+            only = product_candidates[0]
+            reply = f"This is THE one: **{only.get('title') or only.get('name')}** {only.get('url')}"
+            _finalize_and_send(user_id, convo_id, reply, add_cta=False)
+            return
+
         gpt_products: List[Dict] = []
         for c in product_candidates[:3]:
             gpt_products.append({
@@ -769,7 +775,6 @@ def generate_reply_job(
             ).first()
         context = {"is_vip": bool(profile and profile[0]), "has_completed_quiz": bool(profile and profile[1])}
 
-
         reply = ai.generate_reply(
             user_text=user_text,
             product_candidates=gpt_products,
@@ -783,38 +788,10 @@ def generate_reply_job(
             context=context,
         )
         reply = _fix_cringe_opening(reply)
-        # do NOT inject VIP or CTA tail for product replies unless explicitly allowed
         _finalize_and_send(user_id, convo_id, reply, add_cta=False)
         return
 
-    # 7) General chat fallback
-    with db.session() as s:
-        profile = s.execute(
-            sqltext("SELECT is_vip, has_completed_quiz FROM user_profiles WHERE user_id = :uid"),
-            {"uid": user_id}
-        ).first()
-    context = {"is_vip": bool(profile and profile[0]), "has_completed_quiz": bool(profile and profile[1])}
-
-    reply = ai.generate_reply(
-        user_text=user_text,
-        product_candidates=[],
-        user_id=user_id,
-        system_prompt="You are Bestie. Be brief, helpful, stylish, emotionally fluent. No therapy cliches.",
-        context=context,
-    )
-
-    try:
-        if hasattr(ai, "rewrite_if_cringe"):
-            rewritten = ai.rewrite_if_cringe(reply)
-            if rewritten and rewritten != reply:
-                logger.info("[Worker][AI] Reply rewritten to improve tone.")
-                reply = rewritten
-    except Exception:
-        logger.warning("[Worker][AI] rewrite_if_cringe failed. Using original.")
-
-    _finalize_and_send(user_id, convo_id, reply, add_cta=False)
-    return
-
+   
 # ---------------------------------------------------------------------- #
 # Debug and re-engagement jobs
 # ---------------------------------------------------------------------- #

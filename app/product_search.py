@@ -10,6 +10,22 @@ import os
 RF_ENABLED = (os.getenv("RAINFOREST_ENABLED") or "1").lower() in ("1", "true", "yes")
 
 AMAZON_TAG = "schizobestie-20"
+RETAILER_SEARCH = {
+    # retailer domain -> search URL format
+    "freepeople.com": "https://www.freepeople.com/s/?q={q}",
+    "sephora.com":    "https://www.sephora.com/search?keyword={q}",
+    "ulta.com":       "https://www.ulta.com/shop/SearchDisplay?searchTerm={q}",
+    "nordstrom.com":  "https://www.nordstrom.com/sr?keyword={q}",
+}
+
+RETAILER_KEYWORDS = {
+    # user keywords -> retailer domain
+    "free people": "freepeople.com",
+    "freepeople":  "freepeople.com",
+    "sephora":     "sephora.com",
+    "ulta":        "ulta.com",
+    "nordstrom":   "nordstrom.com",
+}
 
 def _dp_link(asin: str) -> str:
     """Build a clean Amazon DP link with affiliate tag."""
@@ -92,6 +108,26 @@ def _fallback_from_query(query: str, max_items: int = 3) -> List[Dict]:
     "review": "",
     "merchant": "amazon.com"
 } for s in seeds[:max_items]]
+def _retailer_candidates(query: str, max_items: int = 3) -> List[Dict]:
+    q = (query or "").strip()
+    low = q.lower()
+    # pick first retailer mentioned in the query
+    for kw, host in RETAILER_KEYWORDS.items():
+        if kw in low:
+            url_tpl = RETAILER_SEARCH.get(host)
+            if not url_tpl:
+                break
+            url = url_tpl.format(q=quote_plus(q))
+            # shape must match _normalize() output keys
+            return [{
+                "title": q,
+                "name": q,
+                "url": url,
+                "review": "",
+                "merchant": host,
+                "meta": {"retailer": host},
+            }]
+    return []
 
 # -------------------- PATCH: small guards only -------------------- #
 _LOW_SIGNAL_FILLERS = {"hi", "hey", "hello", "help", "blah", "ok", "okay", "yo", "hey there"}
@@ -135,6 +171,12 @@ def build_product_candidates(intent: Optional[Dict]) -> List[Dict]:
 
     query = (intent.get("query") or "").strip()
     constraints = intent.get("constraints") or {}
+# NEW: if user asked for a specific retailer, build a retailer search link
+    retail = _retailer_candidates(query, max_items=int(constraints.get("count") or 3))
+    if retail:
+        logger.info("[ProductSearch] Retailer-hint for '{}': {}", query, retail[0].get("merchant"))
+        # Let link layer wrap with SYL; keep only a few to avoid spam
+        return retail[:3]
 
     # PATCH: if the query is low-signal, skip shopping entirely → let Bestie chat
     if _is_low_signal(query):
@@ -149,9 +191,11 @@ def build_product_candidates(intent: Optional[Dict]) -> List[Dict]:
         rows = search_amazon_products(query, max_results=10, constraints=constraints)
         if rows:
             norm = _normalize(rows)
+            norm = dedupe_products(norm)  # ✅ dedupe here
             logger.info("[ProductSearch] {} candidates from Amazon for '{}'", len(norm), query)
             return norm
 
+        
         # PATCH: only use fallback when the query looks itemized (A, B or C).
         if _looks_itemized(query):
             fallback = _fallback_from_query(query, max_items=int(constraints.get("count") or 3))
@@ -190,3 +234,17 @@ def prefer_amazon_first(candidates: List[Dict]) -> List[Dict]:
         return (is_amz, has_url, name_len)
 
     return sorted(candidates or [], key=key)
+def dedupe_products(products):
+    """
+    Remove duplicate products by ASIN or name.
+    Keeps the first unique product and drops the rest.
+    """
+    seen = set()
+    unique = []
+    for p in products or []:
+        key = p.get("asin") or p.get("name") or p.get("title")
+        if key not in seen:
+            seen.add(key)
+            unique.append(p)
+    return unique
+
