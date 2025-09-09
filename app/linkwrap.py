@@ -37,6 +37,7 @@ _URL = re.compile(r"https?://[^\s)\]]+", re.I)
 _MD_LINK = re.compile(r"\[([^\]]+)\]\((https?://[^)]+)\)")
 _AMZN_HOST = re.compile(r"(?:^|\.)amazon\.", re.I)
 _GENIUS_HOST = re.compile(r"(?:^|\.)geni\.us$", re.I)
+_SYL_HOSTS = {"shop-links.co", "goto.shopyourlikes.com"}
 
 # ASIN extractors: /dp/ASIN, /gp/product/ASIN, /ASIN/
 _ASIN_RE = re.compile(
@@ -63,6 +64,9 @@ def _is_syl_retailer(host: str) -> bool:
     - Else wrap if host endswith any domain in SYL_RETAILERS.
     """
     host = (host or "").lower()
+    # NEW: never treat SYL hosts as retailers
+    if host in _SYL_HOSTS:
+        return False
     # never wrap denylisted or Amazon/Genius
     if any(host.endswith(d) for d in _SYL_DENY) or "amazon." in host or _GENIUS_HOST.search(host):
         return False
@@ -79,9 +83,13 @@ def _wrap_with_shopyourlikes(url: str) -> str:
     if not (SYL_ENABLED and SYL_WRAP_TEMPLATE and url):
         return url
     try:
+        # NEW: don't wrap an already-SYL link
+        if urlparse(url).netloc.lower() in _SYL_HOSTS:
+            return url
         return SYL_WRAP_TEMPLATE.format(url=quote_plus(url))
     except Exception:
         return url
+
 
 # -------------------- Helpers ---------------- #
 def _strip_trailing_punct(url: str) -> tuple[str, str]:

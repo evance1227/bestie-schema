@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 from typing import List, Dict, Optional, Tuple
 from urllib.parse import urlparse, quote_plus
+from urllib.parse import urlparse
 
 from loguru import logger
 from app.amazon_api import search_amazon_products
@@ -214,37 +215,23 @@ def build_product_candidates(intent: Optional[Dict]) -> List[Dict]:
         logger.exception("[ProductSearch] Error building candidates: {}", e)
         return _fallback_from_query(query, max_items=int((intent.get("constraints") or {}).get("count") or 3))
 
-
 def prefer_amazon_first(candidates: List[Dict]) -> List[Dict]:
     """
-    Lightweight re-rank that brings Amazon DP links to the top and then sorts by URL presence and name length.
+    Preserve RF ranking if all results are Amazon; only lift non-Amazon
+    (retailers) to the top, otherwise keep original order.
     """
-    def _is_amazon(url: str) -> bool:
-        try:
-            return "amazon." in urlparse(url or "").netloc.lower()
-        except Exception:
-            return False
+    if not candidates:
+        return []
 
-    def key(row: Dict) -> Tuple[int, int, int]:
-        url = (row.get("url") or "").strip()
-        name = (row.get("title") or row.get("name") or "").strip()
-        is_amz = 0 if _is_amazon(url) else 1
-        has_url = 0 if url else 1  # items with URLs first
-        name_len = len(name)
-        return (is_amz, has_url, name_len)
+    def _is_amz(u: str) -> bool:
+        try: return "amazon." in urlparse(u or "").netloc.lower()
+        except Exception: return False
 
-    return sorted(candidates or [], key=key)
-def dedupe_products(products):
-    """
-    Remove duplicate products by ASIN or name.
-    Keeps the first unique product and drops the rest.
-    """
-    seen = set()
-    unique = []
-    for p in products or []:
-        key = p.get("asin") or p.get("name") or p.get("title")
-        if key not in seen:
-            seen.add(key)
-            unique.append(p)
-    return unique
+    if all(_is_amz((c.get("url") or "")) for c in candidates):
+        return candidates
+
+    with_idx = list(enumerate(candidates))
+    with_idx.sort(key=lambda t: (0 if not _is_amz(t[1].get("url") or "") else 1, t[0]))
+    return [row for _, row in with_idx]
+
 

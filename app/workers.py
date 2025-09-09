@@ -696,16 +696,23 @@ def generate_reply_job(
     # --- Catch-all: infer product intent from keywords when extractor returns {} ---
     if not intent_data:
         shopping_keywords = {
-            "boots", "dress", "mascara", "sunscreen", "serum", "moisturizer",
-            "self tanner", "cowgirl boots", "western boots", "jeans", "sneakers",
+            "boots","dress","mascara","sunscreen","serum","moisturizer",
+            "self tanner","cowgirl boots","western boots","jeans","sneakers",
         }
         if any(k in normalized_text for k in shopping_keywords):
-            intent_data = {
-                "intent": "find_products",
-                "query": user_text.strip(),          # preserve user words (brand/retailer/range)
-                "constraints": {},                   # (optional) you can parse price range later
-            }
+            constraints = {}
+            m = re.search(r"\$?\s*(\d{2,4})\s*[-–]\s*\$?\s*(\d{2,4})", normalized_text)
+            if m:
+                lo, hi = sorted(map(int, [m.group(1), m.group(2)]))
+                constraints["price_range"] = [lo, hi]
+            m2 = re.search(r"\bunder\s*\$?\s*(\d{2,4})\b", normalized_text)
+            if m2 and "price_range" not in constraints:
+                constraints["max_price"] = int(m2.group(1))
+
+            intent_data = {"intent": "find_products", "query": user_text.strip(), "constraints": constraints}
             logger.info("[Intent] Fallback keyword-based product intent: {}", intent_data)
+
+
 
     # 5a) Routine audit path (map first, optional product follow-up)
     if intent_data.get("intent") == "routine_audit":
@@ -759,27 +766,21 @@ def generate_reply_job(
             logger.warning("[Routine+Products] Secondary picks failed: {}", e)
 
         return
-    # --- Retailer hint shim: make sure product_search sees retailer words ---
+    # --- Retailer hint shim: let product_search see retailer words so SYL can trigger ---
     _supported_retailers = ("free people", "sephora", "ulta", "nordstrom")
     retailer_in_text = next((r for r in _supported_retailers if r in normalized_text), None)
 
-    # Heuristic: quality boots → prefer Nordstrom
-    if not retailer_in_text and "boot" in normalized_text and any(w in normalized_text for w in ("quality", "cowgirl", "western")):
+    # Heuristic: quality/cowgirl/western boots -> prefer Nordstrom
+    if not retailer_in_text and "boot" in normalized_text and any(w in normalized_text for w in ("quality","cowgirl","western")):
         retailer_in_text = "nordstrom"
 
     intent_for_search = dict(intent_data or {})
     if retailer_in_text:
+        # Prepend retailer words so product_search._retailer_candidates() fires
         q0 = (intent_for_search.get("query") or "").strip()
-        intent_for_search["query"] = (user_text if user_text else q0) or retailer_in_text
-
-
-    # If user explicitly named a retailer, force those words into the search query
-    # so product_search._retailer_candidates() can trigger SYL.
-    intent_for_search = dict(intent_data or {})
-    if retailer_in_text:
-        q0 = (intent_for_search.get("query") or "").strip()
-        # keep the user’s words so "free people" appears inside the query
-        intent_for_search["query"] = (user_text if user_text else q0) or retailer_in_text
+        intent_for_search["query"] = f"{retailer_in_text} {q0}".strip() or retailer_in_text
+    else:
+        intent_for_search = intent_data  # use as-is
 
    # 6) Product candidates path
     product_candidates: List[Dict] = []
