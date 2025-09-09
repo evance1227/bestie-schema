@@ -182,19 +182,7 @@ def process_incoming(message_id: str, user_phone: str, text_val: str, raw_body: 
         logger.exception("💥 [API][Process] Exception: {}", e)
         return {"ok": True, "error": "process_incoming_failed"}
 
-    # -------------- Core processing -------------- #
-    # Hand off directly (synchronous) so jobs always enqueue
-    try:
-        logger.info("[API] Handing off to process_incoming: msg_id={} phone={} text_len={} media_cnt={}",
-                    message_id, user_phone, len(text_val or ""), len(media_urls or []))
-        process_incoming(message_id, user_phone, text_val, body, media_urls)
-    except Exception as e:
-        logger.exception("[API] process_incoming failed: {}", e)
-
-    logger.info("[API][Webhook] ✅ Final ACK sent to GHL")
-    return {"ok": True}
-
-# -------------------- Inbound webhook -------------------- #
+    # -------------------- Inbound webhook -------------------- #
 @app.post("/webhook/incoming_message")
 async def incoming_message_any(req: Request):
     # 🔐 Optional shared secret

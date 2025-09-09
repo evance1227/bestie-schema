@@ -564,19 +564,14 @@ def generate_reply_job(
       6) Product intent -> candidates -> GPT reply
       7) General chat GPT reply
     """
-    logger.info("[Worker][Start] Job: convo_id={} user_id={} text={}", convo_id, user_id, text_val)
 
     user_text = str(text_val or "")
     normalized_text = user_text.lower().strip()
-logger.info(
-    "[Worker][Start] Job: convo_id=%s user_id=%s text_len=%d media_cnt=%d",
-    convo_id, user_id, len(text_val or ""), len(media_urls or [])
-)
-    "[Worker][Start] Job: convo_id=%s user_id=%s text_len=%d media_cnt=%d",
-    convo_id, user_id, len(text_val or ""), len(media_urls or [])
-)
-
-        # 0) Gate
+    logger.info(
+        "[Worker][Start] Job: convo_id=%s user_id=%s text_len=%d media_cnt=%d",
+        convo_id, user_id, len(text_val or ""), len(media_urls or [])
+    )
+    # 0) Gate
     try:
         gate_snapshot = _ensure_profile_defaults(user_id)
         logger.info("[Gate] user_id={} -> {}", user_id, gate_snapshot)
