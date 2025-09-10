@@ -144,6 +144,8 @@ def _retailer_candidates(query: str, max_items: int = 3) -> List[Dict]:
                 "meta": {"retailer": host},
             }]
     label = host.split(".")[0].title()  # e.g. "Nordstrom"
+
+# Clean up the search phrase: drop prices/filler
     q_clean = re.sub(
         r"\$?\d{2,4}(\s*[-–]\s*\$?\s*\d{2,4})?|\b(quality|cheap|not|amazon|please)\b",
         "",
@@ -151,16 +153,40 @@ def _retailer_candidates(query: str, max_items: int = 3) -> List[Dict]:
         flags=re.I,
     )
     q_clean = re.sub(r"\s{2,}", " ", q_clean).strip() or q
-    title = f"{label} — {q_clean}"
 
-    return [{
-        "title": title,
-        "name": title,
-        "url": url,
-        "review": "",
-        "merchant": host,
-        "meta": {"retailer": host, "source": "retailer_search"},
-    }]
+    # build up to 3 keyword variants to show "a few options"
+    variants = [q_clean]
+    if "black" in q_clean and "leather" not in q_clean:
+        variants.append(q_clean + " leather")
+    if "heel" not in q_clean:
+        variants.append(q_clean + " 2-3 inch heel")
+
+    items: List[Dict] = []
+    for v in variants[:max_items]:
+        # most retailers accept keyword or q
+        if host == "nordstrom.com":
+            url = f"https://www.nordstrom.com/sr?keyword={quote_plus(v)}"
+        elif host == "freepeople.com":
+            url = f"https://www.freepeople.com/s/?q={quote_plus(v)}"
+        elif host == "sephora.com":
+            url = f"https://www.sephora.com/search?keyword={quote_plus(v)}"
+        elif host == "ulta.com":
+            url = f"https://www.ulta.com/shop/SearchDisplay?searchTerm={quote_plus(v)}"
+        else:
+            url = f"https://{host}/search?q={quote_plus(v)}"
+
+        title = f"{label} — {v}"
+        items.append({
+            "title": title,
+            "name": title,
+            "url": url,
+            "review": "",
+            "merchant": host,
+            "meta": {"retailer": host, "source": "retailer_search"},
+        })
+
+    return items
+
 
 
 # -------------------- PATCH: small guards only -------------------- #
