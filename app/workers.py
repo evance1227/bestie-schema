@@ -27,6 +27,7 @@ import hashlib
 import random
 import time
 import requests
+import json
 from app.ai import generate_contextual_closer
 from typing import Optional, List
 from typing import Optional, List, Dict, Tuple
@@ -74,6 +75,24 @@ BESTIE_PRODUCT_CTA_ENABLED = os.getenv("BESTIE_PRODUCT_CTA_ENABLED", "0").lower(
 VIP_COOLDOWN_MIN = int(os.getenv("VIP_COOLDOWN_MIN", "20"))
 VIP_DAILY_MAX    = int(os.getenv("VIP_DAILY_MAX", "2"))
 _VIP_STOP        = re.compile(r"(stop( trying)? to sell|don'?t sell|no vip|quit pitching|stop pitching)", re.I)
+
+_LAST_CANDS_KEY = "last_cands:{cid}"
+
+def _get_last_candidates(convo_id: int, limit: int = 6) -> List[Dict]:
+    if not _rds: return []
+    raw = _rds.get(_LAST_CANDS_KEY.format(cid=convo_id)) or ""
+    try:
+        data = json.loads(raw) if raw else []
+        return data[:limit]
+    except Exception:
+        return []
+
+def _set_last_candidates(convo_id: int, cands: List[Dict]) -> None:
+    if not _rds: return
+    try:
+        _rds.set(_LAST_CANDS_KEY.format(cid=convo_id), json.dumps(cands or [])[:60000])  # cap
+    except Exception:
+        pass
 
 # ---------- Retailer/brand hints (module-level) ----------
 BRAND_TO_DOMAIN = {
@@ -861,54 +880,91 @@ def generate_reply_job(
             intent_for_search = intent_data
     # -----------------------------------------------------------------------
 
-    # 6) Product candidates path
+       # 6) Product candidates path (hybrid: never block reply)
     product_candidates: List[Dict] = []
     try:
         product_candidates = prefer_amazon_first(build_product_candidates(intent_for_search))
     except Exception as e:
         logger.warning("[Products] Candidate build failed: {}", e)
 
-    if product_candidates:
-        # ✅ If only one candidate and it's NOT a retailer placeholder → holy grail
-        if len(product_candidates) == 1:
-            only = product_candidates[0]
-            is_retailer_placeholder = bool((only.get("meta") or {}).get("retailer"))
-            if not is_retailer_placeholder:
-                reply = f"This is THE one: **{only.get('title') or only.get('name')}** {only.get('url')}"
-                _finalize_and_send(user_id, convo_id, reply, add_cta=False)
-                return
+    # Dedicate “more options” intent to expansion even if extractor missed it
+    want_more = any(
+        kw in normalized_text
+        for kw in ("more options", "more picks", "another option", "other options", "show me more")
+    )
 
-        gpt_products: List[Dict] = []
-        for c in product_candidates[:3]:
-            gpt_products.append({
-                "name": c.get("title") or c.get("name") or "Product",
-                "category": (intent_data or {}).get("category", ""),
-                "url": c.get("url", ""),
-                "review": c.get("review", ""),
-            })
-
-        with db.session() as s:
-            profile = s.execute(
-                sqltext("SELECT is_vip, is_quiz_completed FROM user_profiles WHERE user_id = :uid"),
-                {"uid": user_id}
-            ).first()
-        context = {"is_vip": bool(profile and profile[0]), "has_completed_quiz": bool(profile and profile[1])}
-
-        reply = ai.generate_reply(
-            user_text=user_text,
-            product_candidates=gpt_products,
-            user_id=user_id,
-            system_prompt=(
-                "You are Bestie. Use the provided product candidates (already monetized). "
-                "FORMAT EXACTLY:\n1. **Name** — one-liner benefit. URL\n"
-                "Max 3 items, ~450 chars. No disclaimers. Do not alter or replace URLs."
-            ),
-            context=context,
-        )
-        reply = _fix_cringe_opening(reply)
-
-        # Optional opener quip
+    if want_more:
         try:
+            extra_intent = dict(intent_for_search or intent_data or {})
+            cons = extra_intent.get("constraints") or {}
+            cons["count"] = 6
+            extra_intent["constraints"] = cons
+            extra = prefer_amazon_first(build_product_candidates(extra_intent))
+
+            # Merge + dedupe
+            seen, merged = set(), []
+            for row in (product_candidates or []) + (extra or []):
+                k = (row.get("url") or "")[:120] or (row.get("title") or row.get("name") or "")
+                if k and k not in seen:
+                    seen.add(k)
+                    merged.append(row)
+            product_candidates = merged
+        except Exception as e:
+            logger.warning("[Products] more-options expansion failed: {}", e)
+
+    # Cache whatever we have (even empty) for next turns
+    try:
+        if product_candidates:
+            _set_last_candidates(convo_id, product_candidates[:6])
+    except Exception:
+        pass
+
+    # Holy grail one-liner only if not a retailer placeholder
+    if product_candidates and len(product_candidates) == 1:
+        only = product_candidates[0]
+        is_placeholder = bool((only.get("meta") or {}).get("retailer"))
+        if not is_placeholder:
+            reply = f"This is THE one: **{only.get('title') or only.get('name')}** {only.get('url')}"
+            _finalize_and_send(user_id, convo_id, reply, add_cta=False)
+            return
+
+    # Prepare candidates for GPT (fallback to cached if empty)
+    cands_for_gpt = product_candidates or _get_last_candidates(convo_id, limit=3)
+
+    gpt_products: List[Dict] = []
+    for c in cands_for_gpt[:3]:
+        gpt_products.append({
+            "name": c.get("title") or c.get("name") or "Product",
+            "category": (intent_data or {}).get("category", ""),
+            "url": c.get("url", ""),
+            "review": c.get("review", ""),
+        })
+
+    with db.session() as s:
+        profile = s.execute(
+            sqltext("SELECT is_vip, is_quiz_completed FROM user_profiles WHERE user_id = :uid"),
+            {"uid": user_id}
+        ).first()
+    context = {"is_vip": bool(profile and profile[0]), "has_completed_quiz": bool(profile and profile[1])}
+
+    # Always call GPT, even if no products
+    reply = ai.generate_reply(
+        user_text=user_text,
+        product_candidates=gpt_products,
+        user_id=user_id,
+        system_prompt=(
+            "You are Bestie. If product_candidates is non-empty, use them to propose 1–3 options "
+            "with the exact URLs provided (do not replace). If it’s empty, still answer helpfully "
+            "and ask one clarifying question or present a credible suggestion. Keep to ~450 chars."
+        ),
+        context=context,
+    )
+
+    reply = _fix_cringe_opening(reply)
+
+    # Optional opener quip
+    try:
+        if gpt_products:
             opener = render_oneliner_with_link(
                 category=(intent_data or {}).get("category") or "skincare",
                 prefer_tag="rec",
@@ -917,12 +973,11 @@ def generate_reply_job(
             )
             if opener and len(opener) < 120:
                 reply = opener + "\n" + reply
-        except Exception as e:
-            logger.info("[Oneliner] skipped opener: {}", e)
+    except Exception as e:
+        logger.info("[Oneliner] skipped opener: {}", e)
 
-        _finalize_and_send(user_id, convo_id, reply, add_cta=False)
-        return
-
+    _finalize_and_send(user_id, convo_id, reply, add_cta=False)
+    return
    
 # ---------------------------------------------------------------------- #
 # Debug and re-engagement jobs
