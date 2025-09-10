@@ -80,18 +80,6 @@ def _is_syl_retailer(host: str) -> bool:
     return any(host.endswith(dom) for dom in _SYL_RETAILERS)
 
 def _wrap_with_shopyourlikes(url: str) -> str:
-    """Return ShopYourLikes redirect if enabled and template is configured, else original url."""
-    if not (SYL_ENABLED and SYL_WRAP_TEMPLATE and url):
-        return url
-    try:
-        # NEW: don't wrap an already-SYL link
-        if urlparse(url).netloc.lower() in _SYL_HOSTS:
-            return url
-        return SYL_WRAP_TEMPLATE.format(url=quote_plus(url))
-    except Exception:
-        return url
-    
-def _wrap_with_shopyourlikes(url: str) -> str:
     """
     Build a short go.shopmy.us redirect when possible; otherwise fall back
     to your template. Never re-wrap SYL, and trim noisy search queries first.
@@ -99,44 +87,46 @@ def _wrap_with_shopyourlikes(url: str) -> str:
     if not (SYL_ENABLED and url):
         return url
     try:
-        # never re-wrap SYL
         host = urlparse(url).netloc.lower()
+
+        # don't wrap an already-SYL link
         if host in _SYL_HOSTS:
             return url
 
-        # trim retailer search URLs so SYL resolves reliably
+        # trim retailer search URLs (keyword-only) so SYL resolves properly
         url = _trim_retailer_search(url)
 
-        # Prefer go.shopmy.us/p-<publisherId>?url=<...> when publisher id exists
+        # Prefer short ShopMy redirect if publisher id exists
         if SYL_PUBLISHER_ID:
             return f"{_GO_SHOPMY_PREFIX}{SYL_PUBLISHER_ID}?url={quote_plus(url)}"
 
-        # Otherwise use your SYL_WRAP_TEMPLATE if provided
+        # Otherwise use the template if provided
         if SYL_WRAP_TEMPLATE:
             return SYL_WRAP_TEMPLATE.format(url=quote_plus(url))
 
-        # If neither is set, return original url untouched
+        # Last resort: return original URL
         return url
     except Exception:
         return url
+
 
 def _trim_retailer_search(url: str) -> str:
     try:
         u = urlparse(url)
         host = u.netloc.lower()
-        if "amazon." in host:
-            return url  # do not touch Amazon here
+        if "amazon." in host:    # do not touch Amazon here
+            return url
 
-        # allow only 'keyword' or 'q' for most retailers
-        qs = dict(parse_qsl(u.query, keep_blank_values=False))
+        qs = dict(parse_qsl(u.query or "", keep_blank_values=False))
+        # keep only keyword param most retailers use; fall back to q
         allowed = {}
-        for k in ("keyword", "q"):
-            if k in qs and qs[k]:
-                allowed[k] = qs[k]
-                break
-
+        if "keyword" in qs and qs["keyword"]:
+            allowed["keyword"] = qs["keyword"]
+        elif "q" in qs and qs["q"]:
+            allowed["q"] = qs["q"]
+        # rebuild url with only the allowed query
         clean = urlunparse(u._replace(query=urlencode(allowed, doseq=True)))
-        # hard cap length for SMS aesthetics
+        # cap length to keep SMS tidy
         return clean if len(clean) <= 200 else clean[:200]
     except Exception:
         return url
