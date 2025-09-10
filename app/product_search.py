@@ -87,6 +87,21 @@ def _normalize(items: List[Dict]) -> List[Dict]:
             "meta": meta,
         })
     return out
+def dedupe_products(products: List[Dict]) -> List[Dict]:
+    """
+    Remove duplicate products by ASIN or name.
+    Keeps the first unique product and drops the rest.
+    """
+    seen = set()
+    unique: List[Dict] = []
+    for p in products or []:
+        key = p.get("asin") or p.get("name") or p.get("title")
+        if not key:
+            continue
+        if key not in seen:
+            seen.add(key)
+            unique.append(p)
+    return unique
 
 def _fallback_from_query(query: str, max_items: int = 3) -> List[Dict]:
     """

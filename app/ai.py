@@ -153,7 +153,37 @@ def _sentiment_hint(user_text: str) -> str:
     if any(x in t for x in ["excited", "love", "omg", "obsessed"]):
         return "User is excited. Match energy and lean into enthusiasm."
     return ""
+def single_line(system: str, user: str, *, max_tokens: int = 60, temperature: float = 0.7) -> str:
+    """
+    Ask the model for exactly one short line.
+    Uses the global CLIENT (initialized above). Returns "" on any failure.
+    """
+    try:
+        # If no client/API key, skip gracefully
+        if CLIENT is None or not os.getenv("OPENAI_API_KEY"):
+            return ""
 
+        resp = CLIENT.chat.completions.create(
+            model=OPENAI_MODEL,   # already defined at top of this file
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            temperature=temperature,
+            max_tokens=max_tokens,
+            n=1,
+        )
+        text = (resp.choices[0].message.content or "").strip()
+        # force single line
+        return text.splitlines()[0].strip()
+    except Exception as e:
+        try:
+            logger.warning("[AI] single_line failed: {}", e)
+        except Exception:
+            pass
+        return ""
+
+# ------------------------------------------------------------------------
 # Multimodal helpers (allow [IMG:url] inline tags if workers ever pass them through)
 _IMG_TAG = re.compile(r"\[IMG:([^\]]+)\]")
 
@@ -696,3 +726,37 @@ def build_product_block(product_candidates: List[Dict]) -> str:
         lines.append(f"- {p['name']} (Category: {p['category']}) | {p['url']} | Review: {p['review']}")
 
     return "Here are product candidates (already monetized if possible):\n" + "\n".join(lines)
+def generate_contextual_closer(
+    user_text: str,
+    *,
+    category: str | None = None,
+    recent_lines: list[str] | None = None,
+    max_len: int = 90,
+) -> str:
+    """
+    Return a single short closer line for this conversation.
+    - Punchy, helpful; no therapy clichés; no repetition.
+    - If nothing useful, return "" (caller will skip).
+    """
+    recent_lines = recent_lines or []
+    system = (
+        "You are Bestie: blunt, witty, useful. Write EXACTLY ONE short closer line "
+        "(<= {max_len} chars). Use the current topic; do not repeat earlier lines. "
+        "No cliches, no 'as an AI', no hashtags, no emojis."
+    ).format(max_len=max_len)
+
+    topic = f"Category: {category}" if category else ""
+    avoid = "\n".join(recent_lines[-5:])  # last few outbounds as 'do-not-repeat' hints
+
+    prompt = (
+        f"{topic}\nUser said: {user_text}\n\n"
+        "Write one helpful closer that nudges a next step (e.g., refine prefs, compare, budget, size). "
+        "Do NOT return multiple lines. If you can't add value, return nothing."
+        f"\n\nAvoid repeating these lines:\n{avoid}"
+    )
+
+    try:
+        # reuse your existing small helper for a single line completion
+        return (single_line(system, prompt) or "").strip()[:max_len]
+    except Exception:
+        return ""
