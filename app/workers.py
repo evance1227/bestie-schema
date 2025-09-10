@@ -27,6 +27,7 @@ import hashlib
 import random
 import time
 import requests
+from app.ai import generate_contextual_closer
 from typing import Optional, List
 from typing import Optional, List, Dict, Tuple
 from datetime import datetime, timezone, timedelta
@@ -113,6 +114,30 @@ BANNED_STOCK_PHRASES = [
 # ---------------------------------------------------------------------- #
 # Utilities
 # ---------------------------------------------------------------------- #
+_URL_END_RE = re.compile(r"(https?://[^\s)]+)\s*$", re.I)
+
+def _maybe_append_ai_closer(reply: str, user_text: str, category: str | None, convo_id: int) -> str:
+    """
+    If reply ends abruptly or on a URL, ask AI for a closer.
+    Avoid repeating last few outbounds. If AI returns "", skip.
+    """
+    try:
+        abrupt = bool(_URL_END_RE.search(reply or "")) or (len((reply or "").splitlines()) <= 2)
+        if not abrupt:
+            return reply
+
+        recent = _recent_outbound_texts(convo_id, limit=6)
+        closer = generate_contextual_closer(user_text, category=category, recent_lines=recent, max_len=90)
+        if not closer:
+            return reply
+
+        # naive anti-repeat check
+        if any(closer.lower() in (r or "").lower() for r in recent):
+            return reply
+        return (reply or "").rstrip() + "\n" + closer
+    except Exception:
+        return reply
+
 def _norm_phone(p: Optional[str]) -> Optional[str]:
     if not p:
         return None
@@ -842,11 +867,15 @@ def generate_reply_job(
 
     if product_candidates:
         # ✅ If only one survives after dedupe, skip GPT list formatting
+            # ✅ If only one candidate and it's NOT a retailer placeholder → holy grail
         if len(product_candidates) == 1:
             only = product_candidates[0]
-            reply = f"This is THE one: **{only.get('title') or only.get('name')}** {only.get('url')}"
-            _finalize_and_send(user_id, convo_id, reply, add_cta=False)
-            return
+            is_retailer_placeholder = bool((only.get("meta") or {}).get("retailer"))
+            if not is_retailer_placeholder:
+                reply = f"This is THE one: **{only.get('title') or only.get('name')}** {only.get('url')}"
+                _finalize_and_send(user_id, convo_id, reply, add_cta=False)
+                return
+
 
         gpt_products: List[Dict] = []
         for c in product_candidates[:3]:
