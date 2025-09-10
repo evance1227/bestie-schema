@@ -45,6 +45,97 @@ except Exception as e:
     logger.error("[AI] OpenAI init failed: {}", e)
 
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+def describe_image(image_url: str, *, user_hint: str | None = None, max_chars: int = 450) -> str:
+    """
+    Vision describe for a single image URL. Returns a short, useful analysis.
+    Uses your global CLIENT + OPENAI_MODEL (must support vision, e.g. gpt-4o or gpt-4o-mini).
+    """
+    try:
+        if CLIENT is None:
+            return "I couldn't open the image just now."
+
+        sys = (
+            "You are Bestie: blunt, stylish, helpful. Describe the image in 3–5 punchy lines. "
+            "Focus only on details useful for recommendations (skin tone, undertone, hair color/length, outfit vibe, textures). "
+            "No disclaimers, no emojis, no hashtags."
+        )
+
+        user = (user_hint or "Describe what matters for product/style advice.").strip()
+
+        resp = CLIENT.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=[
+                {"role": "system", "content": sys},
+                {"role": "user", "content": [
+                    {"type": "text", "text": user},
+                    {"type": "image_url", "image_url": {"url": image_url}},
+                ]},
+            ],
+            temperature=0.6,
+            max_tokens=300,
+        )
+        text = (resp.choices[0].message.content or "").strip()
+        return text[:max_chars]
+    except Exception as e:
+        try: logger.warning("[AI] describe_image failed: {}", e)
+        except Exception: pass
+        return "I couldn't read the image, but if you resend it I’ll try again."
+import tempfile, requests
+
+WHISPER_MODEL = os.getenv("WHISPER_MODEL", "whisper-1")  # or "gpt-4o-mini-transcribe"
+
+def transcribe_audio_url(audio_url: str, *, prompt: str | None = None) -> str:
+    """
+    Download an audio file and transcribe via Whisper API. Returns plain text.
+    """
+    try:
+        if CLIENT is None:
+            return ""
+
+        with requests.get(audio_url, stream=True, timeout=20) as r:
+            r.raise_for_status()
+            with tempfile.NamedTemporaryFile(suffix=".m4a", delete=True) as tmp:
+                for chunk in r.iter_content(8192):
+                    tmp.write(chunk)
+                tmp.flush()
+                tmp.seek(0)
+
+                # OpenAI Whisper
+                tr = CLIENT.audio.transcriptions.create(
+                    model=WHISPER_MODEL,
+                    file=tmp,
+                    prompt=prompt or "Transcribe clearly with punctuation.",
+                )
+                # SDKs differ: handle both dict-like and object-like
+                text = getattr(tr, "text", None) or (tr.get("text") if isinstance(tr, dict) else "")
+                return (text or "").strip()
+    except Exception as e:
+        try: logger.warning("[AI] transcribe_audio_url failed: {}", e)
+        except Exception: pass
+        return ""
+
+def transcribe_and_respond(audio_url: str, *, user_id: int | None = None) -> str:
+    """
+    Transcribe voice note, then produce a short Bestie reply.
+    """
+    transcript = transcribe_audio_url(audio_url)
+    if not transcript:
+        return "I couldn't hear that clearly. If you resend, I’ll try again."
+
+    sys = (
+        "You are Bestie. Reply in ~3–6 lines. Be specific, punchy, and helpful. "
+        "No therapy clichés. If a product ask is implied, give 1–3 picks with links placeholders."
+    )
+    resp = CLIENT.chat.completions.create(
+        model=OPENAI_MODEL,
+        messages=[
+            {"role": "system", "content": sys},
+            {"role": "user", "content": f"User said (voice): {transcript}"},
+        ],
+        temperature=0.7,
+        max_tokens=450,
+    )
+    return (resp.choices[0].message.content or "").strip()
 
 # ------------------ Redis memory ------------------- #
 REDIS_URL = os.getenv("REDIS_URL", "")
