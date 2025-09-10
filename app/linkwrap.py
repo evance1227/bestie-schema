@@ -270,29 +270,36 @@ def convert_to_geniuslink(url: str) -> str:
         return url
 
     clean, trail = _strip_trailing_punct(url)
-
-    # NEW: unwrap any geni.us/redirect first to the real target
+    
     try:
-        clean = _unwrap_genius_redirect(clean)
+        h = urlparse(clean).netloc.lower()
+        if h in _SYL_HOSTS:
+            return clean + trail  # already SYL-short; don't touch
     except Exception:
         pass
 
-    clean = _strip_utm(clean)
-    # Non-Amazon path: ShopYourLikes for supported retailers
-    try:
-        u = urlparse(clean)
-        if _is_syl_retailer(u.netloc):
-            return _wrap_with_shopyourlikes(clean)
-    except Exception:
-        pass
+        # NEW: unwrap any geni.us/redirect first to the real target
+        try:
+            clean = _unwrap_genius_redirect(clean)
+        except Exception:
+            pass
 
-    # Amazon path: canonicalize or tag, then optional wrap
-    if _is_amazon(clean):
-        if AMAZON_TAG or AMAZON_CANONICALIZE:
-            clean = _canonicalize_amazon(clean, AMAZON_TAG)
-        if GL_REWRITE:
-            clean = _wrap_with_geniuslink(clean)
-    return clean + trail
+        clean = _strip_utm(clean)
+        # Non-Amazon path: ShopYourLikes for supported retailers
+        try:
+            u = urlparse(clean)
+            if _is_syl_retailer(u.netloc):
+                return _wrap_with_shopyourlikes(clean)
+        except Exception:
+            pass
+
+        # Amazon path: canonicalize or tag, then optional wrap
+        if _is_amazon(clean):
+            if AMAZON_TAG or AMAZON_CANONICALIZE:
+                clean = _canonicalize_amazon(clean, AMAZON_TAG)
+            if GL_REWRITE:
+                clean = _wrap_with_geniuslink(clean)
+        return clean + trail
 
 # Back-compat alias used elsewhere
 convert_to_affiliate_link = convert_to_geniuslink

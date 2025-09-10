@@ -133,17 +133,38 @@ def _retailer_candidates(query: str, max_items: int = 3) -> List[Dict]:
             url_tpl = RETAILER_SEARCH.get(host)
             if not url_tpl:
                 break
-            url = url_tpl.format(q=quote_plus(q))
-            # shape must match _normalize() output keys
-            return [{
-                "title": q,
-                "name": q,
-                "url": url,
-                "review": "",
-                "merchant": host,
-                "meta": {"retailer": host},
-            }]
-    label = host.split(".")[0].title()  # e.g. "Nordstrom"
+
+            # ----- NEW: 3 safe keyword variants -----
+            # drop prices & filler, keep a compact search phrase
+            base = re.sub(
+                r"\$?\d{2,4}(\s*[-–]\s*\$?\s*\d{2,4})?|\b(quality|cheap|not|amazon|please|go)\b",
+                "",
+                low,
+                flags=re.I,
+            )
+            base = re.sub(r"\s{2,}", " ", base).strip() or q
+            variants = [base]
+            if "black" in base and "leather" not in base:
+                variants.append(base + " leather")
+            if "heel" not in base:
+                variants.append(base + " 2-3 inch heel")
+
+            items: List[Dict] = []
+            for v in variants[:max_items]:
+                # build the retailer search URL using our map (keyword param)
+                url = url_tpl.format(q=quote_plus(v))
+                title = f"{host.split('.')[0].title()} — {v}"
+                items.append({
+                    "title": title,
+                    "name": title,
+                    "url": url,
+                    "review": "",
+                    "merchant": host,
+                    "meta": {"retailer": host, "source": "retailer_search"},
+                })
+            return items
+    return []
+
 
 # Clean up the search phrase: drop prices/filler
     q_clean = re.sub(
