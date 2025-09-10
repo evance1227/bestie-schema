@@ -638,10 +638,13 @@ def generate_reply_job(
 
     user_text = str(text_val or "")
     normalized_text = user_text.lower().strip()
-    logger.info("[Worker][Start] Job: convo_id=%s user_id=%s text_len=%d media_cnt=%d",
-                convo_id, user_id, len(text_val or ""), len(media_urls or []))
 
-        # 0) Gate
+    logger.info(
+        "[Worker][Start] Job: convo_id=%s user_id=%s text_len=%d media_cnt=%d",
+        convo_id, user_id, len(text_val or ""), len(media_urls or [])
+    )
+
+    # 0) Gate
     try:
         gate_snapshot = _ensure_profile_defaults(user_id)
         logger.info("[Gate] user_id={} -> {}", user_id, gate_snapshot)
@@ -749,6 +752,13 @@ def generate_reply_job(
     if rename_reply:
         _store_and_send(user_id, convo_id, rename_reply)
         return
+    # Base reply context (used by both chat + product paths)
+    with db.session() as s:
+        profile = s.execute(
+            sqltext("SELECT is_vip, is_quiz_completed FROM user_profiles WHERE user_id = :uid"),
+            {"uid": user_id}
+        ).first()
+    context = {"is_vip": bool(profile and profile[0]), "has_completed_quiz": bool(profile and profile[1])}
 
     # 5) Intent extraction (products/routine)
     intent_data = {}
@@ -833,39 +843,38 @@ def generate_reply_job(
 
         return
     # --- Retailer hint shim (no "not amazon" needed) ------------------------
-    _supported_retailers = ("free people", "sephora", "ulta", "nordstrom", "madewell", "everlane", "spanx")
+    _SUPPORTED_RETAILERS = ("free people", "sephora", "ulta", "nordstrom", "madewell", "everlane", "spanx")
 
     def _detect_retailer_from_text(txt: str) -> Optional[str]:
-            low = txt.lower()
+        low = (txt or "").lower()
 
-            # 1) direct retailer mention
-            for key in _supported_retailers:
-                if key in low:
-                    return BRAND_TO_DOMAIN.get(key, f"{key.replace(' ', '')}.com")
+        # 1) direct retailer mention
+        for key in _SUPPORTED_RETAILERS:
+            if key in low:
+                return BRAND_TO_DOMAIN.get(key, f"{key.replace(' ', '')}.com")
 
-            # 2) brand mentions
-            for brand, dom in BRAND_TO_DOMAIN.items():
-                if brand in low:
-                    return dom
+        # 2) brand mentions
+        for brand, dom in BRAND_TO_DOMAIN.items():
+            if brand in low:
+                return dom
 
-            # 3) category + quality/price heuristics
-            price = None
-            m = re.search(r"\$?\s*(\d{2,4})\s*[-–]\s*\$?\s*(\d{2,4})", low)
-            if m:
-                lo, hi = sorted(map(int, [m.group(1), m.group(2)]))
-                price = (lo + hi) / 2
-            m2 = re.search(r"\bunder\s*\$?\s*(\d{2,4})\b", low)
-            if price is None and m2:
-                price = int(m2.group(1)) * 0.8  # rough target
+        # 3) category + quality/price heuristics
+        price = None
+        m = re.search(r"\$?\s*(\d{2,4})\s*[-–]\s*\$?\s*(\d{2,4})", low)
+        if m:
+            lo, hi = sorted(map(int, [m.group(1), m.group(2)]))
+            price = (lo + hi) / 2
+        m2 = re.search(r"\bunder\s*\$?\s*(\d{2,4})\b", low)
+        if price is None and m2:
+            price = int(m2.group(1)) * 0.8  # rough target
 
-            quality_flag = any(w in low for w in ("quality", "high-quality", "nice", "premium", "designer"))
+        quality_flag = any(w in low for w in ("quality", "high-quality", "nice", "premium", "designer"))
 
-            # map a few high-value categories to a default retailer
-            for key, dom in RETAILER_DEFAULTS.items():
-                if key in low and (quality_flag or (price and price >= 150)):
-                    return dom
+        for key, dom in RETAILER_DEFAULTS.items():
+            if key in low and (quality_flag or (price and price >= 150)):
+                return dom
 
-            return None
+        return None
 
     retailer_domain = _detect_retailer_from_text(user_text)
 
@@ -878,21 +887,38 @@ def generate_reply_job(
             intent_for_search["query"] = f"{retailer_words} {q0}".strip()
     else:
             intent_for_search = intent_data
+
+    # If no product intent → general conversation branch
+# If no product intent → general conversation branch FIRST
+    if not intent_data or intent_data.get("intent") not in ("find_products", "shopping"):
+        reply = ai.generate_reply(
+            user_text=user_text,
+            user_id=user_id,
+            product_candidates=[],
+            system_prompt=(
+                "You are Bestie: blunt, witty, stylish, emotionally fluent. "
+                "Build trust and connection first; if products naturally fit, weave them in gracefully."
+            ),
+            context=context,
+        )
+        reply = _fix_cringe_opening(reply)
+        _finalize_and_send(user_id, convo_id, reply, add_cta=False)
+        return
+        
     # -----------------------------------------------------------------------
 
-       # 6) Product candidates path (hybrid: never block reply)
+    # 6) Product candidates path (hybrid: never block reply)
     product_candidates: List[Dict] = []
     try:
         product_candidates = prefer_amazon_first(build_product_candidates(intent_for_search))
     except Exception as e:
         logger.warning("[Products] Candidate build failed: {}", e)
 
-    # Dedicate “more options” intent to expansion even if extractor missed it
+    # Detect “more options” follow-ups and try to expand to ~6
     want_more = any(
         kw in normalized_text
-        for kw in ("more options", "more picks", "another option", "other options", "show me more")
+        for kw in ("more options", "more picks", "another option", "other options", "show me more", "more?", "more", "another?")
     )
-
     if want_more:
         try:
             extra_intent = dict(intent_for_search or intent_data or {})
@@ -901,7 +927,7 @@ def generate_reply_job(
             extra_intent["constraints"] = cons
             extra = prefer_amazon_first(build_product_candidates(extra_intent))
 
-            # Merge + dedupe
+            # Merge + dedupe by URL/title
             seen, merged = set(), []
             for row in (product_candidates or []) + (extra or []):
                 k = (row.get("url") or "")[:120] or (row.get("title") or row.get("name") or "")
@@ -919,7 +945,7 @@ def generate_reply_job(
     except Exception:
         pass
 
-    # Holy grail one-liner only if not a retailer placeholder
+    # Holy grail only if it’s a real product (not a retailer placeholder)
     if product_candidates and len(product_candidates) == 1:
         only = product_candidates[0]
         is_placeholder = bool((only.get("meta") or {}).get("retailer"))
@@ -928,9 +954,23 @@ def generate_reply_job(
             _finalize_and_send(user_id, convo_id, reply, add_cta=False)
             return
 
-    # Prepare candidates for GPT (fallback to cached if empty)
+    # Prepare candidates for formatting (fallback to cached if this turn is empty)
     cands_for_gpt = product_candidates or _get_last_candidates(convo_id, limit=3)
 
+    # Deterministic formatter so URLs never disappear
+    def _format_numbered_products(rows: List[Dict], limit: int = 3) -> str:
+        lines: List[str] = []
+        for i, p in enumerate(rows[:limit], 1):
+            name = (p.get("title") or p.get("name") or "Product").strip()
+            url  = (p.get("url") or "").strip()
+            blurb = (p.get("review") or "").strip()
+            if blurb:
+                lines.append(f"{i}. **{name}**: {blurb}. {url}")
+            else:
+                lines.append(f"{i}. **{name}**: {url}")
+        return "\n".join(lines)
+
+    # Build the minimal structure ai.generate_reply expects as context
     gpt_products: List[Dict] = []
     for c in cands_for_gpt[:3]:
         gpt_products.append({
@@ -940,33 +980,31 @@ def generate_reply_job(
             "review": c.get("review", ""),
         })
 
-    with db.session() as s:
-        profile = s.execute(
-            sqltext("SELECT is_vip, is_quiz_completed FROM user_profiles WHERE user_id = :uid"),
-            {"uid": user_id}
-        ).first()
-    context = {"is_vip": bool(profile and profile[0]), "has_completed_quiz": bool(profile and profile[1])}
+    # Compose reply: if we have candidates, format ourselves; otherwise ask GPT to improvise
+    if gpt_products:
+        reply = _format_numbered_products(gpt_products, limit=3)
+    else:
+        reply = ai.generate_reply(
+            user_text=user_text,
+            product_candidates=[],
+            user_id=user_id,
+            system_prompt=(
+                "You are Bestie. There are no fetched products. Answer helpfully in ~3–6 lines and ask one "
+                "clarifying question or propose credible next steps. Do not invent affiliate links."
+            ),
+            context=context,
+        )
 
-    # Always call GPT, even if no products
-    reply = ai.generate_reply(
-        user_text=user_text,
-        product_candidates=gpt_products,
-        user_id=user_id,
-        system_prompt=(
-            "You are Bestie. If product_candidates is non-empty, use them to propose 1–3 options "
-            "with the exact URLs provided (do not replace). If it’s empty, still answer helpfully "
-            "and ask one clarifying question or present a credible suggestion. Keep to ~450 chars."
-        ),
-        context=context,
-    )
-
-    reply = _fix_cringe_opening(reply)
-
-    # Optional opener quip
+    # Optional opener quip (only when we actually have products)
     try:
         if gpt_products:
+            cat = (intent_data or {}).get("category") or ""
+            if not cat:
+                t = " ".join([p.get("name","") for p in gpt_products]).lower()
+                cat = "fashion" if "boot" in t or "dress" in t else ("skincare" if "serum" in t or "spf" in t else "home")
+
             opener = render_oneliner_with_link(
-                category=(intent_data or {}).get("category") or "skincare",
+                category=cat,
                 prefer_tag="rec",
                 rec_product_name=gpt_products[0]["name"],
                 rec_affiliate_url=gpt_products[0]["url"],
@@ -976,9 +1014,10 @@ def generate_reply_job(
     except Exception as e:
         logger.info("[Oneliner] skipped opener: {}", e)
 
+    reply = _fix_cringe_opening(reply)
     _finalize_and_send(user_id, convo_id, reply, add_cta=False)
     return
-   
+  
 # ---------------------------------------------------------------------- #
 # Debug and re-engagement jobs
 # ---------------------------------------------------------------------- #
