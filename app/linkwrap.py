@@ -31,6 +31,7 @@ SYL_PUBLISHER_ID = (os.getenv("SYL_PUBLISHER_ID") or "").strip()
 SYL_API_KEY = (os.getenv("SYL_API_KEY") or "").strip()
 _SYL_RETAILERS = tuple([d.strip().lower() for d in (os.getenv("SYL_RETAILERS") or "").split(",") if d.strip()])
 _SYL_DENY = tuple([d.strip().lower() for d in (os.getenv("SYL_DENYLIST") or "").split(",") if d.strip()])
+_GO_SHOPMY_PREFIX = "https://go.shopmy.us/p-"
 
 # -------------------- Regex ------------------ #
 _URL = re.compile(r"https?://[^\s)\]]+", re.I)
@@ -89,8 +90,56 @@ def _wrap_with_shopyourlikes(url: str) -> str:
         return SYL_WRAP_TEMPLATE.format(url=quote_plus(url))
     except Exception:
         return url
+    
+def _wrap_with_shopyourlikes(url: str) -> str:
+    """
+    Build a short go.shopmy.us redirect when possible; otherwise fall back
+    to your template. Never re-wrap SYL, and trim noisy search queries first.
+    """
+    if not (SYL_ENABLED and url):
+        return url
+    try:
+        # never re-wrap SYL
+        host = urlparse(url).netloc.lower()
+        if host in _SYL_HOSTS:
+            return url
 
+        # trim retailer search URLs so SYL resolves reliably
+        url = _trim_retailer_search(url)
 
+        # Prefer go.shopmy.us/p-<publisherId>?url=<...> when publisher id exists
+        if SYL_PUBLISHER_ID:
+            return f"{_GO_SHOPMY_PREFIX}{SYL_PUBLISHER_ID}?url={quote_plus(url)}"
+
+        # Otherwise use your SYL_WRAP_TEMPLATE if provided
+        if SYL_WRAP_TEMPLATE:
+            return SYL_WRAP_TEMPLATE.format(url=quote_plus(url))
+
+        # If neither is set, return original url untouched
+        return url
+    except Exception:
+        return url
+
+def _trim_retailer_search(url: str) -> str:
+    try:
+        u = urlparse(url)
+        host = u.netloc.lower()
+        if "amazon." in host:
+            return url  # do not touch Amazon here
+
+        # allow only 'keyword' or 'q' for most retailers
+        qs = dict(parse_qsl(u.query, keep_blank_values=False))
+        allowed = {}
+        for k in ("keyword", "q"):
+            if k in qs and qs[k]:
+                allowed[k] = qs[k]
+                break
+
+        clean = urlunparse(u._replace(query=urlencode(allowed, doseq=True)))
+        # hard cap length for SMS aesthetics
+        return clean if len(clean) <= 200 else clean[:200]
+    except Exception:
+        return url
 # -------------------- Helpers ---------------- #
 def _strip_trailing_punct(url: str) -> tuple[str, str]:
     """
@@ -338,21 +387,26 @@ def make_sms_reply(reply: str, amazon_tag: str = "schizobestie-20") -> str:
         return reply
 
 # ==== Never end replies on a link ====
+# at top with other env flags
+CLOSER_MODE = (os.getenv("CLOSER_MODE") or "ai").lower()   # 'ai' | 'static' | 'off'
+
 _URL_END_RE = re.compile(r"(https?://[^\s)]+)\s*$", re.I)
 
 def ensure_not_link_ending(text: str) -> str:
     """
-    If the message ends with a URL, append a short conversational closer
-    so SMS doesn't look ugly and the user is invited to reply.
+    If CLOSER_MODE=static, append a neutral closer when a message ends with a URL.
+    Otherwise return text untouched (AI will decide closers).
     """
-    if not text:
+    if not text or CLOSER_MODE != "static":
         return text
+
     if _URL_END_RE.search(text):
         closers = [
-            "Want the lighter gel or a richer cream?",
-            "Under $30 or go-for-gold?",
-            "Do you want speed or maximum results? I can tune it."
+            "Want me to tweak brand, budget, or color?",
+            "Prefer 1 luxe and 1 budget option?",
+            "Need sizing/fit details or a comparable alt?",
         ]
-        # simple deterministic pick
         return text.rstrip() + "\n" + closers[0]
     return text
+
+
