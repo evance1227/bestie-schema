@@ -75,6 +75,30 @@ VIP_COOLDOWN_MIN = int(os.getenv("VIP_COOLDOWN_MIN", "20"))
 VIP_DAILY_MAX    = int(os.getenv("VIP_DAILY_MAX", "2"))
 _VIP_STOP        = re.compile(r"(stop( trying)? to sell|don'?t sell|no vip|quit pitching|stop pitching)", re.I)
 
+# ---------- Retailer/brand hints (module-level) ----------
+BRAND_TO_DOMAIN = {
+    "free people": "freepeople.com",
+    "fp": "freepeople.com",
+    "spanx": "spanx.com",
+    "everlane": "everlane.com",
+    "madewell": "madewell.com",
+    "skims": "skims.com",
+    "ganni": "ganni.com",
+    "samsung": "samsung.com",
+    "dyson": "dyson.com",
+}
+
+RETAILER_DEFAULTS = {
+    "boots": "nordstrom.com",
+    "dress": "nordstrom.com",
+    "cowgirl boots": "nordstrom.com",
+    "western boots": "nordstrom.com",
+    "mascara": "sephora.com",
+    "sunscreen": "sephora.com",
+    "serum": "sephora.com",
+    "foundation": "sephora.com",
+}
+
 # Geniuslink / Amazon wrap toggles (leave blank to disable)
 GENIUSLINK_DOMAIN = (os.getenv("GENIUSLINK_DOMAIN") or "").strip()
 GENIUSLINK_WRAP   = (os.getenv("GENIUSLINK_WRAP") or "").strip()  # e.g. https://geni.us/redirect?url={url}
@@ -736,28 +760,7 @@ def generate_reply_job(
 
             intent_data = {"intent": "find_products", "query": user_text.strip(), "constraints": constraints}
             logger.info("[Intent] Fallback keyword-based product intent: {}", intent_data)
-        BRAND_TO_DOMAIN = {
-            "free people": "freepeople.com",
-            "fp": "freepeople.com",
-            "spanx": "spanx.com",
-            "everlane": "everlane.com",
-            "madewell": "madewell.com",
-            "skims": "skims.com",
-            "ganni": "ganni.com",
-            "samsung": "samsung.com",
-            "dyson": "dyson.com",
-        }
-        RETAILER_DEFAULTS = {
-            "boots": "nordstrom.com",
-            "dress": "nordstrom.com",
-            "cowgirl boots": "nordstrom.com",
-            "western boots": "nordstrom.com",
-            "mascara": "sephora.com",
-            "sunscreen": "sephora.com",
-            "serum": "sephora.com",
-            "foundation": "sephora.com",
-        }
-
+       
     # 5a) Routine audit path (map first, optional product follow-up)
     if intent_data.get("intent") == "routine_audit":
         reply = ai.audit_routine(user_text, constraints=intent_data.get("constraints") or {}, user_id=user_id)
@@ -814,51 +817,51 @@ def generate_reply_job(
     _supported_retailers = ("free people", "sephora", "ulta", "nordstrom", "madewell", "everlane", "spanx")
 
     def _detect_retailer_from_text(txt: str) -> Optional[str]:
-        low = txt.lower()
+            low = txt.lower()
 
-        # 1) direct retailer mention
-        for key in _supported_retailers:
-            if key in low:
-                return BRAND_TO_DOMAIN.get(key, f"{key.replace(' ', '')}.com")
+            # 1) direct retailer mention
+            for key in _supported_retailers:
+                if key in low:
+                    return BRAND_TO_DOMAIN.get(key, f"{key.replace(' ', '')}.com")
 
-        # 2) brand mentions
-        for brand, dom in BRAND_TO_DOMAIN.items():
-            if brand in low:
-                return dom
+            # 2) brand mentions
+            for brand, dom in BRAND_TO_DOMAIN.items():
+                if brand in low:
+                    return dom
 
-        # 3) category + quality/price heuristics
-        price = None
-        m = re.search(r"\$?\s*(\d{2,4})\s*[-–]\s*\$?\s*(\d{2,4})", low)
-        if m:
-            lo, hi = sorted(map(int, [m.group(1), m.group(2)]))
-            price = (lo + hi) / 2
-        m2 = re.search(r"\bunder\s*\$?\s*(\d{2,4})\b", low)
-        if price is None and m2:
-            price = int(m2.group(1)) * 0.8  # rough target
+            # 3) category + quality/price heuristics
+            price = None
+            m = re.search(r"\$?\s*(\d{2,4})\s*[-–]\s*\$?\s*(\d{2,4})", low)
+            if m:
+                lo, hi = sorted(map(int, [m.group(1), m.group(2)]))
+                price = (lo + hi) / 2
+            m2 = re.search(r"\bunder\s*\$?\s*(\d{2,4})\b", low)
+            if price is None and m2:
+                price = int(m2.group(1)) * 0.8  # rough target
 
-        quality_flag = any(w in low for w in ("quality", "high-quality", "nice", "premium", "designer"))
+            quality_flag = any(w in low for w in ("quality", "high-quality", "nice", "premium", "designer"))
 
-        # map a few high-value categories to a default retailer
-        for key, dom in RETAILER_DEFAULTS.items():
-            if key in low and (quality_flag or (price and price >= 150)):
-                return dom
+            # map a few high-value categories to a default retailer
+            for key, dom in RETAILER_DEFAULTS.items():
+                if key in low and (quality_flag or (price and price >= 150)):
+                    return dom
 
-        return None
+            return None
 
     retailer_domain = _detect_retailer_from_text(user_text)
 
-    # Build the intent we’ll actually search with (keep constraints from extractor/fallback)
+        # Build the intent we’ll actually search with (keep constraints from extractor/fallback)
     intent_for_search = dict(intent_data or {})
     if retailer_domain:
-        q0 = (intent_for_search.get("query") or "").strip()
-        # Prepend retailer signal so product_search._retailer_candidates() triggers SYL
-        retailer_words = retailer_domain.split(".")[0]  # e.g. "nordstrom"
-        intent_for_search["query"] = f"{retailer_words} {q0}".strip()
+            q0 = (intent_for_search.get("query") or "").strip()
+            # Prepend retailer signal so product_search._retailer_candidates() triggers SYL
+            retailer_words = retailer_domain.split(".")[0]  # e.g. "nordstrom"
+            intent_for_search["query"] = f"{retailer_words} {q0}".strip()
     else:
-        intent_for_search = intent_data
-# -----------------------------------------------------------------------
+            intent_for_search = intent_data
+    # -----------------------------------------------------------------------
 
-   # 6) Product candidates path
+    # 6) Product candidates path
     product_candidates: List[Dict] = []
     try:
         product_candidates = prefer_amazon_first(build_product_candidates(intent_for_search))
@@ -866,8 +869,7 @@ def generate_reply_job(
         logger.warning("[Products] Candidate build failed: {}", e)
 
     if product_candidates:
-        # ✅ If only one survives after dedupe, skip GPT list formatting
-            # ✅ If only one candidate and it's NOT a retailer placeholder → holy grail
+        # ✅ If only one candidate and it's NOT a retailer placeholder → holy grail
         if len(product_candidates) == 1:
             only = product_candidates[0]
             is_retailer_placeholder = bool((only.get("meta") or {}).get("retailer"))
@@ -875,7 +877,6 @@ def generate_reply_job(
                 reply = f"This is THE one: **{only.get('title') or only.get('name')}** {only.get('url')}"
                 _finalize_and_send(user_id, convo_id, reply, add_cta=False)
                 return
-
 
         gpt_products: List[Dict] = []
         for c in product_candidates[:3]:
@@ -905,7 +906,8 @@ def generate_reply_job(
             context=context,
         )
         reply = _fix_cringe_opening(reply)
-        # Optional opener quip (keep very short; safe-guarded)
+
+        # Optional opener quip
         try:
             opener = render_oneliner_with_link(
                 category=(intent_data or {}).get("category") or "skincare",
@@ -917,20 +919,10 @@ def generate_reply_job(
                 reply = opener + "\n" + reply
         except Exception as e:
             logger.info("[Oneliner] skipped opener: {}", e)
+
         _finalize_and_send(user_id, convo_id, reply, add_cta=False)
         return
-# If we reached here and product_candidates is empty, try a relevant quip instead of dead air
-    if not product_candidates and any(w in normalized_text for w in ("hair", "hairspray", "frizz", "hold")):
-        msg = render_oneliner_with_link(
-            category="haircare",
-            prefer_tag="anti_rec_to_rec",
-            anti_rec_alt_name="Living Proof Flex Hairspray",
-            anti_rec_alt_url="https://shop-links.co/your-flex-hairspray-link",
-            reason="no helmet hair, flexible hold",
-        )
-        if msg:
-            _finalize_and_send(user_id, convo_id, msg, add_cta=False)
-            return
+
    
 # ---------------------------------------------------------------------- #
 # Debug and re-engagement jobs
