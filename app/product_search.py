@@ -143,7 +143,25 @@ def _retailer_candidates(query: str, max_items: int = 3) -> List[Dict]:
                 "merchant": host,
                 "meta": {"retailer": host},
             }]
-    return []
+    label = host.split(".")[0].title()  # e.g. "Nordstrom"
+    q_clean = re.sub(
+        r"\$?\d{2,4}(\s*[-–]\s*\$?\s*\d{2,4})?|\b(quality|cheap|not|amazon|please)\b",
+        "",
+        low,
+        flags=re.I,
+    )
+    q_clean = re.sub(r"\s{2,}", " ", q_clean).strip() or q
+    title = f"{label} — {q_clean}"
+
+    return [{
+        "title": title,
+        "name": title,
+        "url": url,
+        "review": "",
+        "merchant": host,
+        "meta": {"retailer": host, "source": "retailer_search"},
+    }]
+
 
 # -------------------- PATCH: small guards only -------------------- #
 _LOW_SIGNAL_FILLERS = {"hi", "hey", "hello", "help", "blah", "ok", "okay", "yo", "hey there"}
