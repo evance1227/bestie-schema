@@ -499,7 +499,7 @@ def _finalize_and_send(
     - Optional CTA line (off by default)
     - Final cleanup for SMS delivery
     """
-    from app.linkwrap import make_sms_reply, ensure_not_link_ending
+    from app.linkwrap import wrap_all_affiliates, ensure_not_link_ending
 
     def _add_personality_if_flat(t: str) -> str:
         if not t:
