@@ -23,7 +23,6 @@ import json
 import random
 from typing import Optional, List, Dict, Tuple
 from datetime import datetime, timezone
-from app import bestie_qc
 
 import redis
 from loguru import logger
@@ -559,10 +558,7 @@ When product candidates are present:
     # 5) Update memory
     _remember_turn(user_id, "user", user_text)
     _remember_turn(user_id, "assistant", text)
-
-    # ✅ NEW: run through QC so numbered lists/length/phrases are enforced without breaking links
-    return _apply_bestie_qc(user_text, text, has_products=bool(product_candidates))
-
+    
 # ------------------ Multimodal routes --------------- #
 def describe_image(image_url: str) -> str:
     """Analyze an image and answer in Bestie voice."""
@@ -636,22 +632,6 @@ def rewrite_if_cringe(original_text: str) -> str:
         except Exception as e:
             logger.debug("[AI][Rewrite] failed: {}", e)
     return original_text
-def _apply_bestie_qc(user_text: str, reply_text: str, has_products: bool) -> str:
-    """
-    Post-process replies to enforce tone/format without changing URLs.
-    Non-destructive: if anything fails, returns the original text.
-    """
-    try:
-        report = bestie_qc.evaluate_reply(user_text, reply_text, has_products=has_products)
-        if report.get("needs_fix"):
-            return bestie_qc.upgrade_reply(user_text, reply_text, report)
-        return reply_text
-    except Exception as e:
-        try:
-            logger.debug("[AI][QC] skipped: {}", e)
-        except Exception:
-            pass
-        return reply_text
 
 def rewrite_different(
     original_text: str,
