@@ -34,7 +34,7 @@ from typing import Optional, List, Dict, Tuple
 from datetime import datetime, timezone, timedelta
 from urllib.parse import quote_plus
 from app.linkwrap import wrap_all_affiliates, ensure_not_link_ending
-from app.bestie_oneliners import render_oneliner_with_link
+
 
 # ----------------------------- Third party ----------------------------- #
 import redis
@@ -507,7 +507,7 @@ def generate_reply_job(
                 convo_id,
                 "Before we chat, start your access so I can remember everything and tailor recs to you. Tap here and you’ll go straight to your quiz after signup:\nhttps://schizobestie.gumroad.com/l/gexqp\nNo refunds. Cancel anytime. 💅"
             )
-            return
+            return  # <— make sure this line is present
 
     except Exception as e:
         logger.exception("[Gate] snapshot/build error: {}", e)
@@ -604,13 +604,7 @@ def generate_reply_job(
         profile = s.execute(
             sqltext("SELECT is_quiz_completed FROM user_profiles WHERE user_id = :uid"),
             {"uid": user_id}
-        ).first()
-        # Base reply context (used by GPT-only chat)
-    with db.session() as s:
-        profile = s.execute(
-            sqltext("SELECT is_quiz_completed FROM user_profiles WHERE user_id = :uid"),
-            {"uid": user_id}
-        ).first()
+        ).first()      
     context = {"has_completed_quiz": bool(profile and profile[0])}
 
     # 5) Chat-first (single GPT pass)
@@ -630,6 +624,10 @@ def generate_reply_job(
             system_prompt=system_prompt,
             context=context,
         )
+
+        # NEW GUARD
+        if not reply or not str(reply).strip():
+            reply = "Babe, I glitched. Say it again and I’ll do better. 💅"
 
         reply = _fix_cringe_opening(reply)
         _finalize_and_send(user_id, convo_id, reply, add_cta=False)
