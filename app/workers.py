@@ -526,8 +526,11 @@ def _finalize_and_send(
         reply = _strip_link_placeholders(reply)
         reply = _strip_amazon_search_links(reply)
         reply = _add_personality_if_flat(reply)
-        reply = make_sms_reply(reply)          # canonical Amazon links + tag
-        reply = ensure_not_link_ending(reply)  # avoid ending on a naked URL
+        # monetize/normalize all links GPT produced
+        from app import linkwrap as _lw
+        reply = _lw.wrap_all_affiliates(reply)
+        reply = ensure_not_link_ending(reply)
+
     except Exception as e:
         logger.warning("[Worker][Linkwrap/Tone] Error in reply cleanup: {}", e)
 
