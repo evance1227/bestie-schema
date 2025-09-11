@@ -33,7 +33,7 @@ from typing import Optional, List
 from typing import Optional, List, Dict, Tuple
 from datetime import datetime, timezone, timedelta
 from urllib.parse import quote_plus
-from app.linkwrap import make_sms_reply, ensure_not_link_ending
+from app.linkwrap import wrap_all_affiliates, ensure_not_link_ending
 from app.bestie_oneliners import render_oneliner_with_link
 
 # ----------------------------- Third party ----------------------------- #
@@ -419,7 +419,7 @@ def _store_and_send(user_id: int, convo_id: int, text_val: str) -> None:
 
     # ==== Final shaping ====
     text_val = _add_personality_if_flat(text_val)
-    text_val = make_sms_reply(text_val)
+    text_val = wrap_all_affiliates(text_val)   # SYL + Geniuslink wrapping
     text_val = ensure_not_link_ending(text_val)
 
     # ==== One-time debug marker ====
