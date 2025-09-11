@@ -75,9 +75,18 @@ BESTIE_PRODUCT_CTA_ENABLED = os.getenv("BESTIE_PRODUCT_CTA_ENABLED", "0").lower(
 VIP_COOLDOWN_MIN = int(os.getenv("VIP_COOLDOWN_MIN", "20"))
 VIP_DAILY_MAX    = int(os.getenv("VIP_DAILY_MAX", "2"))
 _VIP_STOP        = re.compile(r"(stop( trying)? to sell|don'?t sell|no vip|quit pitching|stop pitching)", re.I)
+VIP_SOFT_ENABLED = (os.getenv("VIP_SOFT_ENABLED") or "0").strip() in ("1", "true", "yes")
 
 _LAST_CANDS_KEY = "last_cands:{cid}"
 
+def _maybe_inject_vip_by_convo(reply: str, convo_id: int, user_text: str) -> str:
+    # VIP not used in this product anymore; keep as hard no-op
+    return reply
+
+def _fix_vip_links(text: str) -> str:
+    # VIP not used; hard no-op
+    return text
+       
 def _get_last_candidates(convo_id: int, limit: int = 6) -> List[Dict]:
     if not _rds: return []
     raw = _rds.get(_LAST_CANDS_KEY.format(cid=convo_id)) or ""
@@ -306,65 +315,6 @@ def _ensure_profile_defaults(user_id: int) -> Dict[str, object]:
     return {"allowed": False, "reason": "pending"}
 
 # ---------------------------------------------------------------------- #
-# VIP soft pitch helpers (OFF by default)
-# ---------------------------------------------------------------------- #
-def _recent_vip_stats_by_convo(convo_id: int, minutes: int = 1440) -> Tuple[int, Optional[datetime]]:
-    cutoff = datetime.utcnow() - timedelta(minutes=minutes)
-    count_24h = 0
-    recent_ts = None
-    try:
-        with db.session() as s:
-            rows = s.execute(sqltext("""
-                SELECT content, created_at
-                FROM messages
-                WHERE conversation_id = :cid
-                ORDER BY created_at DESC
-                LIMIT 100
-            """), {"cid": convo_id}).fetchall()
-        for content, ts in rows:
-            txt = (content or "").lower()
-            if "gumroad.com" in txt or "vip" in txt:
-                count_24h += 1
-                if ts and ts > cutoff and (recent_ts is None or ts > recent_ts):
-                    recent_ts = ts
-    except Exception:
-        pass
-    return count_24h, recent_ts
-
-def _should_soft_pitch_vip_convo(convo_id: int, user_text: str, reply_text: str) -> bool:
-    if not VIP_SOFT_ENABLED:      # global kill switch
-        return False
-    if _VIP_STOP.search(user_text or ""):
-        return False
-    count_24h, recent_ts = _recent_vip_stats_by_convo(convo_id, minutes=1440)
-    if count_24h >= VIP_DAILY_MAX:
-        return False
-    if recent_ts:
-        mins_since = (datetime.utcnow() - recent_ts).total_seconds() / 60.0
-        if mins_since < VIP_COOLDOWN_MIN:
-            return False
-    txt = f"{user_text} {reply_text}".lower()
-    friction = any(w in txt for w in ["overwhelmed", "confused", "stuck", "frustrated", "help", "support", "struggling"])
-    momentum = any(w in txt for w in ["recommend", "options", "compare", "ideas", "plan", "next step", "next level", "upgrade", "more"])
-    asked    = any(w in txt for w in ["vip", "membership", "trial"])
-    return asked or friction or momentum
-
-def _vip_soft_line() -> str:
-    # copy locked to current pricing/business plan
-    return "First week free, then $17/month. Cancel anytime."
-
-def _maybe_inject_vip_by_convo(reply: str, convo_id: int, user_text: str) -> str:
-    if not VIP_SOFT_ENABLED:
-        return reply
-    try:
-        if _should_soft_pitch_vip_convo(convo_id, user_text, reply):
-            if "gumroad.com" not in (reply or "").lower():
-                reply = (reply or "").rstrip() + "\n\n" + _vip_soft_line()
-    except Exception:
-        pass
-    return reply
-
-# ---------------------------------------------------------------------- #
 # Link hygiene and affiliate helpers
 # ---------------------------------------------------------------------- #
 def _amazon_search_url(q: str) -> str:
@@ -422,15 +372,7 @@ def _rewrite_links_to_genius(text: str) -> str:
         return re.sub(_AMZN_RE, repl, text)
 
     return text
-
-def _fix_vip_links(text: str) -> str:
-    """Ensure VIP mention is clickable (used only if VIP soft-line appears)."""
-    if not text:
-        return text
-    text = re.sub(r"(?mi)^\s*\[?(vip|vip\s*sign[- ]?up|vip\s*signup)\]?\s*$", f"VIP Sign-Up: {FULL_URL or VIP_URL}", text)
-    if "vip" in text.lower() and "gumroad.com" not in text.lower():
-        text = text.rstrip() + ("\n" if not text else "")
-                                
+                               
 # ---------------------------------------------------------------------- #
 # Final storage and SMS send
 # ---------------------------------------------------------------------- #
@@ -476,10 +418,13 @@ def _store_and_send(user_id: int, convo_id: int, text_val: str) -> None:
             "convo_id": convo_id
         }
         try:
-            requests.post(GHL_WEBHOOK_URL, json=ghl_payload, timeout=6)
+            resp = requests.post(GHL_WEBHOOK_URL, json=ghl_payload, timeout=8)
+            logger.info("[GHL_SEND] status={} body={}",
+                        getattr(resp, "status_code", None),
+                        (getattr(resp, "text", "") or "")[:200])
         except Exception as e:
             logger.warning("[GHL_SEND] Failed to POST to GHL: {}", e)
-
+      
     # ==== Break into SMS chunks ====
     while len(text_val) > max_len:
         split_point = text_val[:max_len].rfind(" ")
@@ -734,13 +679,14 @@ def generate_reply_job(
         "how do i take the quiz": f"Take the quiz here, babe. It unlocks your personalized Bestie: {QUIZ_URL}",
         "where do i take the quiz": f"Here’s your link: {QUIZ_URL}",
         "quiz link": f"Quiz link incoming: {QUIZ_URL}",
-        "how much is vip": "1 week free, then $17/month. Upgrades unlock by invitation (Plus $27, Elite $37). Cancel anytime.",
-        "vip cost": "1 week free, then $17/month. Upgrades are invite-only when you hit caps.",
-        "price of vip": "Start at $17/month after a 1-week free trial. Upgrades unlock by invitation.",
+        "how much is bestie": "7-day free trial (card required), then $17/month. If you hit texting caps you’re auto-promoted to $27 then $37. Cancel anytime.",
+        "price": "Starts at $17/month after your 7-day trial. Heavy texters auto-promoted to $27 and $37 tiers.",
+        "how much does it cost": "7-day free trial, then $17/month. Promotions to $27 and $37 happen automatically when you hit caps.",
         "how much are prompt packs": "Prompt Packs are $7 each or 3 for $20.",
         "prompt pack price": "Each pack is $7 — or 3 for $20. Link: https://schizobestie.gumroad.com/",
         "prompt packs link": "Right this way: https://schizobestie.gumroad.com/",
     }
+
     for key, canned in faq_map.items():
         if key in normalized_text:
             logger.info("[Worker][FAQ] Intercepted '{}'", key)
@@ -755,10 +701,10 @@ def generate_reply_job(
     # Base reply context (used by both chat + product paths)
     with db.session() as s:
         profile = s.execute(
-            sqltext("SELECT is_vip, is_quiz_completed FROM user_profiles WHERE user_id = :uid"),
+            sqltext("SELECT is_quiz_completed FROM user_profiles WHERE user_id = :uid"),
             {"uid": user_id}
         ).first()
-    context = {"is_vip": bool(profile and profile[0]), "has_completed_quiz": bool(profile and profile[1])}
+    context = {"has_completed_quiz": bool(profile and profile[0])}
 
     # 5) Intent extraction (products/routine)
     intent_data = {}
@@ -771,78 +717,103 @@ def generate_reply_job(
         logger.warning("[Intent] Extractor failed: {}", e)
         intent_data = {}
     logger.info("[Intent] intent_data: {}", intent_data)
-    # --- Catch-all: infer product intent from keywords when extractor returns {} ---
+
+    # --- Catch-all: fire product mode for suggestions/ideas OR clear “I need/looking for + noun” ---
     if not intent_data:
-        shopping_keywords = {
-            "boots","dress","mascara","sunscreen","serum","moisturizer",
-            "self tanner","cowgirl boots","western boots","jeans","sneakers",
-        }
-        if any(k in normalized_text for k in shopping_keywords):
+        low = normalized_text
+
+        # Signals that clearly mean “give me product recs”
+        SUGGEST_SIGNALS = re.compile(
+            r"\b(recommend|recommendation|suggest|suggestions?|ideas?|picks?|starter\s*kit|essentials?|must[-\s]?haves?)\b",
+            re.I
+        )
+
+        # Phrases that usually precede a shopping ask (when paired with a category noun)
+        SEEK_SIGNALS = re.compile(r"\b(i\s+need|i\s+want|looking\s+for|shopping\s+for|find\s+me|help\s+me\s+pick)\b", re.I)
+
+        # Category nouns we support (expand as needed)
+        CATEGORY_NOUNS = (
+            "wardrobe","outfit","closet","boots","dress","jeans","sneakers","heels","coat","jacket","sweater",
+            "makeup","starter kit","routine","spf","sunscreen","serum","moisturizer","retinol","lipstick","mascara",
+            "body wash","self tanner","peptides","hair mask","shampoo","conditioner","curl cream"
+        )
+
+        should_shop = False
+
+        # Case 1: direct “give me suggestions/ideas/picks”
+        if SUGGEST_SIGNALS.search(low):
+            should_shop = True
+
+        # Case 2: “I need/looking for …” + category noun
+        elif SEEK_SIGNALS.search(low) and any(noun in low for noun in CATEGORY_NOUNS):
+            should_shop = True
+
+        if should_shop:
             constraints = {}
-            m = re.search(r"\$?\s*(\d{2,4})\s*[-–]\s*\$?\s*(\d{2,4})", normalized_text)
+            m = re.search(r"\$?\s*(\d{2,4})\s*[-–]\s*\$?\s*(\d{2,4})", low)
             if m:
                 lo, hi = sorted(map(int, [m.group(1), m.group(2)]))
                 constraints["price_range"] = [lo, hi]
-            m2 = re.search(r"\bunder\s*\$?\s*(\d{2,4})\b", normalized_text)
+            m2 = re.search(r"\bunder\s*\$?\s*(\d{2,4})\b", low)
             if m2 and "price_range" not in constraints:
                 constraints["max_price"] = int(m2.group(1))
 
             intent_data = {"intent": "find_products", "query": user_text.strip(), "constraints": constraints}
-            logger.info("[Intent] Fallback keyword-based product intent: {}", intent_data)
-       
-    # 5a) Routine audit path (map first, optional product follow-up)
-    if intent_data.get("intent") == "routine_audit":
-        reply = ai.audit_routine(user_text, constraints=intent_data.get("constraints") or {}, user_id=user_id)
-        _finalize_and_send(user_id, convo_id, reply, add_cta=False)
+            logger.info("[Intent] Fallback product intent (suggestions/ideas or seek+category): {}", intent_data)
+        
+        # 5a) Routine audit path (map first, optional product follow-up)
+        if intent_data.get("intent") == "routine_audit":
+            reply = ai.audit_routine(user_text, constraints=intent_data.get("constraints") or {}, user_id=user_id)
+            _finalize_and_send(user_id, convo_id, reply, add_cta=False)
 
-        # If the message implies shopping, send 1–3 picks (form inferred when possible)
-        try:
-            want_products = any(w in normalized_text for w in [
-                "recommend", "recommendation", "suggest", "what should", "which", "looking for", "buy", "get"
-            ]) or "peptide" in normalized_text
+            # If the message implies shopping, send 1–3 picks (form inferred when possible)
+            try:
+                want_products = any(w in normalized_text for w in [
+                    "recommend", "recommendation", "suggest", "what should", "which", "looking for", "buy", "get"
+                ]) or "peptide" in normalized_text
 
-            if want_products:
-                form = None
-                if hasattr(ai_intent, "infer_form_factor"):
-                    form = ai_intent.infer_form_factor(user_text)  # "topical" | "ingestible" | None
+                if want_products:
+                    form = None
+                    if hasattr(ai_intent, "infer_form_factor"):
+                        form = ai_intent.infer_form_factor(user_text)  # "topical" | "ingestible" | None
 
-                base_query = "peptide face serum" if form == "topical" else (
-                             "collagen peptides" if form == "ingestible" else "peptide")
+                    base_query = "peptide face serum" if form == "topical" else (
+                                "collagen peptides" if form == "ingestible" else "peptide")
 
-                secondary_intent = {
-                    "intent": "find_products",
-                    "query": base_query,
-                    "category": "skincare" if form == "topical" else "",
-                    "constraints": {"form": form, "count": 3}
-                }
-                picks = prefer_amazon_first(build_product_candidates(secondary_intent))
-                if picks:
-                    gpt_products = [{
-                        "name": p.get("title") or p.get("name") or "Product",
-                        "category": "skincare" if form == "topical" else "supplements",
-                        "url": p.get("url",""),
-                        "review": p.get("review",""),
-                    } for p in picks[:3]]
+                    secondary_intent = {
+                        "intent": "find_products",
+                        "query": base_query,
+                        "category": "skincare" if form == "topical" else "",
+                        "constraints": {"form": form, "count": 3}
+                    }
+                    picks = prefer_amazon_first(build_product_candidates(secondary_intent))
+                    if picks:
+                        gpt_products = [{
+                            "name": p.get("title") or p.get("name") or "Product",
+                            "category": "skincare" if form == "topical" else "supplements",
+                            "url": p.get("url",""),
+                            "review": p.get("review",""),
+                        } for p in picks[:3]]
 
-                    rec_text = ai.generate_reply(
-                        user_text=user_text,
-                        product_candidates=gpt_products,
-                        user_id=user_id,
-                        system_prompt=(
-                            "You are Bestie. Use the provided product candidates (already monetized DP URLs).\n"
-                            "FORMAT AS A NUMBERED LIST with bold names so link hygiene can attach if needed:\n"
-                            "1. **Name**: one-liner benefit. URL\n"
-                            "Keep the whole reply ~450 chars. 1–3 options max. No disclaimers. Do not alter or replace URLs."
-                        ),
-                        context={"session_goal": "offer quick product picks"},
-                    )
-                    rec_text = _fix_cringe_opening(rec_text)
-                    _finalize_and_send(user_id, convo_id, rec_text, add_cta=False)  # no CTA tail
-        except Exception as e:
-            logger.warning("[Routine+Products] Secondary picks failed: {}", e)
+                        rec_text = ai.generate_reply(
+                            user_text=user_text,
+                            product_candidates=gpt_products,
+                            user_id=user_id,
+                            system_prompt=(
+                                "You are Bestie. Use the provided product candidates (already monetized DP URLs).\n"
+                                "FORMAT AS A NUMBERED LIST with bold names so link hygiene can attach if needed:\n"
+                                "1. **Name**: one-liner benefit. URL\n"
+                                "Keep the whole reply ~450 chars. 1–3 options max. No disclaimers. Do not alter or replace URLs."
+                            ),
+                            context={"session_goal": "offer quick product picks"},
+                        )
+                        rec_text = _fix_cringe_opening(rec_text)
+                        _finalize_and_send(user_id, convo_id, rec_text, add_cta=False)  # no CTA tail
+            except Exception as e:
+                logger.warning("[Routine+Products] Secondary picks failed: {}", e)
 
-        return
-    # --- Retailer hint shim (no "not amazon" needed) ------------------------
+            return
+# --- Retailer hint shim (no "not amazon" needed) ------------------------
     _SUPPORTED_RETAILERS = ("free people", "sephora", "ulta", "nordstrom", "madewell", "everlane", "spanx")
 
     def _detect_retailer_from_text(txt: str) -> Optional[str]:
@@ -873,43 +844,39 @@ def generate_reply_job(
         for key, dom in RETAILER_DEFAULTS.items():
             if key in low and (quality_flag or (price and price >= 150)):
                 return dom
+    return None        
 
-        return None
+retailer_domain = _detect_retailer_from_text(user_text)
 
-    retailer_domain = _detect_retailer_from_text(user_text)
+# Build the intent we’ll actually search with (keep constraints from extractor/fallback)
+intent_for_search = dict(intent_data or {})
+if retailer_domain:
+        q0 = (intent_for_search.get("query") or "").strip()
+        # Prepend retailer signal so product_search._retailer_candidates() triggers SYL
+        retailer_words = retailer_domain.split(".")[0]  # e.g. "nordstrom"
+        intent_for_search["query"] = f"{retailer_words} {q0}".strip()
+else:
+    intent_for_search = intent_data
 
-        # Build the intent we’ll actually search with (keep constraints from extractor/fallback)
-    intent_for_search = dict(intent_data or {})
-    if retailer_domain:
-            q0 = (intent_for_search.get("query") or "").strip()
-            # Prepend retailer signal so product_search._retailer_candidates() triggers SYL
-            retailer_words = retailer_domain.split(".")[0]  # e.g. "nordstrom"
-            intent_for_search["query"] = f"{retailer_words} {q0}".strip()
-    else:
-            intent_for_search = intent_data
-
-    # If no product intent → general conversation branch
-# If no product intent → general conversation branch FIRST
-    if not intent_data or intent_data.get("intent") not in ("find_products", "shopping"):
+    # If no product intent → general conversation branch FIRST
+if not intent_data or intent_data.get("intent") not in ("find_products", "shopping"):
         reply = ai.generate_reply(
             user_text=user_text,
             user_id=user_id,
-            product_candidates=[],
+            product_candidates=[],  # pure chat
             system_prompt=(
                 "You are Bestie: blunt, witty, stylish, emotionally fluent. "
-                "Build trust and connection first; if products naturally fit, weave them in gracefully."
+                "Relationship & loyalty first. Only weave products in when the user clearly asks."
             ),
             context=context,
         )
         reply = _fix_cringe_opening(reply)
         _finalize_and_send(user_id, convo_id, reply, add_cta=False)
         return
-        
-    # -----------------------------------------------------------------------
 
     # 6) Product candidates path (hybrid: never block reply)
     product_candidates: List[Dict] = []
-    try:
+try:
         product_candidates = prefer_amazon_first(build_product_candidates(intent_for_search))
     except Exception as e:
         logger.warning("[Products] Candidate build failed: {}", e)
@@ -920,23 +887,30 @@ def generate_reply_job(
         for kw in ("more options", "more picks", "another option", "other options", "show me more", "more?", "more", "another?")
     )
     if want_more:
-        try:
-            extra_intent = dict(intent_for_search or intent_data or {})
-            cons = extra_intent.get("constraints") or {}
-            cons["count"] = 6
-            extra_intent["constraints"] = cons
-            extra = prefer_amazon_first(build_product_candidates(extra_intent))
+try:
+        extra_intent = dict(intent_for_search or intent_data or {})
+        cons = extra_intent.get("constraints") or {}
+        cons["count"] = 6
+        extra_intent["constraints"] = cons
+        extra = prefer_amazon_first(build_product_candidates(extra_intent))
 
-            # Merge + dedupe by URL/title
-            seen, merged = set(), []
-            for row in (product_candidates or []) + (extra or []):
-                k = (row.get("url") or "")[:120] or (row.get("title") or row.get("name") or "")
-                if k and k not in seen:
-                    seen.add(k)
-                    merged.append(row)
-            product_candidates = merged
-        except Exception as e:
-            logger.warning("[Products] more-options expansion failed: {}", e)
+     # Merge + dedupe by URL/title
+        seen, merged = set(), []
+        for row in (product_candidates or []) + (extra or []):
+            k = (row.get("url") or "")[:120] or (row.get("title") or row.get("name") or "")
+            if k and k not in seen:
+                seen.add(k)
+                merged.append(row)
+                product_candidates = merged
+    except Exception as e:
+        logger.warning("[Products] more-options expansion failed: {}", e)
+
+    # --- DEBUG: show first candidate URLs ---
+try:
+        for i, p in enumerate(product_candidates[:3], 1):
+            logger.info("[Products][DBG] %d) %s | url=%s", i, (p.get('title') or p.get('name')), (p.get('url') or ''))
+    except Exception:
+        pass
 
     # Cache whatever we have (even empty) for next turns
     try:
@@ -957,30 +931,61 @@ def generate_reply_job(
     # Prepare candidates for formatting (fallback to cached if this turn is empty)
     cands_for_gpt = product_candidates or _get_last_candidates(convo_id, limit=3)
 
-    # Deterministic formatter so URLs never disappear
-    def _format_numbered_products(rows: List[Dict], limit: int = 3) -> str:
-        lines: List[str] = []
-        for i, p in enumerate(rows[:limit], 1):
+    # Deterministic formatter that guarantees URLs and skips empties
+    def _format_numbered_with_urls(rows: List[Dict], limit: int = 3) -> str:
+        out = []
+        count = 0
+        for p in rows:
+            url = (p.get("url") or "").strip()
+            if not url:
+                continue  # skip blank URL entries
+            url = linkwrap.convert_to_geniuslink(url)  # wrap SYL/Amazon if needed
             name = (p.get("title") or p.get("name") or "Product").strip()
-            url  = (p.get("url") or "").strip()
             blurb = (p.get("review") or "").strip()
+            count += 1
             if blurb:
-                lines.append(f"{i}. **{name}**: {blurb}. {url}")
+                out.append(f"{count}. **{name}**: {blurb}. {url}")
             else:
-                lines.append(f"{i}. **{name}**: {url}")
-        return "\n".join(lines)
+                out.append(f"{count}. **{name}**: {url}")
+            if count >= limit:
+                break
+        return "\n".join(out)
 
-    # Build the minimal structure ai.generate_reply expects as context
-    gpt_products: List[Dict] = []
-    for c in cands_for_gpt[:3]:
-        gpt_products.append({
-            "name": c.get("title") or c.get("name") or "Product",
-            "category": (intent_data or {}).get("category", ""),
-            "url": c.get("url", ""),
-            "review": c.get("review", ""),
-        })
+    # Build gpt_products only for opener quip
+    gpt_products: List[Dict] = [
+        {"name": (c.get("title") or c.get("name") or "Product"),
+        "category": (intent_data or {}).get("category",""),
+        "url": (c.get("url") or ""),
+        "review": (c.get("review") or "")}
+        for c in cands_for_gpt[:3]
+    ]
 
-    # Compose reply: if we have candidates, format ourselves; otherwise ask GPT to improvise
+    # Optional opener
+    try:
+        opener = ""
+        if gpt_products:
+            t = " ".join([p["name"] for p in gpt_products]).lower()
+            cat = (intent_data or {}).get("category") or (
+                "fashion" if ("boot" in t or "dress" in t) else ("skincare" if ("spf" in t or "serum" in t) else "home")
+            )
+            opener = render_oneliner_with_link(
+                category=cat, prefer_tag="rec",
+                rec_product_name=gpt_products[0]["name"],
+                rec_affiliate_url=linkwrap.convert_to_geniuslink(gpt_products[0]["url"]) if gpt_products[0]["url"] else "",
+            ) or ""
+    except Exception:
+        opener = ""
+
+    body = _format_numbered_with_urls(product_candidates, limit=3)
+    if not body:
+        body = "I can’t pull the product URLs right now. Want me to try a different retailer or budget?"
+
+    reply = (opener + "\n" + body).strip() if opener and len(opener) < 120 else body
+    reply = _fix_cringe_opening(reply)
+    _finalize_and_send(user_id, convo_id, reply, add_cta=False)
+    return
+
+        # Compose reply: if we have candidates, format ourselves; otherwise ask GPT to improvise
     if gpt_products:
         reply = _format_numbered_products(gpt_products, limit=3)
     else:
@@ -995,13 +1000,13 @@ def generate_reply_job(
             context=context,
         )
 
-    # Optional opener quip (only when we actually have products)
+        # Optional opener quip (only when we actually have products)
     try:
         if gpt_products:
-            cat = (intent_data or {}).get("category") or ""
-            if not cat:
-                t = " ".join([p.get("name","") for p in gpt_products]).lower()
-                cat = "fashion" if "boot" in t or "dress" in t else ("skincare" if "serum" in t or "spf" in t else "home")
+                cat = (intent_data or {}).get("category") or ""
+        if not cat:
+            t = " ".join([p.get("name","") for p in gpt_products]).lower()
+            cat = "fashion" if "boot" in t or "dress" in t else ("skincare" if "serum" in t or "spf" in t else "home")
 
             opener = render_oneliner_with_link(
                 category=cat,
@@ -1009,13 +1014,13 @@ def generate_reply_job(
                 rec_product_name=gpt_products[0]["name"],
                 rec_affiliate_url=gpt_products[0]["url"],
             )
-            if opener and len(opener) < 120:
-                reply = opener + "\n" + reply
+        if opener and len(opener) < 120:
+                    reply = opener + "\n" + reply
     except Exception as e:
-        logger.info("[Oneliner] skipped opener: {}", e)
+            logger.info("[Oneliner] skipped opener: {}", e)
 
     reply = _fix_cringe_opening(reply)
-    _finalize_and_send(user_id, convo_id, reply, add_cta=False)
+    finalize_and_send(user_id, convo_id, reply, add_cta=False)
     return
   
 # ---------------------------------------------------------------------- #
