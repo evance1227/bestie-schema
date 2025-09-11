@@ -19,7 +19,8 @@ try:
     from openai import OpenAI
 except Exception:
     OpenAI = None  # type: ignore
-
+    
+VIP_QC_ENABLED = False
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 QC_MAX_CHARS = int(os.getenv("QC_MAX_CHARS", "480"))  # NEW: configurable max length
 
