@@ -162,3 +162,10 @@ def ensure_not_link_ending(text: str) -> str:
         ]
         return text.rstrip() + "\n" + closers[0]
     return text
+# Back-compat shim for existing code paths in workers.py
+def convert_to_geniuslink(url: str) -> str:
+    """
+    Legacy name used by workers.py. Keep it as a thin wrapper that applies the same
+    affiliate logic as wrap_all_affiliates() but for a single URL.
+    """
+    return _wrap_url(url)
