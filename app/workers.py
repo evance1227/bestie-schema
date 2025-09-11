@@ -42,8 +42,7 @@ from loguru import logger
 from sqlalchemy import text as sqltext
 
 # ------------------------------ App deps ------------------------------- #
-from app import db, models, ai, ai_intent, integrations, linkwrap
-from app.product_search import build_product_candidates, prefer_amazon_first
+from app import db, models, ai, integrations, linkwrap
 
 # ---------------------------------------------------------------------- #
 # Environment and globals
@@ -77,8 +76,6 @@ VIP_DAILY_MAX    = int(os.getenv("VIP_DAILY_MAX", "2"))
 _VIP_STOP        = re.compile(r"(stop( trying)? to sell|don'?t sell|no vip|quit pitching|stop pitching)", re.I)
 VIP_SOFT_ENABLED = (os.getenv("VIP_SOFT_ENABLED") or "0").strip() in ("1", "true", "yes")
 
-_LAST_CANDS_KEY = "last_cands:{cid}"
-
 def _maybe_inject_vip_by_convo(reply: str, convo_id: int, user_text: str) -> str:
     # VIP not used in this product anymore; keep as hard no-op
     return reply
@@ -87,46 +84,6 @@ def _fix_vip_links(text: str) -> str:
     # VIP not used; hard no-op
     return text
        
-def _get_last_candidates(convo_id: int, limit: int = 6) -> List[Dict]:
-    if not _rds: return []
-    raw = _rds.get(_LAST_CANDS_KEY.format(cid=convo_id)) or ""
-    try:
-        data = json.loads(raw) if raw else []
-        return data[:limit]
-    except Exception:
-        return []
-
-def _set_last_candidates(convo_id: int, cands: List[Dict]) -> None:
-    if not _rds: return
-    try:
-        _rds.set(_LAST_CANDS_KEY.format(cid=convo_id), json.dumps(cands or [])[:60000])  # cap
-    except Exception:
-        pass
-
-# ---------- Retailer/brand hints (module-level) ----------
-BRAND_TO_DOMAIN = {
-    "free people": "freepeople.com",
-    "fp": "freepeople.com",
-    "spanx": "spanx.com",
-    "everlane": "everlane.com",
-    "madewell": "madewell.com",
-    "skims": "skims.com",
-    "ganni": "ganni.com",
-    "samsung": "samsung.com",
-    "dyson": "dyson.com",
-}
-
-RETAILER_DEFAULTS = {
-    "boots": "nordstrom.com",
-    "dress": "nordstrom.com",
-    "cowgirl boots": "nordstrom.com",
-    "western boots": "nordstrom.com",
-    "mascara": "sephora.com",
-    "sunscreen": "sephora.com",
-    "serum": "sephora.com",
-    "foundation": "sephora.com",
-}
-
 # Geniuslink / Amazon wrap toggles (leave blank to disable)
 GENIUSLINK_DOMAIN = (os.getenv("GENIUSLINK_DOMAIN") or "").strip()
 GENIUSLINK_WRAP   = (os.getenv("GENIUSLINK_WRAP") or "").strip()  # e.g. https://geni.us/redirect?url={url}
@@ -313,86 +270,7 @@ def _ensure_profile_defaults(user_id: int) -> Dict[str, object]:
         return {"allowed": False, "reason": plan_status}
 
     return {"allowed": False, "reason": "pending"}
-
-# ---------------------------------------------------------------------- #
-# Link hygiene and affiliate helpers
-# ---------------------------------------------------------------------- #
-# deterministic product formatter (guarantees URLs; skips blanks)
-def _format_numbered_with_urls(rows: List[Dict], limit: int = 3) -> str:
-    out = []
-    count = 0
-    for p in rows:
-        url = (p.get("url") or "").strip()
-        if not url:
-            continue  # skip blank URL entries
-        url = linkwrap.convert_to_geniuslink(url)  # wrap SYL/Amazon if needed
-        name = (p.get("title") or p.get("name") or "Product").strip()
-        blurb = (p.get("review") or "").strip()
-        count += 1
-        if blurb:
-            out.append(f"{count}. **{name}**: {blurb}. {url}")
-        else:
-            out.append(f"{count}. **{name}**: {url}")
-        if count >= limit:
-            break
-    return "\n".join(out)
-
-def _amazon_search_url(q: str) -> str:
-    """Build a safe Amazon search URL without backslashes in f-string expressions."""
-    try:
-        term = quote_plus((q or "").strip())
-    except Exception:
-        term = (q or "").strip().replace(" ", "+")
-    return "https://www.amazon.com/s?k=" + term
-
-def _ensure_amazon_links(text: str) -> str:
-    """
-    If there are no links at all, add a safe Amazon search link under numbered bold product headers:
-    "1. **Name**"
-    """
-    if not text:
-        return text
-    if "amazon.com/dp/" in text.lower():
-        return text  # keep direct DP links untouched
-    if re.search(r"https?://\S+", text):
-        return text  # some link already present
-
-    def _inject(m):
-        name = m.group(1).strip()
-        return f"{m.group(0)}\n    [Amazon link]({_amazon_search_url(name)})"
-
-    return re.sub(r"(?m)^\s*\d+\.\s+\*\*(.+?)\*\*.*$", _inject, text)
-
-def _rewrite_links_to_genius(text: str) -> str:
-    """
-    Wrap Amazon URLs via Geniuslink when explicitly configured ONLY.
-      1) If GENIUSLINK_WRAP template is set, wrap any Amazon URL with it.
-      2) Else if GL_REWRITE and GENIUSLINK_DOMAIN are set, rewrite /dp/ASIN to https://{domain}/{ASIN}.
-      3) Else return text unmodified.
-    """
-    if not text:
-        return text
-
-    if GENIUSLINK_WRAP:
-        def _wrap(url: str) -> str:
-            return GENIUSLINK_WRAP.format(url=re.sub(r'\s', '%20', url))
-        text = re.sub(_AMZN_RE, lambda m: _wrap(m.group(0)), text)
-
-        def _md_repl(m):
-            label, url = m.group(1), m.group(2)
-            return f"[{label}]({_wrap(url)})" if _AMZN_RE.match(url) else m.group(0)
-        return re.sub(r"\[([^\]]+)\]\((https?://[^)]+)\)", _md_repl, text)
-
-    if GL_REWRITE and GENIUSLINK_DOMAIN:
-        host = GENIUSLINK_DOMAIN.rstrip("/")
-        def repl(m):
-            url = m.group(0)
-            m_asin = re.search(r"/dp/([A-Z0-9]{10})", url, re.I)
-            return f"https://{host}/{m_asin.group(1)}" if m_asin else url
-        return re.sub(_AMZN_RE, repl, text)
-
-    return text
-                               
+                                 
 # ---------------------------------------------------------------------- #
 # Final storage and SMS send
 # ---------------------------------------------------------------------- #
@@ -727,206 +605,41 @@ def generate_reply_job(
             sqltext("SELECT is_quiz_completed FROM user_profiles WHERE user_id = :uid"),
             {"uid": user_id}
         ).first()
+        # Base reply context (used by GPT-only chat)
+    with db.session() as s:
+        profile = s.execute(
+            sqltext("SELECT is_quiz_completed FROM user_profiles WHERE user_id = :uid"),
+            {"uid": user_id}
+        ).first()
     context = {"has_completed_quiz": bool(profile and profile[0])}
 
-    # 5) Intent extraction (products/routine)
-    intent_data = {}
+    # 5) Chat-first (single GPT pass)
     try:
-        if hasattr(ai_intent, "extract_product_intent"):
-            intent_data = ai_intent.extract_product_intent(user_text) or {}
-        else:
-            logger.info("[Intent] No extractor defined.")
-    except Exception as e:
-        logger.warning("[Intent] Extractor failed: {}", e)
-        intent_data = {}
-    logger.info("[Intent] intent_data: {}", intent_data)
-
-       # --- Catch-all: fire product mode for suggestions/ideas OR clear “I need/looking for + noun” ---
-    if not intent_data:
-        low = normalized_text
-
-        # Signals that clearly mean “give me product recs”
-        SUGGEST_SIGNALS = re.compile(
-            r"\b(recommend|recommendation|suggest|suggestions?|ideas?|picks?|starter\s*kit|essentials?|must[-\s]?haves?)\b",
-            re.I
+        system_prompt = (
+            "You are Bestie — blunt, witty, stylish, emotionally fluent. Relationship & loyalty first. "
+            "Answer like a ride-or-die best friend. Be punchy, specific, no therapy clichés. "
+            "If you recommend products, include 1–3 picks as a numbered list with **bold names** + a direct URL "
+            "(no search links). Prefer trusted retailers (Nordstrom, Free People, Sephora, Ulta, Amazon DP pages). "
+            "Keep the whole reply under ~450 characters."
         )
 
-        # Phrases that usually precede a shopping ask (when paired with a category noun)
-        SEEK_SIGNALS = re.compile(r"\b(i\s+need|i\s+want|looking\s+for|shopping\s+for|find\s+me|help\s+me\s+pick)\b", re.I)
-
-        # Category nouns we support (expand as needed)
-        CATEGORY_NOUNS = (
-            "wardrobe","outfit","closet","boots","dress","jeans","sneakers","heels","coat","jacket","sweater",
-            "makeup","starter kit","routine","spf","sunscreen","serum","moisturizer","retinol","lipstick","mascara",
-            "body wash","self tanner","peptides","hair mask","shampoo","conditioner","curl cream"
-        )
-
-        should_shop = False
-
-        # Case 1: direct “give me suggestions/ideas/picks”
-        if SUGGEST_SIGNALS.search(low):
-            should_shop = True
-        # Case 2: “I need/looking for …” + category noun
-        elif SEEK_SIGNALS.search(low) and any(noun in low for noun in CATEGORY_NOUNS):
-            should_shop = True
-
-        if should_shop:
-            constraints = {}
-            m = re.search(r"\$?\s*(\d{2,4})\s*[-–]\s*\$?\s*(\d{2,4})", low)
-            if m:
-                lo, hi = sorted(map(int, [m.group(1), m.group(2)]))
-                constraints["price_range"] = [lo, hi]
-            m2 = re.search(r"\bunder\s*\$?\s*(\d{2,4})\b", low)
-            if m2 and "price_range" not in constraints:
-                constraints["max_price"] = int(m2.group(1))
-
-            intent_data = {"intent": "find_products", "query": user_text.strip(), "constraints": constraints}
-            logger.info("[Intent] Fallback product intent (suggestions/ideas or seek+category): {}", intent_data)
-
-    # --- Retailer hint shim (no \"not amazon\" needed) ------------------------
-    _SUPPORTED_RETAILERS = ("free people", "sephora", "ulta", "nordstrom", "madewell", "everlane", "spanx")
-
-    def _detect_retailer_from_text(txt: str) -> Optional[str]:
-        low = (txt or "").lower()
-        # 1) direct retailer mention
-        for key in _SUPPORTED_RETAILERS:
-            if key in low:
-                return BRAND_TO_DOMAIN.get(key, f"{key.replace(' ', '')}.com")
-        # 2) brand mentions
-        for brand, dom in BRAND_TO_DOMAIN.items():
-            if brand in low:
-                return dom
-        # 3) category + quality/price heuristics
-        price = None
-        m = re.search(r"\$?\s*(\d{2,4})\s*[-–]\s*\$?\s*(\d{2,4})", low)
-        if m:
-            lo, hi = sorted(map(int, [m.group(1), m.group(2)]))
-            price = (lo + hi) / 2
-        m2 = re.search(r"\bunder\s*\$?\s*(\d{2,4})\b", low)
-        if price is None and m2:
-            price = int(m2.group(1)) * 0.8  # rough target
-        quality_flag = any(w in low for w in ("quality", "high-quality", "nice", "premium", "designer"))
-        for key, dom in RETAILER_DEFAULTS.items():
-            if key in low and (quality_flag or (price and price >= 150)):
-                return dom
-        return None
-    retailer_domain = _detect_retailer_from_text(user_text)
-
-    # Build the intent we’ll actually search with (keep constraints from extractor/fallback)
-    intent_for_search = dict(intent_data or {})
-    if retailer_domain:
-        q0 = (intent_for_search.get("query") or "").strip()
-        retailer_words = retailer_domain.split(".")[0]  # e.g. "nordstrom"
-        intent_for_search["query"] = f"{retailer_words} {q0}".strip()
-    else:
-        intent_for_search = intent_data
-
-    # If no product intent → general conversation branch FIRST
-    if not intent_data or intent_data.get("intent") not in ("find_products", "shopping"):
         reply = ai.generate_reply(
             user_text=user_text,
             user_id=user_id,
-            product_candidates=[],  # pure chat
-            system_prompt=(
-                "You are Bestie: blunt, witty, stylish, emotionally fluent. "
-                "Relationship & loyalty first. Only weave products in when the user clearly asks."
-            ),
+            product_candidates=[],       # no product pipeline
+            system_prompt=system_prompt,
             context=context,
         )
+
         reply = _fix_cringe_opening(reply)
         _finalize_and_send(user_id, convo_id, reply, add_cta=False)
         return
 
-    # 6) Product candidates path (hybrid: never block reply)
-    product_candidates: List[Dict] = []
-    try:
-        product_candidates = prefer_amazon_first(build_product_candidates(intent_for_search))
-    except Exception as e:
-        logger.warning("[Products] Candidate build failed: {}", e)
-
-    # Detect “more options” follow-ups and try to expand to ~6
-    want_more = any(
-        kw in normalized_text
-        for kw in ("more options", "more picks", "another option", "other options", "show me more", "more?", "more", "another?")
-    )
-    if want_more:
-        try:
-            extra_intent = dict(intent_for_search or intent_data or {})
-            cons = extra_intent.get("constraints") or {}
-            cons["count"] = 6
-            extra_intent["constraints"] = cons
-            extra = prefer_amazon_first(build_product_candidates(extra_intent))
-            # Merge + dedupe by URL/title
-            seen, merged = set(), []
-            for row in (product_candidates or []) + (extra or []):
-                k = (row.get("url") or "")[:120] or (row.get("title") or row.get("name") or "")
-                if k and k not in seen:
-                    seen.add(k); merged.append(row)
-            product_candidates = merged
-        except Exception as e:
-            logger.warning("[Products] more-options expansion failed: {}", e)
-
-    # --- DEBUG: show first candidate URLs ---
-    try:
-        for i, p in enumerate(product_candidates[:3], 1):
-            logger.info("[Products][DBG] %d) %s | url=%s",
-                        i, (p.get('title') or p.get('name')), (p.get('url') or ''))
     except Exception:
-        pass
+        logger.exception("[ChatOnly] GPT pass failed")
+        _finalize_and_send(user_id, convo_id, "I glitched for a sec. Say it again and I’ll do better. 💅")
+        return
 
-    # Cache whatever we have (even empty) for next turns
-    try:
-        if product_candidates:
-            _set_last_candidates(convo_id, product_candidates[:6])           
-    except Exception:
-        pass
-
-    # Holy grail only if it’s a real product (not a retailer placeholder)
-    if product_candidates and len(product_candidates) == 1:
-        only = product_candidates[0]
-        is_placeholder = bool((only.get("meta") or {}).get("retailer"))
-        if not is_placeholder:
-            reply = f"This is THE one: **{only.get('title') or only.get('name')}** {only.get('url')}"
-            _finalize_and_send(user_id, convo_id, reply, add_cta=False)
-            return
-
-    # Prepare candidates for formatting (fallback to cached if this turn is empty)
-    cands_for_gpt = product_candidates or _get_last_candidates(convo_id, limit=3)
-
-    # Build gpt_products only for opener quip
-    gpt_products: List[Dict] = [
-        {"name": (c.get("title") or c.get("name") or "Product"),
-         "category": (intent_data or {}).get("category",""),
-         "url": (c.get("url") or ""),
-         "review": (c.get("review") or "")}
-        for c in cands_for_gpt[:3]
-    ]
-
-    # Optional opener
-    opener = ""
-    try:
-        if gpt_products:
-            t = " ".join([p["name"] for p in gpt_products]).lower()
-            cat = (intent_data or {}).get("category") or (
-                "fashion" if ("boot" in t or "dress" in t) else ("skincare" if ("spf" in t or "serum" in t) else "home")
-            )
-            opener = render_oneliner_with_link(
-                category=cat, prefer_tag="rec",
-                rec_product_name=gpt_products[0]["name"],
-                rec_affiliate_url=linkwrap.convert_to_geniuslink(gpt_products[0]["url"]) if gpt_products[0]["url"] else "",
-            ) or ""
-    except Exception:
-        logger.info("[Oneliner] skipped")
-
-    body = _format_numbered_with_urls(product_candidates, limit=3)
-    if not body:
-        body = "I can’t pull the product URLs right now. Want me to try a different retailer or budget?"
-
-    reply = (opener + "\n" + body).strip() if opener and len(opener) < 120 else body
-    reply = _fix_cringe_opening(reply)
-    _finalize_and_send(user_id, convo_id, reply, add_cta=False)
-    return
-  
 # ---------------------------------------------------------------------- #
 # Debug and re-engagement jobs
 # ---------------------------------------------------------------------- #
