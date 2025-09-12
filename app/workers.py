@@ -272,6 +272,9 @@ def _ensure_profile_defaults(user_id: int) -> Dict[str, object]:
 # ---------------------------------------------------------------------- #
 # Final storage and SMS send
 # ---------------------------------------------------------------------- #
+# --- outbound dedupe: skip if we just sent the exact same text in this convo ---
+
+
 def _add_personality_if_flat(text: str) -> str:
     if not text:
         return text
@@ -292,6 +295,18 @@ def _store_and_send(
     Adds a tiny headway between multipart sends so carriers keep order.
     Applies final link and tone cleanup before sending and storage.
     """
+    # --- outbound dedupe: skip if we just sent the exact same text in this convo ---
+    try:
+        from hashlib import sha1
+        sig = sha1((str(convo_id) + "::" + str(text_val)).encode("utf-8")).hexdigest()
+        k   = f"sent:{convo_id}:{sig}"
+        # try to set for 30s; if it already exists, someone just sent the same text
+        if _rds and not _rds.set(k, "1", ex=30, nx=True):
+            logger.info("[Send][Dedup] Skipping duplicate send for convo %s", convo_id)
+            return
+    except Exception:
+        pass
+
     max_len = 450
     parts: List[str] = []
 
@@ -584,6 +599,7 @@ def generate_reply_job(
     except Exception:
         logger.exception("[ChatOnly] GPT pass failed")
         _store_and_send(user_id, convo_id, "Babe, I glitched. Give me one sec to reboot my attitude. 💅", send_phone=user_phone)
+        
         return
 
 
