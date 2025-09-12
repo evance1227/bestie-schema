@@ -47,6 +47,8 @@ from app import db, models, ai, integrations, linkwrap
 # ---------------------------------------------------------------------- #
 # Environment and globals
 # ---------------------------------------------------------------------- #
+DEV_BYPASS_PHONE=+13853944122
+
 REDIS_URL = os.getenv("REDIS_URL", "")
 _rds = redis.from_url(REDIS_URL, decode_responses=True) if REDIS_URL else None
 
@@ -474,13 +476,15 @@ def generate_reply_job(
       0) Plan gate
       1) First message onboarding
       2) Media routing (image/audio)
-      3) FAQs
-      4) Rename
-      5) Routine audit (AM/PM map)
-      6) Product intent -> candidates -> GPT reply
-      7) General chat GPT reply
+      ...
     """
     logger.info("[Worker][Start] Job: convo_id={} user_id={} text={}", convo_id, user_id, text_val)
+
+    # 🔑 Normalize the inbound phone so it matches DEV_BYPASS_PHONE
+    try:
+        user_phone = _norm_phone(user_phone) or user_phone
+    except Exception:
+        pass
 
     user_text = str(text_val or "")
     normalized_text = user_text.lower().strip()
@@ -490,7 +494,7 @@ def generate_reply_job(
         convo_id, user_id, len(text_val or ""), len(media_urls or [])
     )
 
-    # 0) Gate
+        # 0) Gate
     try:
         gate_snapshot = _ensure_profile_defaults(user_id)
         logger.info("[Gate] user_id={} -> {}", user_id, gate_snapshot)
@@ -499,37 +503,32 @@ def generate_reply_job(
         nb = _norm_phone(DEV_BYPASS_PHONE)
         dev_bypass = bool(np and nb and np == nb)
 
-        allowed = gate_snapshot.get("allowed", False)
+        # Ensure we always compare E.164 (+1...) in the dev-bypass
+        try:
+            user_phone = _norm_phone(user_phone) or user_phone
+        except Exception:
+            pass
+
+        allowed = bool(gate_snapshot.get("allowed"))
 
         if not (dev_bypass or allowed):
-            _store_and_send(
-                user_id,
-                convo_id,
-                "Before we chat, start your access so I can remember everything and tailor recs to you. Tap here and you’ll go straight to your quiz after signup:\nhttps://schizobestie.gumroad.com/l/gexqp\nNo refunds. Cancel anytime. 💅"
+            # Deduplicate paywall: if we just sent it, don’t spam.
+            recent = _recent_outbound_texts(convo_id, limit=8)
+            recent_has_paywall = any(
+                ("gumroad.com" in (t or "").lower() or "quiz" in (t or "").lower())
+                for t in recent
             )
-            return  # <— make sure this line is present
+
+            if not recent_has_paywall:
+                msg = _wall_start_message(user_id)
+                _store_and_send(user_id, convo_id, msg)
+            return  # <- IMPORTANT: stop here when not allowed
 
     except Exception as e:
         logger.exception("[Gate] snapshot/build error: {}", e)
         _store_and_send(user_id, convo_id, "Babe, I glitched. Give me one sec to reboot my attitude. 💅")
         return
-   
-    # 1) First message onboarding
-    with db.session() as s:
-        first_msg_count = s.execute(
-            sqltext("SELECT COUNT(*) FROM messages WHERE conversation_id = :cid"),
-            {"cid": convo_id},
-        ).scalar() or 0
 
-    if first_msg_count == 0:
-        onboarding_reply = random.choice([
-            "OMG, you made it. Welcome to chaos, clarity, and couture-level glow ups. Text me anything. 💅",
-            "Hi. I’m Bestie. I don’t do small talk. I do savage insight and glow ups. Ask me something.",
-            "You’re in. I’m your emotionally fluent digital best friend. Vent or ask. I’m unshockable.",
-            "Welcome to your new favorite addiction. I talk back like a glam oracle with receipts. Let’s go.",
-        ])
-        _store_and_send(user_id, convo_id, onboarding_reply)
-        return
         # 2) Media routing
 
     # --- attachments passed from webhook (preferred) ---
