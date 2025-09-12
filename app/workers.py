@@ -29,7 +29,6 @@ import time
 import requests
 import json
 from app.ai import generate_contextual_closer
-from typing import Optional, List
 from typing import Optional, List, Dict, Tuple
 from datetime import datetime, timezone, timedelta
 from urllib.parse import quote_plus
@@ -47,8 +46,6 @@ from app import db, models, ai, integrations, linkwrap
 # ---------------------------------------------------------------------- #
 # Environment and globals
 # ---------------------------------------------------------------------- #
-DEV_BYPASS_PHONE=+13853944122
-
 REDIS_URL = os.getenv("REDIS_URL", "")
 _rds = redis.from_url(REDIS_URL, decode_responses=True) if REDIS_URL else None
 
@@ -76,7 +73,6 @@ BESTIE_PRODUCT_CTA_ENABLED = os.getenv("BESTIE_PRODUCT_CTA_ENABLED", "0").lower(
 VIP_COOLDOWN_MIN = int(os.getenv("VIP_COOLDOWN_MIN", "20"))
 VIP_DAILY_MAX    = int(os.getenv("VIP_DAILY_MAX", "2"))
 _VIP_STOP        = re.compile(r"(stop( trying)? to sell|don'?t sell|no vip|quit pitching|stop pitching)", re.I)
-VIP_SOFT_ENABLED = (os.getenv("VIP_SOFT_ENABLED") or "0").strip() in ("1", "true", "yes")
 
 def _maybe_inject_vip_by_convo(reply: str, convo_id: int, user_text: str) -> str:
     # VIP not used in this product anymore; keep as hard no-op
@@ -284,12 +280,18 @@ def _add_personality_if_flat(text: str) -> str:
         text = opener + "\n" + text
     return text
 
-def _store_and_send(user_id: int, convo_id: int, text_val: str) -> None:
+# after
+def _store_and_send(
+    user_id: int,
+    convo_id: int,
+    text_val: str,
+    send_phone: Optional[str] = None,
+) -> None:
     """
     Single place to store and send. Splits long messages to ~450 chars with [1/2] prefix.
     Adds a tiny headway between multipart sends so carriers keep order.
     Applies final link and tone cleanup before sending and storage.
-    """    
+    """
     max_len = 450
     parts: List[str] = []
 
@@ -299,16 +301,17 @@ def _store_and_send(user_id: int, convo_id: int, text_val: str) -> None:
 
     # ==== Final shaping ====
     text_val = _add_personality_if_flat(text_val)
-    text_val = wrap_all_affiliates(text_val)   # SYL + Geniuslink wrapping
-    text_val = ensure_not_link_ending(text_val)
+    text_val = wrap_all_affiliates(text_val)      # affiliate/link wrap if you call it here
+    text_val = ensure_not_link_ending(text_val)   # no naked URL at end
 
     # ==== One-time debug marker ====
     DEBUG_MARKER = os.getenv("DEBUG_MARKER", "")
     if DEBUG_MARKER:
         text_val = text_val.rstrip() + f"\n{DEBUG_MARKER}"
 
-    # ==== POST to GHL ====
-    user_phone = os.getenv("TEST_PHONE") or "+15555555555"
+    # ==== POST to GHL (use the real inbound phone if provided) ====
+    # Normalize: prefer job-supplied phone; fall back to TEST_PHONE only for dev
+    user_phone = _norm_phone(send_phone) or _norm_phone(os.getenv("TEST_PHONE")) or "+15555555555"
     GHL_WEBHOOK_URL = os.getenv("GHL_OUTBOUND_WEBHOOK_URL")
     if GHL_WEBHOOK_URL:
         ghl_payload = {
@@ -319,12 +322,14 @@ def _store_and_send(user_id: int, convo_id: int, text_val: str) -> None:
         }
         try:
             resp = requests.post(GHL_WEBHOOK_URL, json=ghl_payload, timeout=8)
-            logger.info("[GHL_SEND] status={} body={}",
-                        getattr(resp, "status_code", None),
-                        (getattr(resp, "text", "") or "")[:200])
+            logger.info(
+                "[GHL_SEND] status={} body={}",
+                getattr(resp, "status_code", None),
+                (getattr(resp, "text", "") or "")[:200],
+            )
         except Exception as e:
             logger.warning("[GHL_SEND] Failed to POST to GHL: {}", e)
-      
+
     # ==== Break into SMS chunks ====
     while len(text_val) > max_len:
         split_point = text_val[:max_len].rfind(" ")
@@ -361,61 +366,7 @@ def _store_and_send(user_id: int, convo_id: int, text_val: str) -> None:
                 time.sleep(SMS_PART_DELAY_MS / 1000.0)
         except Exception:
             pass
-# ---------------------------------------------------------------------- #
-# Finalize + send (formatting, links, optional CTA - OFF by default)
-# ---------------------------------------------------------------------- #
-def _finalize_and_send(
-    user_id: int,
-    convo_id: int,
-    reply: str,
-    *,
-    add_cta: bool = False,
-    force_send: bool = True,
-) -> None:
-    """
-    Final formatting before a single send.
-    - Link hygiene (Amazon + optional Geniuslink rewrite)
-    - Personality injection if reply is flat
-    - Optional CTA line (off by default)
-    - Final cleanup for SMS delivery
-    """
-    from app.linkwrap import wrap_all_affiliates, ensure_not_link_ending
-
-    def _add_personality_if_flat(t: str) -> str:
-        if not t:
-            return t
-        if t.count("http") >= 2 and len(t) < 480:
-            opener = "Got you, babe. Here are a couple that actually work:"
-            t = opener + "\n" + t
-        return t
-
-    reply = (reply or "").strip()
-    if not reply:
-        logger.warning("[Worker][Send] Empty reply. Skipping.")
-        return
-
-    try:
-        # Optional CTA tail (globally disabled unless env enabled)
-        if add_cta and BESTIE_PRODUCT_CTA_ENABLED:
-            reply += "\n\nPS: Savings tip: try WELCOME10 or search brand + coupon."
-    except Exception:
-        pass
-
-    # === Link and tone hygiene ===
-    try:
-        reply = _strip_link_placeholders(reply)
-        reply = _strip_amazon_search_links(reply)
-        reply = _add_personality_if_flat(reply)
-        # monetize/normalize all links GPT produced
-        from app import linkwrap as _lw
-        reply = _lw.wrap_all_affiliates(reply)
-        reply = ensure_not_link_ending(reply)
-
-    except Exception as e:
-        logger.warning("[Worker][Linkwrap/Tone] Error in reply cleanup: {}", e)
-
-    _store_and_send(user_id, convo_id, reply)
-
+   
 # ---------------------------------------------------------------------- #
 # Rename flow
 # ---------------------------------------------------------------------- #
@@ -494,7 +445,7 @@ def generate_reply_job(
         convo_id, user_id, len(text_val or ""), len(media_urls or [])
     )
 
-        # 0) Gate
+    # 0) Gate
     try:
         gate_snapshot = _ensure_profile_defaults(user_id)
         logger.info("[Gate] user_id={} -> {}", user_id, gate_snapshot)
@@ -502,12 +453,6 @@ def generate_reply_job(
         np = _norm_phone(user_phone)
         nb = _norm_phone(DEV_BYPASS_PHONE)
         dev_bypass = bool(np and nb and np == nb)
-
-        # Ensure we always compare E.164 (+1...) in the dev-bypass
-        try:
-            user_phone = _norm_phone(user_phone) or user_phone
-        except Exception:
-            pass
 
         allowed = bool(gate_snapshot.get("allowed"))
 
@@ -518,11 +463,14 @@ def generate_reply_job(
                 ("gumroad.com" in (t or "").lower() or "quiz" in (t or "").lower())
                 for t in recent
             )
+            if recent_has_paywall:
+                logger.info("[Gate] Paywall already sent recently; skipping re-send.")
+                return
 
-            if not recent_has_paywall:
-                msg = _wall_start_message(user_id)
-                _store_and_send(user_id, convo_id, msg)
-            return  # <- IMPORTANT: stop here when not allowed
+            msg = _wall_start_message(user_id)
+            _store_and_send(user_id, convo_id, msg, send_phone=user_phone)
+            return  # <- stop here when not allowed
+
 
     except Exception as e:
         logger.exception("[Gate] snapshot/build error: {}", e)
@@ -538,24 +486,25 @@ def generate_reply_job(
         try:
             if any(lower.endswith(ext) for ext in [".jpg", ".jpeg", ".png", ".gif", ".webp"]):
                 logger.info("[Worker][Media] Attachment image detected: {}", first)
-                reply = ai.describe_image(first)
-                _finalize_and_send(user_id, convo_id, reply, add_cta=False)
+                reply = ai.describe_image(first)              # <-- was transcribe_and_respond
+                _store_and_send(user_id, convo_id, reply, send_phone=user_phone)
                 return
+
             if any(lower.endswith(ext) for ext in [".mp3", ".m4a", ".wav", ".ogg"]):
                 logger.info("[Worker][Media] Attachment audio detected: {}", first)
                 reply = ai.transcribe_and_respond(first, user_id=user_id)
-                _finalize_and_send(user_id, convo_id, reply, add_cta=False)
+                _store_and_send(user_id, convo_id, reply, send_phone=user_phone)
                 return
             # Extensionless: try image, then audio
             logger.info("[Worker][Media] Attachment extless; trying image describe: {}", first)
             try:
                 reply = ai.describe_image(first)
-                _finalize_and_send(user_id, convo_id, reply, add_cta=False)
+                _store_and_send(user_id, convo_id, reply, send_phone=user_phone)
                 return
             except Exception:
                 logger.info("[Worker][Media] describe_image failed; trying audio transcribe: {}", first)
                 reply = ai.transcribe_and_respond(first, user_id=user_id)
-                _finalize_and_send(user_id, convo_id, reply, add_cta=False)
+                _store_and_send(user_id, convo_id, reply, send_phone=user_phone)
                 return
         except Exception as e:
             logger.warning("[Worker][Media] Attachment handling failed: {}", e)
@@ -566,12 +515,12 @@ def generate_reply_job(
         if any(ext in normalized_text for ext in [".jpg", ".jpeg", ".png", ".gif", ".webp"]):
             logger.info("[Worker][Media] Image URL detected, describing.")
             reply = ai.describe_image(user_text.strip())
-            _finalize_and_send(user_id, convo_id, reply, add_cta=False)
+            _store_and_send(user_id, convo_id, reply, send_phone=user_phone)
             return
         if any(ext in normalized_text for ext in [".mp3", ".m4a", ".wav", ".ogg"]):
             logger.info("[Worker][Media] Audio URL detected, transcribing.")
             reply = ai.transcribe_and_respond(user_text.strip(), user_id=user_id)
-            _finalize_and_send(user_id, convo_id, reply, add_cta=False)
+            _store_and_send(user_id, convo_id, reply, send_phone=user_phone)
             return
 
     # 3) FAQs (pricing corrected)
@@ -629,13 +578,14 @@ def generate_reply_job(
             reply = "Babe, I glitched. Say it again and I’ll do better. 💅"
 
         reply = _fix_cringe_opening(reply)
-        _finalize_and_send(user_id, convo_id, reply, add_cta=False)
+        _store_and_send(user_id, convo_id, reply, send_phone=user_phone)
         return
 
     except Exception:
         logger.exception("[ChatOnly] GPT pass failed")
-        _finalize_and_send(user_id, convo_id, "I glitched for a sec. Say it again and I’ll do better. 💅")
+        _store_and_send(user_id, convo_id, "Babe, I glitched. Give me one sec to reboot my attitude. 💅", send_phone=user_phone)
         return
+
 
 # ---------------------------------------------------------------------- #
 # Debug and re-engagement jobs
