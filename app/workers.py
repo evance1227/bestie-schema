@@ -369,11 +369,13 @@ def _store_and_send(
         except Exception:
             logger.exception("[Worker][DB] Failed to insert outbound, will still attempt send")
 
-        try:
-            integrations.send_sms_reply(user_id, full_text)
-            logger.success("[Worker][Send] SMS send attempted for user_id={}", user_id)
-        except Exception:
-            logger.exception("[Worker][Send] Exception while calling send_sms_reply")
+        if not USE_GHL_ONLY:
+            try:
+                integrations.send_sms_reply(user_id, full_text)
+                logger.success("[Worker][Send] SMS send attempted for user_id={}", user_id)
+            except Exception:
+                logger.exception("[Worker][Send] Exception while calling send_sms_reply")
+
 
         # tiny pause so carriers preserve ordering
         try:
