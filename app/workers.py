@@ -606,6 +606,16 @@ def generate_reply_job(
     context = {"has_completed_quiz": bool(profile and profile[0])}
 
    # 5) Chat-first (single GPT pass) ---------------------------------------------
+    def _clean_reply(val: Optional[str]) -> Optional[str]:
+        """Normalize a GPT reply to 'None' if it's blank or useless."""
+        s = (val or "").strip()
+        if not s:
+            return None
+        s_lower = s.lower()
+        if s_lower in {"ok", "okay", "k", "👍", "👌"}:
+            return None
+        return s
+
     try:
         system_prompt = (
             "You are Bestie — blunt, witty, stylish, emotionally fluent. Relationship & loyalty first. "
@@ -617,30 +627,39 @@ def generate_reply_job(
 
         reply = ai.generate_reply(
             user_text=user_text,
-            product_candidates=[],        # product pipeline removed
+            product_candidates=[],  # product pipeline removed
             user_id=user_id,
             system_prompt=system_prompt,
             context=context,
         )
-        reply = (reply or "").strip() or None
-        logger.info("[Chat] first pass len=%s", 0 if reply is None else len(reply))
+        reply = _clean_reply(reply)
+        logger.info(
+            "[Chat] first pass len=%s preview=%s",
+            0 if reply is None else len(reply),
+            "None" if reply is None else repr(reply[:120]),
+        )
 
     except Exception as e:
         logger.exception("[ChatOnly] first pass failed: {}", e)
         reply = None
 
-    # --- Second chance: very small instruction if the first pass failed ----------
+    # --- Second chance if still empty -------------------------------------------
     if not reply:
         try:
-            reply = ai.generate_reply(
+            reply2 = ai.generate_reply(
                 user_text=user_text,
                 product_candidates=[],
                 user_id=user_id,
-                system_prompt="Reply helpfully in one short SMS line (<=140 chars). No disclaimers.",
+                system_prompt="Reply helpfully in ~1 SMS line (<=140 chars). No disclaimers.",
                 context=context,
             )
-            reply = (reply or "").strip() or None
-            logger.info("[Chat] second pass len=%s", 0 if reply is None else len(reply))
+            reply2 = _clean_reply(reply2)
+            logger.info(
+                "[Chat] second pass len=%s preview=%s",
+                0 if reply2 is None else len(reply2),
+                "None" if reply2 is None else repr(reply2[:120]),
+            )
+            reply = reply2
         except Exception as e:
             logger.exception("[ChatOnly] second pass failed: {}", e)
             reply = None
@@ -659,6 +678,10 @@ def generate_reply_job(
     reply = _fix_cringe_opening(reply)
     _store_and_send(user_id, convo_id, reply, send_phone=user_phone)
     return
+# ============================================================================
+
+# Debug and re-engagement jobs
+
 
 # ---------------------------------------------------------------------- #
 # Debug and re-engagement jobs
