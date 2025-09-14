@@ -605,7 +605,7 @@ def generate_reply_job(
         ).first()      
     context = {"has_completed_quiz": bool(profile and profile[0])}
 
-    # 5) Chat-first (single GPT pass) ---------------------------------------------
+   # 5) Chat-first (single GPT pass) ---------------------------------------------
     try:
         system_prompt = (
             "You are Bestie — blunt, witty, stylish, emotionally fluent. Relationship & loyalty first. "
@@ -617,25 +617,41 @@ def generate_reply_job(
 
         reply = ai.generate_reply(
             user_text=user_text,
-            product_candidates=[],           # product pipeline removed
+            product_candidates=[],        # product pipeline removed
             user_id=user_id,
             system_prompt=system_prompt,
             context=context,
         )
-        # normalize to None if empty/whitespace
         reply = (reply or "").strip() or None
+        logger.info("[Chat] first pass len=%s", 0 if reply is None else len(reply))
 
     except Exception as e:
-        logger.exception("[ChatOnly] GPT pass failed: {}", e)
+        logger.exception("[ChatOnly] first pass failed: {}", e)
         reply = None
 
+    # --- Second chance: very small instruction if the first pass failed ----------
+    if not reply:
+        try:
+            reply = ai.generate_reply(
+                user_text=user_text,
+                product_candidates=[],
+                user_id=user_id,
+                system_prompt="Reply helpfully in one short SMS line (<=140 chars). No disclaimers.",
+                context=context,
+            )
+            reply = (reply or "").strip() or None
+            logger.info("[Chat] second pass len=%s", 0 if reply is None else len(reply))
+        except Exception as e:
+            logger.exception("[ChatOnly] second pass failed: {}", e)
+            reply = None
+
     # ===================== FINAL SAFETY NET (single place) =======================
-    # If nothing produced a reply, send the friendly “glitched” message and stop.
     if not reply:
         _store_and_send(
-            user_id, convo_id,
+            user_id,
+            convo_id,
             "Babe, I glitched. Say it again and I’ll do better. 💅",
-            send_phone=user_phone
+            send_phone=user_phone,
         )
         return
 
