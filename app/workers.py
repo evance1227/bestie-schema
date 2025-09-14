@@ -48,7 +48,9 @@ from app import db, models, ai, integrations, linkwrap
 # ---------------------------------------------------------------------- #
 REDIS_URL = os.getenv("REDIS_URL", "")
 _rds = redis.from_url(REDIS_URL, decode_responses=True) if REDIS_URL else None
-
+USE_GHL_ONLY = (os.getenv("USE_GHL_ONLY", "1").lower() not in ("0","false","no"))
+SEND_FALLBACK_ON_ERROR = (os.getenv("SEND_FALLBACK_ON_ERROR", "0").lower() in ("1","true","yes"))
+logger.info("[Boot] USE_GHL_ONLY=%s  SEND_FALLBACK_ON_ERROR=%s", USE_GHL_ONLY, SEND_FALLBACK_ON_ERROR)
 # Message pacing so carriers preserve multipart ordering
 SMS_PART_DELAY_MS = int(os.getenv("SMS_PART_DELAY_MS", "800"))
 
@@ -326,7 +328,7 @@ def _store_and_send(
 
     # ==== POST to GHL (use the real inbound phone if provided) ====
     # Normalize: prefer job-supplied phone; fall back to TEST_PHONE only for dev
-    user_phone = _norm_phone(send_phone) or _norm_phone(os.getenv("TEST_PHONE")) or "+15555555555"
+    user_phone = send_phone
     GHL_WEBHOOK_URL = os.getenv("GHL_OUTBOUND_WEBHOOK_URL")
     if GHL_WEBHOOK_URL:
         ghl_payload = {
