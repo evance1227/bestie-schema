@@ -329,32 +329,37 @@ def _store_and_send(
     # ==== POST to GHL (use the real inbound phone if provided) ====
     # Normalize: prefer job-supplied phone; fall back to TEST_PHONE only for dev
    # always use the real phone the webhook passed to the worker; no test fallbacks
+    # ---- Primary send path: GHL; if that fails, fallback to direct sender once ----
     user_phone = _norm_phone(send_phone) if send_phone else None
-    if not USE_GHL_ONLY:
-        try:
-            integrations.send_sms_reply(user_id, text_val)
-            logger.success("[Worker][Send] SMS send attempted for user_id={}", user_id)
-        except Exception:
-            logger.exception("[Worker][Send] Exception while calling send_sms_reply")
-
-    # ==== POST to GHL (use the real inbound phone if provided) ====
     GHL_WEBHOOK_URL = os.getenv("GHL_OUTBOUND_WEBHOOK_URL")
+
+    sent_ok = False
+
     if GHL_WEBHOOK_URL:
-        ghl_payload = {
-            "phone": user_phone,
-            "message": text_val,
-            "user_id": user_id,
-            "convo_id": convo_id
-        }
         try:
+            ghl_payload = {
+                "phone": user_phone,
+                "message": text_val,
+                "user_id": user_id,
+                "convo_id": convo_id
+            }
             resp = requests.post(GHL_WEBHOOK_URL, json=ghl_payload, timeout=8)
-            logger.info(
-                "[GHL_SEND] status={} body={}",
-                getattr(resp, "status_code", None),
-                (getattr(resp, "text", "") or "")[:200],
-            )
+            logger.info("[GHL_SEND] status={} body={}",
+                        getattr(resp, "status_code", None),
+                        (getattr(resp, "text", "") or "")[:200])
+            sent_ok = True
         except Exception as e:
             logger.warning("[GHL_SEND] Failed to POST to GHL: {}", e)
+
+    # Fallback only if the GHL POST did not succeed
+    if not sent_ok:
+        try:
+            integrations.send_sms_reply(user_id, text_val)
+            logger.success("[Worker][Send] Fallback SMS send attempted for user_id={}", user_id)
+            sent_ok = True
+        except Exception:
+            logger.exception("[Worker][Send] Exception while calling fallback send_sms_reply")
+
 
     # ==== Break into SMS chunks ====
     while len(text_val) > max_len:
@@ -484,28 +489,53 @@ def generate_reply_job(
 
         allowed = bool(gate_snapshot.get("allowed"))
 
-        if not (dev_bypass or allowed):
-            # Deduplicate paywall: if we just sent it, don’t spam.
+        # --- DEV BYPASS HARD OVERRIDE -----------------------------------------
+        if dev_bypass:
+            allowed = True
+            logger.info("[Gate][Bypass] forcing allow for DEV phone np=%s nb=%s", np, nb)
+
+        # --- Minimal chat fallback when nothing else produced a reply ----------
+        # (This only sets `reply`; it does NOT send.)
+        if not reply:
+            try:
+                reply = ai.generate_reply(
+                    user_text=user_text,
+                    product_candidates=[],
+                    user_id=user_id,
+                    system_prompt=(
+                        "You are Bestie. Be brief, helpful, stylish, emotionally fluent. "
+                        "Respond in a single SMS (<= 450 chars)."
+                    ),
+                    context={},
+                )
+            except Exception:
+                reply = None
+
+        # --- Paywall if still not allowed (deduped) ---------------------------
+        if not allowed:
             recent = _recent_outbound_texts(convo_id, limit=8)
             recent_has_paywall = any(
-                ("gumroad.com" in (t or "").lower() or "quiz" in (t or "").lower())
+                ("gumroad.com" in (t or "").lower()) or ("quiz" in (t or "").lower())
                 for t in recent
             )
-            if recent_has_paywall:
-                logger.info("[Gate] Paywall already sent recently; skipping re-send.")
-                return
-
-            msg = _wall_start_message(user_id)
-            _store_and_send(user_id, convo_id, msg, send_phone=user_phone)
-            return  # <- stop here when not allowed
-
+            if not recent_has_paywall:
+                msg = _wall_start_message(user_id)
+                _store_and_send(user_id, convo_id, msg, send_phone=user_phone)
+            return  # stop routing when not allowed
 
     except Exception as e:
         logger.exception("[Gate] snapshot/build error: {}", e)
-        _store_and_send(user_id, convo_id, "Babe, I glitched. Give me one sec to reboot my attitude. 💅")
+        _store_and_send(
+            user_id,
+            convo_id,
+            "Babe, I glitched. Give me one sec to reboot my attitude. 💅",
+            send_phone=user_phone,
+        )
         return
 
-        # 2) Media routing
+        # ---------------------------------------------------------------------------
+
+    # 2) Media routing
 
     # --- attachments passed from webhook (preferred) ---
     if media_urls:
