@@ -328,7 +328,16 @@ def _store_and_send(
 
     # ==== POST to GHL (use the real inbound phone if provided) ====
     # Normalize: prefer job-supplied phone; fall back to TEST_PHONE only for dev
-    user_phone = send_phone
+   # always use the real phone the webhook passed to the worker; no test fallbacks
+    user_phone = _norm_phone(send_phone) if send_phone else None
+    if not USE_GHL_ONLY:
+        try:
+            integrations.send_sms_reply(user_id, text_val)
+            logger.success("[Worker][Send] SMS send attempted for user_id={}", user_id)
+        except Exception:
+            logger.exception("[Worker][Send] Exception while calling send_sms_reply")
+
+    # ==== POST to GHL (use the real inbound phone if provided) ====
     GHL_WEBHOOK_URL = os.getenv("GHL_OUTBOUND_WEBHOOK_URL")
     if GHL_WEBHOOK_URL:
         ghl_payload = {
