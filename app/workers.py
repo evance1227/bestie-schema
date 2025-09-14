@@ -635,17 +635,20 @@ def generate_reply_job(
         # NEW GUARD
         if not reply or not str(reply).strip():
             reply = "Babe, I glitched. Say it again and I’ll do better. 💅"
+        # ------------------------------------------------------------------
+# FINAL SAFETY NET:
+# If nothing produced a reply, send a friendly “glitched” message
+# and stop. This guarantees exactly one message back to the user.
+# ------------------------------------------------------------------
+        if not reply or not str(reply).strip():
+            reply = "Babe, I glitched. Say it again and I’ll do better. 💅"
+            _store_and_send(user_id, convo_id, reply, send_phone=user_phone)
+            return
+# ------------------------------------------------------------------
 
         reply = _fix_cringe_opening(reply)
         _store_and_send(user_id, convo_id, reply, send_phone=user_phone)
         return
-
-    except Exception:
-        logger.exception("[ChatOnly] GPT pass failed")
-        _store_and_send(user_id, convo_id, "Babe, I glitched. Give me one sec to reboot my attitude. 💅", send_phone=user_phone)
-        
-        return
-
 
 # ---------------------------------------------------------------------- #
 # Debug and re-engagement jobs
