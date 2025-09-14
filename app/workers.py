@@ -463,7 +463,8 @@ def generate_reply_job(
       ...
     """
     logger.info("[Worker][Start] Job: convo_id={} user_id={} text={}", convo_id, user_id, text_val)
-
+    # initialize reply so UnboundLocalError can never occur
+    reply: Optional[str] = None
     # 🔑 Normalize the inbound phone so it matches DEV_BYPASS_PHONE
     try:
         user_phone = _norm_phone(user_phone) or user_phone
