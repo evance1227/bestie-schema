@@ -49,8 +49,10 @@ from app import db, models, ai, integrations, linkwrap
 REDIS_URL = os.getenv("REDIS_URL", "")
 _rds = redis.from_url(REDIS_URL, decode_responses=True) if REDIS_URL else None
 USE_GHL_ONLY = (os.getenv("USE_GHL_ONLY", "1").lower() not in ("0","false","no"))
-SEND_FALLBACK_ON_ERROR = (os.getenv("SEND_FALLBACK_ON_ERROR", "0").lower() in ("1","true","yes"))
+SEND_FALLBACK_ON_ERROR = True  # keep it True so we still send if GPT path hiccups
+
 logger.info("[Boot] USE_GHL_ONLY=%s  SEND_FALLBACK_ON_ERROR=%s", USE_GHL_ONLY, SEND_FALLBACK_ON_ERROR)
+
 # Message pacing so carriers preserve multipart ordering
 SMS_PART_DELAY_MS = int(os.getenv("SMS_PART_DELAY_MS", "800"))
 
@@ -479,58 +481,47 @@ def generate_reply_job(
         convo_id, user_id, len(text_val or ""), len(media_urls or [])
     )
 
-    # 0) Gate
+        # 0) Gate
     try:
         gate_snapshot = _ensure_profile_defaults(user_id)
         logger.info("[Gate] user_id={} -> {}", user_id, gate_snapshot)
 
+        # normalize phones for bypass compare
+        try:
+            user_phone = _norm_phone(user_phone) or user_phone
+        except Exception:
+            pass
         np = _norm_phone(user_phone)
         nb = _norm_phone(DEV_BYPASS_PHONE)
         dev_bypass = bool(np and nb and np == nb)
 
         allowed = bool(gate_snapshot.get("allowed"))
 
-        # --- DEV BYPASS HARD OVERRIDE -----------------------------------------
-        if dev_bypass:
-            allowed = True
-            logger.info("[Gate][Bypass] forcing allow for DEV phone np=%s nb=%s", np, nb)
-
-        # --- Minimal chat fallback when nothing else produced a reply ----------
-        # (This only sets `reply`; it does NOT send.)
-        if not reply:
-            try:
-                reply = ai.generate_reply(
-                    user_text=user_text,
-                    product_candidates=[],
-                    user_id=user_id,
-                    system_prompt=(
-                        "You are Bestie. Be brief, helpful, stylish, emotionally fluent. "
-                        "Respond in a single SMS (<= 450 chars)."
-                    ),
-                    context={},
-                )
-            except Exception:
-                reply = None
-
-        # --- Paywall if still not allowed (deduped) ---------------------------
-        if not allowed:
+        if not (dev_bypass or allowed):
+            # Deduplicate paywall: if we just sent it, don’t spam.
             recent = _recent_outbound_texts(convo_id, limit=8)
             recent_has_paywall = any(
-                ("gumroad.com" in (t or "").lower()) or ("quiz" in (t or "").lower())
+                ("gumroad.com" in (t or "").lower() or "quiz" in (t or "").lower())
                 for t in recent
             )
-            if not recent_has_paywall:
-                msg = _wall_start_message(user_id)
-                _store_and_send(user_id, convo_id, msg, send_phone=user_phone)
-            return  # stop routing when not allowed
+            if recent_has_paywall:
+                logger.info("[Gate] Paywall already sent recently; skipping re-send.")
+                return
+
+            msg = _wall_start_message(user_id)
+            _store_and_send(user_id, convo_id, msg, send_phone=user_phone)
+            return  # stop here when not allowed
+
+        # dev bypass note
+        if dev_bypass:
+            logger.info("[Gate][Bypass] forcing allow for DEV phone np=%s nb=%s", np, nb)
 
     except Exception as e:
         logger.exception("[Gate] snapshot/build error: {}", e)
         _store_and_send(
-            user_id,
-            convo_id,
+            user_id, convo_id,
             "Babe, I glitched. Give me one sec to reboot my attitude. 💅",
-            send_phone=user_phone,
+            send_phone=user_phone
         )
         return
 
@@ -614,41 +605,44 @@ def generate_reply_job(
         ).first()      
     context = {"has_completed_quiz": bool(profile and profile[0])}
 
-    # 5) Chat-first (single GPT pass)
+    # 5) Chat-first (single GPT pass) ---------------------------------------------
     try:
         system_prompt = (
             "You are Bestie — blunt, witty, stylish, emotionally fluent. Relationship & loyalty first. "
             "Answer like a ride-or-die best friend. Be punchy, specific, no therapy clichés. "
-            "If you recommend products, include 1–3 picks as a numbered list with **bold names** + a direct URL "
+            "If you recommend products, include 1–3 picks as a numbered list with **bold names** + a direct URL. "
             "(no search links). Prefer trusted retailers (Nordstrom, Free People, Sephora, Ulta, Amazon DP pages). "
             "Keep the whole reply under ~450 characters."
         )
 
         reply = ai.generate_reply(
             user_text=user_text,
+            product_candidates=[],           # product pipeline removed
             user_id=user_id,
-            product_candidates=[],       # no product pipeline
             system_prompt=system_prompt,
             context=context,
         )
+        # normalize to None if empty/whitespace
+        reply = (reply or "").strip() or None
 
-        # NEW GUARD
-        if not reply or not str(reply).strip():
-            reply = "Babe, I glitched. Say it again and I’ll do better. 💅"
-        # ------------------------------------------------------------------
-# FINAL SAFETY NET:
-# If nothing produced a reply, send a friendly “glitched” message
-# and stop. This guarantees exactly one message back to the user.
-# ------------------------------------------------------------------
-        if not reply or not str(reply).strip():
-            reply = "Babe, I glitched. Say it again and I’ll do better. 💅"
-            _store_and_send(user_id, convo_id, reply, send_phone=user_phone)
-            return
-# ------------------------------------------------------------------
+    except Exception as e:
+        logger.exception("[ChatOnly] GPT pass failed: {}", e)
+        reply = None
 
-        reply = _fix_cringe_opening(reply)
-        _store_and_send(user_id, convo_id, reply, send_phone=user_phone)
+    # ===================== FINAL SAFETY NET (single place) =======================
+    # If nothing produced a reply, send the friendly “glitched” message and stop.
+    if not reply:
+        _store_and_send(
+            user_id, convo_id,
+            "Babe, I glitched. Say it again and I’ll do better. 💅",
+            send_phone=user_phone
+        )
         return
+
+    # polish + send exactly once
+    reply = _fix_cringe_opening(reply)
+    _store_and_send(user_id, convo_id, reply, send_phone=user_phone)
+    return
 
 # ---------------------------------------------------------------------- #
 # Debug and re-engagement jobs
