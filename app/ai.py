@@ -435,6 +435,7 @@ def build_messages(
     return msgs
   
 # ------------------ Core: generate_reply ------------ #
+# ------------------ Core: generate_reply ------------ #
 def generate_reply(
     user_text: str,
     product_candidates: Optional[List[Dict]] = None,
@@ -444,6 +445,7 @@ def generate_reply(
 ) -> str:
     """
     Single entrypoint used by workers.py. Returns one SMS-ready reply string.
+    Answer-first. No surveys. If it's a product ask, give real picks.
     """
     # 1) Build messages (persona + history + current ask)
     session_goal = (context or {}).get("session_goal")
@@ -460,122 +462,55 @@ def generate_reply(
     When product help is requested or implied:
     - Answer first. Do not ask for budget/preferences. No surveys.
     - Return 2–3 options total, each with a tight one-liner benefit (use PRODUCT ONE-LINERS vibe).
-    - Lead with the BEST-IN-CLASS pick. Then a smart mid-tier. Then an actually-good budget alternative.
+    - Lead with the BEST-IN-CLASS pick. Then a smart Mid. Then a real Budget that still works.
     - If the user says “which one”, “only buy one”, or “best” — pick EXACTLY ONE and justify in 1–2 lines.
     - Do NOT write the literal word "URL". If links are present, keep them; otherwise omit.
     - Keep the whole reply ≤ 450 chars. No disclaimers.
     """.strip()
 
-    force_choice = any(
-        k in (user_text or "").lower()
-        for k in ["which one", "only buy one", "only afford", "best one", "pick one"]
-    )
-    if force_choice and messages and messages[0]["role"] == "system":
-        messages[0]["content"] = f"{messages[0]['content']}\n\nUser may only buy one: pick exactly one and explain why in 1–2 lines."
+    # Tiny domain nudge (hair) so she stops hand-waving
+    hair_nudge = ""
+    tlow = (user_text or "").lower()
+    if "hair" in tlow and any(k in tlow for k in ("regrow","growth","extensions","perimenopause","thinning","hair loss")):
+        hair_nudge = (
+            "\nFor hair regrowth after extensions/perimenopause: mention 5% minoxidil nightly, "
+            "ketoconazole shampoo 2–3x/wk, and a daytime peptide serum; note sensitive-scalp caution."
+        )
 
     # Replace system content if workers passed an explicit system_prompt
     if system_prompt and messages and messages[0]["role"] == "system":
-        messages[0]["content"] = f"{system_prompt}\n\n{shopping_guidance}"
+        messages[0]["content"] = f"{system_prompt}\n\n{shopping_guidance}{hair_nudge}"
     else:
         # Append guidance to composed persona
-        messages[0]["content"] = f"{messages[0]['content']}\n\n{shopping_guidance}"
-        # --- Tutorial / how-to guard: avoid Amazon search links for technique questions ---
-    is_tutorial = any(
-        k in (user_text or "").lower()
-        for k in ["how to", "application", "apply", "tips", "tutorial", "best way to", "how best to"]
-    )
-    if (not product_candidates) and is_tutorial and messages and messages[0]["role"] == "system":
-        messages[0]["content"] = (
-            f"{messages[0]['content']}\n\n"
-            "When giving technique tips, do NOT include Amazon search links. "
-            "If you include a link, prefer a reputable brand how-to page or a YouTube tutorial. "
-            "If you're not sure, skip the link and keep the advice concise and practical."
-        )
-    # --- Style booster for non-product replies: keep it warm, witty, short ---
-    is_tutorial = any(
-        k in (user_text or "").lower()
-        for k in ["how to", "application", "apply", "tips", "tutorial", "best way to", "how best to"]
-    )
-    has_products = bool(product_candidates)
-
-    if (not has_products) and messages and messages[0]["role"] == "system":
-        messages[0]["content"] = (
-            f"{messages[0]['content']}\n\n"
-            "Style for chat:\n"
-            "- Warm, witty, one playful quip or emoji max.\n"
-            "- 1–3 short lines, no therapy clichés.\n"
-            "- Offer a tiny next step or a question back."
-        )
-    def rewrite_as_three_picks(user_text: str, base_reply: str, system_prompt: str) -> str:
-        """
-        Gentle nudge: if the first reply dodged, ask GPT to rewrite with 3 concrete picks.
-                No catalogs or rules; still freeform GPT.
-                """
-        import os, logging
-        from openai import OpenAI
-
-        client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-        model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-
-        rescue_system = (
-            system_prompt +
-            "\nRewrite your advice into a decisive, helpful SMS with 2–3 concrete product/treatment picks "
-            "(BEST → Mid → Budget) each with a crisp one-liner benefit. "
-            "No surveys. One playful quip allowed. ≤ 450 chars. If links appear, keep them."
-        )
-
-        try:
-            resp = client.chat.completions.create(
-                model=model,
-                messages=[
-                    {"role": "system", "content": rescue_system},
-                    {"role": "user", "content": user_text},
-                    {"role": "assistant", "content": base_reply or ""},
-                    {"role": "user", "content": "Rewrite that into real picks now."},
-                ],
-                temperature=float(os.getenv("OPENAI_TEMP", "0.6")),
-                max_tokens=int(os.getenv("OPENAI_MAXTOK", "260")),
-            )
-            text = (resp.choices[0].message.content or "").strip()
-            return text or base_reply
-        
-        except Exception:
-                logging.exception("[AI] rescue pass failed")
-                return base_reply        
-            
-    # If user asks 'which one' or budget-limited, force a single pick with justification
-    force_choice = any(
-        k in (user_text or "").lower()
-        for k in ["which one", "only buy one", "only afford", "best one", "pick one"]
-    )
-    if force_choice and messages and messages[0]["role"] == "system":
-        messages[0]["content"] = f"{messages[0]['content']}\n\nUser may only buy one: pick exactly one and explain why in 1–2 lines."
+        messages[0]["content"] = f"{messages[0]['content']}\n\n{shopping_guidance}{hair_nudge}"
 
     # 3) Call OpenAI (prefer app.integrations if present)
     text_out = ""
     try:
-        from app.integrations import openai_complete  # prefer centralized pipeline
+        from app.integrations import openai_complete  # centralized path
         text_out = openai_complete(messages=messages, user_id=user_id, context=context)
     except Exception as e:
         logger.info("[AI] Falling back to direct OpenAI call: {}", e)
         if CLIENT is None or not os.getenv("OPENAI_API_KEY"):
-            # super low-tech fallback
+            # ultra fallback: echo with tiny nudge
             if product_candidates:
                 p = product_candidates[0]
                 text_out = f"{p.get('name','Product')} — easy win. {p.get('url','')}"
             else:
-                text_out = f"{user_text[:40]}… I’ve got you. Let’s sort this fast."
+                text_out = f"{(user_text or '')[:40]}… I’ve got you."
         else:
             resp = CLIENT.chat.completions.create(
-            model=OPENAI_MODEL,
-            messages=messages,
-            temperature=float(os.getenv("OPENAI_TEMP", "0.6")),
-            max_tokens=int(os.getenv("OPENAI_MAXTOK", "260")),
-        )
+                model=OPENAI_MODEL,
+                messages=messages,
+                temperature=float(os.getenv("OPENAI_TEMP", "0.6")),
+                max_tokens=int(os.getenv("OPENAI_MAXTOK", "260")),
+            )
+            # *** THIS LINE WAS MISSING IN YOUR FILE — caused empty replies ***
+            text_out = (resp.choices[0].message.content or "").strip()
 
+    text = text_out or ""
 
     # 4) Tone rescue: banned opener and cringe rewrite if needed
-    text = text_out or ""
     lines = [l for l in text.splitlines() if l.strip()]
     if lines:
         first = lines[0].lower()
@@ -592,10 +527,13 @@ def generate_reply(
     text = rewrite_if_cringe(text)
     text = _sanitize_output(text)
 
-    # 5) Update memory
-    _remember_turn(user_id, "user", user_text)
-    _remember_turn(user_id, "assistant", text)
-    
+    # 5) Memory
+    _remember_turn(user_id, "user", user_text or "")
+    _remember_turn(user_id, "assistant", text or "")
+
+    # 6) Return (your old function forgot to return anything)
+    return text
+   
 # ------------------ Multimodal routes --------------- #
 def describe_image(image_url: str) -> str:
     """Analyze an image and answer in Bestie voice."""
