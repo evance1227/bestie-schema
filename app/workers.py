@@ -279,16 +279,10 @@ def _mini_fallback_reply(user_text: str) -> str:
     Keep it friendly, actionable, and short (<140 chars).
     """
     t = (user_text or "").lower()
-    # light heuristics to feel situational
-    if any(w in t for w in ("boot", "shoe", "sneaker", "heel")):
-        return ("Got you. What vibe—western, sleek, or everyday—and any price ceiling? "
-                "I’ll pull 3 picks fast.")
-    if any(w in t for w in ("dress", "outfit", "top", "jeans", "skirt")):
-        return ("Tell me the vibe (casual, concert, date night) + budget and I’ll pull 3 looks.")
-    if "help" in t or "advice" in t:
-        return "Tell me the goal in one line and the constraint (time, $, vibe). I’ll map next steps."
-    # plain catch-all
-    return "Got you. Give me 1–2 specifics (goal + budget/vibe) and I’ll get you options."
+    if any(w in t for w in ("boot", "shoe", "sneaker", "heel", "dress", "outfit", "top", "jeans", "skirt")):
+        return "Got you. What’s the outcome you want and any must-avoid? I’ll map a quick next step."
+    # general catch-all
+    return "Got you. Tell me the outcome you want in one line and any constraint (time/energy). I’ll map next steps."
                                      
 # ---------------------------------------------------------------------- #
 # Final storage and SMS send
@@ -335,8 +329,10 @@ def _store_and_send(
 
     # ==== Final shaping ====
     text_val = _add_personality_if_flat(text_val)
-    text_val = wrap_all_affiliates(text_val)      # affiliate/link wrap if you call it here
-    text_val = ensure_not_link_ending(text_val)   # no naked URL at end
+    text_val = _strip_link_placeholders(text_val)   # <--- add
+    text_val = _strip_amazon_search_links(text_val) # <--- add
+    text_val = wrap_all_affiliates(text_val)
+    text_val = ensure_not_link_ending(text_val)
 
     # ==== One-time debug marker ====
     DEBUG_MARKER = os.getenv("DEBUG_MARKER", "")
@@ -487,6 +483,27 @@ def _clean_reply(text: Optional[str]) -> Optional[str]:
 
     # Non-destructive guard: never turn real content into ""
     return t or text
+
+# --- De-productize / no-briefing scrubs --------------------------------------
+import re  # no-op if already imported at top
+
+def _deproductize(text: Optional[str]) -> Optional[str]:
+    """
+    Remove briefing-y asks (options/budget/vibe/specifics) and normalize tone
+    so replies feel like a friend, not a form. Non-destructive: never returns ""
+    if the original had content.
+    """
+    if text is None:
+        return None
+    s = (text or "").strip()
+    # hard deletes for stock lines
+    s = re.sub(r"(?i)\b(give|share)\s+(me\s+)?(1\s*[-–]\s*2|one\s*[-–]\s*two|\d+)\s+specifics.*$", "", s).strip()
+    s = re.sub(r"(?i)\btell me .*constraint.*$", "", s).strip()
+    # soften leftover lexicon
+    s = re.sub(r"(?i)\b(options?|picks)\b", "next step", s)
+    s = re.sub(r"(?i)\b(budget|price|vibe)\b", "context", s)
+    s = re.sub(r"\s{2,}", " ", s).strip()
+    return s or text
 
 # ---------------------------------------------------------------------- #
 # Main worker entrypoint
@@ -647,24 +664,16 @@ def generate_reply_job(
     context = {"has_completed_quiz": bool(profile and profile[0])}
 
    # 5) Chat-first (single GPT pass) ---------------------------------------------
-    def _clean_reply(val: Optional[str]) -> Optional[str]:
-        """Normalize a GPT reply to 'None' if it's blank or useless."""
-        s = (val or "").strip()
-        if not s:
-            return None
-        s_lower = s.lower()
-        if s_lower in {"ok", "okay", "k", "👍", "👌"}:
-            return None
-        return s
 
     try:
         system_prompt = (
-        "You are Bestie — blunt, witty, stylish, emotionally fluent. "
-        "Talk like a ride-or-die best friend. "
-        "No numbered lists, no product catalogs, no URLs. "
-        "Keep it conversational, supportive, and fun. "
-        "Reply in a single SMS length (<= 450 characters)."
-    )
+    "You are Bestie — blunt, witty, emotionally fluent. "
+    "Talk like a ride-or-die best friend. "
+    "Do not ask for budget/price/vibe or ‘specifics.’ "
+    "No product catalogs and no URLs unless the user explicitly asks for shopping help. "
+    "Keep it conversational, supportive, and fun. "
+    "Reply in a single SMS length (<= 450 characters)."
+)
 
         raw = ai.generate_reply(
             user_text=user_text,
@@ -676,6 +685,7 @@ def generate_reply_job(
         # clean, but never lose the message
         clean = _clean_reply(raw)
         reply = (clean.strip() if clean else (raw.strip() if raw else ""))
+        reply = _deproductize(reply)
 
         logger.info(
             "[Chat] first pass len={} preview={}",
@@ -696,26 +706,27 @@ def generate_reply_job(
 # --- Second chance if still empty ------------------------------------------------
     if not reply:
         try:
-            reply2 = ai.generate_reply(
-            user_text=user_text,
-            product_candidates=[],
-            user_id=user_id,
-            system_prompt=(
+            system_prompt = (
                 "You are Bestie — casual, witty, emotionally fluent. "
-                "No product talk, no ‘options’, no budget/price/vibe questions. "
+                "No product talk, no ‘options,’ no budget/price/vibe questions. "
                 "If the user just greets, greet back playfully and ask one open-ended question. "
                 "Keep it to one SMS (<= 450 chars)."
-            ),
-            context=context,
-        )
+            )
 
+            raw2 = ai.generate_reply(
+                user_text=user_text,
+                product_candidates=[],
+                user_id=user_id,
+                system_prompt=system_prompt,
+                context=context,
+            )
 
-            # clean, but never lose the message
-            clean2 = _clean_reply(reply2)
-            reply2 = (clean2.strip() if clean2 else (reply2.strip() if reply2 else ""))
+            # scrub briefing/optiony phrasing and normalize without ever making it blank
+            clean2 = _clean_reply(_deproductize(raw2))
+            reply2 = (clean2.strip() if clean2 else (raw2.strip() if raw2 else ""))
 
             logger.info(
-                "[Chat] second pass len={} preview={}",
+                "[Chat] second pass len=%s preview=%s",
                 0 if not reply2 else len(reply2),
                 "None" if not reply2 else repr(reply2[:120]),
             )
