@@ -631,25 +631,6 @@ def generate_reply_job(
             _store_and_send(user_id, convo_id, reply, send_phone=user_phone)
             return
 
-    # 3) FAQs (pricing corrected)
-    faq_map = {
-        "how do i take the quiz": f"Take the quiz here, babe. It unlocks your personalized Bestie: {QUIZ_URL}",
-        "where do i take the quiz": f"Here’s your link: {QUIZ_URL}",
-        "quiz link": f"Quiz link incoming: {QUIZ_URL}",
-        "how much is bestie": "7-day free trial (card required), then $17/month. If you hit texting caps you’re auto-promoted to $27 then $37. Cancel anytime.",
-        "price": "Starts at $17/month after your 7-day trial. Heavy texters auto-promoted to $27 and $37 tiers.",
-        "how much does it cost": "7-day free trial, then $17/month. Promotions to $27 and $37 happen automatically when you hit caps.",
-        "how much are prompt packs": "Prompt Packs are $7 each or 3 for $20.",
-        "prompt pack price": "Each pack is $7 — or 3 for $20. Link: https://schizobestie.gumroad.com/",
-        "prompt packs link": "Right this way: https://schizobestie.gumroad.com/",
-    }
-
-    for key, canned in faq_map.items():
-        if key in normalized_text:
-            logger.info("[Worker][FAQ] Intercepted '{}'", key)
-            _store_and_send(user_id, convo_id, canned)
-            return
-
     # 4) Rename flow
     rename_reply = try_handle_bestie_rename(user_id, convo_id, user_text)
     if rename_reply:
@@ -666,13 +647,17 @@ def generate_reply_job(
     # 5) Chat-first (single GPT pass) ===============================================
     try:
         persona = (
-            "You are Bestie — sharp, funny, emotionally fluent, a little savage but kind. "
-            "Answer like a close friend, not a form. "
-            "Do NOT ask the user for ‘options’, ‘goal/constraint’, ‘budget/price/vibe’. "
-            "If they greet, greet back playfully and ask one fun open-ended question. "
-            "Only suggest products if they clearly ask for them. "
-            "Keep it to one SMS (<= 450 chars)."
-        )
+        "You are Bestie — sharp, funny, emotionally fluent, a little savage but kind. "
+        "Answer like a close friend, not a form. "
+        "Do NOT ask for 'options', 'budget', 'goal/constraint'. "
+        "If they greet you, greet them back playfully and ask one open-ended question. "
+        "If they ask about prompt packs, pricing, or the quiz, tell them:\n"
+        " - Quiz: https://tally.so/r/YOUR_QUIZ_ID\n"
+        " - Prompt Packs: $7 each or 3 for $20 → https://schizobestie.gumroad.com/\n"
+        " - Subscription: 7-day trial, then $17/mo. Cancel anytime.\n"
+        "If they share a product link or name, you're allowed to compare it, warn if it's not ideal, or offer an upgrade — like Elise would. "
+        "Keep messages within 450 characters (1 SMS)."
+    )
 
         raw = ai.generate_reply(
             user_text=user_text,
@@ -685,6 +670,7 @@ def generate_reply_job(
         # light scrub, but **never** force empty
         cleaned = _clean_reply(_deproductize(raw))
         reply = (cleaned.strip() if cleaned else (raw.strip() if raw else ""))
+        reply = _maybe_append_ai_closer(reply, user_text, category=None, convo_id=convo_id)
 
     except Exception as e:
         logger.exception("[ChatOnly] GPT pass failed: {}", e)
@@ -703,7 +689,6 @@ def generate_reply_job(
 
     _store_and_send(user_id, convo_id, reply, send_phone=user_phone)
     return
-
 
 # ---------------------------------------------------------------------- #
 # Debug and re-engagement jobs
