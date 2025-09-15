@@ -272,13 +272,28 @@ def _ensure_profile_defaults(user_id: int) -> Dict[str, object]:
         return {"allowed": False, "reason": plan_status}
 
     return {"allowed": False, "reason": "pending"}
-                                 
+
+def _mini_fallback_reply(user_text: str) -> str:
+    """
+    Deterministic 1-liner when GPT returns empty twice.
+    Keep it friendly, actionable, and short (<140 chars).
+    """
+    t = (user_text or "").lower()
+    # light heuristics to feel situational
+    if any(w in t for w in ("boot", "shoe", "sneaker", "heel")):
+        return ("Got you. What vibe—western, sleek, or everyday—and any price ceiling? "
+                "I’ll pull 3 picks fast.")
+    if any(w in t for w in ("dress", "outfit", "top", "jeans", "skirt")):
+        return ("Tell me the vibe (casual, concert, date night) + budget and I’ll pull 3 looks.")
+    if "help" in t or "advice" in t:
+        return "Tell me the goal in one line and the constraint (time, $, vibe). I’ll map next steps."
+    # plain catch-all
+    return "Got you. Give me 1–2 specifics (goal + budget/vibe) and I’ll get you options."
+                                     
 # ---------------------------------------------------------------------- #
 # Final storage and SMS send
 # ---------------------------------------------------------------------- #
 # --- outbound dedupe: skip if we just sent the exact same text in this convo ---
-
-
 def _add_personality_if_flat(text: str) -> str:
     if not text:
         return text
@@ -445,7 +460,33 @@ def _fix_cringe_opening(reply: str) -> str:
             )
         except Exception:
             return "\n".join(lines[1:]) if len(lines) > 1 else reply
-    return reply
+# --- reply cleaner -----------------------------------------------------------
+from typing import Optional  # keep once near your other imports
+
+def _clean_reply(text: Optional[str]) -> Optional[str]:
+    """
+    Light, non-destructive cleanup:
+    - trim whitespace
+    - collapse excessive spaces / newlines
+    - remove simple wrapping quotes/backticks
+    Returns the original text if cleaning would produce an empty string.
+    """
+    if text is None:
+        return None
+
+    t = str(text).strip()
+    # (Optional) very light normalization without importing regex:
+    # collapse multiple spaces
+    while "  " in t:
+        t = t.replace("  ", " ")
+    # collapse 3+ newlines to a max of two
+    while "\n\n\n" in t:
+        t = t.replace("\n\n\n", "\n\n")
+    # strip simple wrappers
+    t = t.strip('`"\' ')
+
+    # Non-destructive guard: never turn real content into ""
+    return t or text
 
 # ---------------------------------------------------------------------- #
 # Main worker entrypoint
@@ -646,7 +687,12 @@ def generate_reply_job(
         logger.exception("[ChatOnly] first pass failed: {}", e)
         reply = None
 
-    # --- Second chance if still empty -------------------------------------------
+    # --- Hard fallback writer if still empty ---
+    if not reply:
+        reply = _mini_fallback_reply(user_text)
+        _store_and_send(user_id, convo_id, reply, send_phone=user_phone)
+        return
+
 # --- Second chance if still empty ------------------------------------------------
     if not reply:
         try:
@@ -673,8 +719,6 @@ def generate_reply_job(
         except Exception as e:
             logger.exception("[ChatOnly] second pass failed: {}", e)
             reply = None
-
-
 
     # ===================== FINAL SAFETY NET (single place) =======================
     if not reply:
