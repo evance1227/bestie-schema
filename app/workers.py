@@ -505,93 +505,109 @@ def _is_greeting(text: str) -> bool:
 # ---------------------------------------------------------------------- #
 # Main worker entrypoint
 # ---------------------------------------------------------------------- #
-def generate_reply(
-    user_text: str,
+def generate_reply_job(
+    convo_id: int,
     user_id: int,
-    system_prompt: str,
-    product_candidates=None,
-    context=None,
-) -> str:
-    from openai import OpenAI
-    import os, logging
+    text_val: str,
+    user_phone: Optional[str] = None,
+    media_urls: Optional[List[str]] = None,
+) -> None:
+    """
+    Single-pass chat job:
+      0) Plan gate (trial/active)
+      1) Media routing (image/audio)
+      2) Rename flow
+      3) Chat-first GPT
+      4) Affiliate/link hygiene + send
+    """
+    logger.info("[Worker][Start] Job: convo_id=%s user_id=%s text=%s", convo_id, user_id, text_val)
+    reply: Optional[str] = None
 
-    client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-    system_prompt = system_prompt or (
-        "You are Bestie — sharp, funny, emotionally fluent, a little savage but kind. "
-        "Keep replies <= 450 chars."
-    )
-
-    # Optional: inject sales links so GPT can answer FAQs organically
-    quiz_url = os.getenv("QUIZ_URL", "https://tally.so/r/YOUR_QUIZ_ID")
-    packs_url = "https://schizobestie.gumroad.com/"
-    system_prompt = (
-        system_prompt
-        + f"\nIf asked about pricing/quiz/prompt packs, you may use:\n"
-          f"- Quiz → {quiz_url}\n"
-          f"- Prompt Packs ($7 or 3 for $20) → {packs_url}\n"
-          f"- Subscription → 7-day trial then $17/mo (cancel anytime)."
-    )
-
+    # Normalize phone for outbound
     try:
-        resp = client.chat.completions.create(
-            model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_text or ""},
-            ],
-            temperature=0.8,
-            max_tokens=300,
-        )
-        text = (resp.choices[0].message.content or "").strip()
-        if not text:
-            logging.warning(
-                "[AI] Empty content for user_id=%s prompt_len=%d",
-                user_id, len(user_text or "")
-            )
-            # deterministic friendly fallback
-            return "Okay, I’m here. What do you want to tackle first — vent, advice, or a tiny win?"
-        return text
+        user_phone = _norm_phone(user_phone) or user_phone
     except Exception:
-        logging.exception("[AI] Chat call failed")
-        # bubble up an obvious, friendly fallback
-        return "My brain hiccuped mid-catwalk. Tell me again and I’ll deliver."
+        pass
 
-        # ---------------------------------------------------------------------------
+    user_text = str(text_val or "")
+    normalized_text = user_text.lower().strip()
 
-    # 2) Media routing
+    logger.info(
+        "[Worker][Start] Job: convo_id=%s user_id=%s text_len=%d media_cnt=%d",
+        convo_id, user_id, len(user_text), len(media_urls or [])
+    )
 
-    # --- attachments passed from webhook (preferred) ---
+    # 0) Plan gate ---------------------------------------------------------------
+    try:
+        gate_snapshot = _ensure_profile_defaults(user_id)
+        logger.info("[Gate] user_id=%s -> %s", user_id, gate_snapshot)
+
+        # DEV bypass
+        np = _norm_phone(user_phone)
+        nb = _norm_phone(DEV_BYPASS_PHONE)
+        dev_bypass = bool(np and nb and np == nb)
+        allowed = bool(gate_snapshot.get("allowed"))
+
+        if not (dev_bypass or allowed):
+            # Don't spam if we just sent the wall
+            recent = _recent_outbound_texts(convo_id, limit=8)
+            recent_has_paywall = any(
+                ("gumroad.com" in (t or "").lower() or "quiz" in (t or "").lower())
+                for t in recent
+            )
+            if recent_has_paywall:
+                logger.info("[Gate] Paywall already sent recently; skipping re-send.")
+                return
+
+            msg = _wall_start_message(user_id)
+            _store_and_send(user_id, convo_id, msg, send_phone=user_phone)
+            return
+
+        if dev_bypass:
+            logger.info("[Gate][Bypass] forcing allow for DEV phone np=%s nb=%s", np, nb)
+
+    except Exception as e:
+        logger.exception("[Gate] snapshot/build error: %s", e)
+        _store_and_send(
+            user_id, convo_id,
+            "Babe, I glitched. Give me one sec to reboot my attitude. 💅",
+            send_phone=user_phone
+        )
+        return
+
+    # 1) Media routing -----------------------------------------------------------
     if media_urls:
         first = (media_urls[0] or "").strip()
         lower = first.lower()
         try:
             if any(lower.endswith(ext) for ext in [".jpg", ".jpeg", ".png", ".gif", ".webp"]):
-                logger.info("[Worker][Media] Attachment image detected: {}", first)
-                reply = ai.describe_image(first)              # <-- was transcribe_and_respond
+                logger.info("[Worker][Media] Attachment image detected: %s", first)
+                reply = ai.describe_image(first)
                 _store_and_send(user_id, convo_id, reply, send_phone=user_phone)
                 return
 
             if any(lower.endswith(ext) for ext in [".mp3", ".m4a", ".wav", ".ogg"]):
-                logger.info("[Worker][Media] Attachment audio detected: {}", first)
+                logger.info("[Worker][Media] Attachment audio detected: %s", first)
                 reply = ai.transcribe_and_respond(first, user_id=user_id)
                 _store_and_send(user_id, convo_id, reply, send_phone=user_phone)
                 return
+
             # Extensionless: try image, then audio
-            logger.info("[Worker][Media] Attachment extless; trying image describe: {}", first)
+            logger.info("[Worker][Media] Attachment extless; trying image describe: %s", first)
             try:
                 reply = ai.describe_image(first)
                 _store_and_send(user_id, convo_id, reply, send_phone=user_phone)
                 return
             except Exception:
-                logger.info("[Worker][Media] describe_image failed; trying audio transcribe: {}", first)
+                logger.info("[Worker][Media] describe_image failed; trying audio transcribe: %s", first)
                 reply = ai.transcribe_and_respond(first, user_id=user_id)
                 _store_and_send(user_id, convo_id, reply, send_phone=user_phone)
                 return
         except Exception as e:
-            logger.warning("[Worker][Media] Attachment handling failed: {}", e)
-            # fall through to your existing text-based routing below
+            logger.warning("[Worker][Media] Attachment handling failed: %s", e)
+            # fall through to text routing
 
-    # 2) Media routing
+    # If a naked URL is in the text, quick media sniff
     if "http" in user_text:
         if any(ext in normalized_text for ext in [".jpg", ".jpeg", ".png", ".gif", ".webp"]):
             logger.info("[Worker][Media] Image URL detected, describing.")
@@ -604,20 +620,21 @@ def generate_reply(
             _store_and_send(user_id, convo_id, reply, send_phone=user_phone)
             return
 
-    # 4) Rename flow
+    # 2) Rename flow -------------------------------------------------------------
     rename_reply = try_handle_bestie_rename(user_id, convo_id, user_text)
     if rename_reply:
-        _store_and_send(user_id, convo_id, rename_reply)
+        _store_and_send(user_id, convo_id, rename_reply, send_phone=user_phone)
         return
-    # Base reply context (used by both chat + product paths)
+
+    # 3) Chat-first (single GPT pass) -------------------------------------------
+    # Pull a tiny bit of context
     with db.session() as s:
         profile = s.execute(
             sqltext("SELECT is_quiz_completed FROM user_profiles WHERE user_id = :uid"),
             {"uid": user_id}
-        ).first()      
-    context = {"has_completed_quiz": bool(profile and profile[0])}
+        ).first()
+    has_quiz = bool(profile and profile[0])
 
-    # 5) Chat-first (single GPT pass) ===============================================
     try:
         persona = (
             "You are Bestie — sharp, funny, emotionally fluent, a little savage but kind. "
@@ -636,32 +653,33 @@ def generate_reply(
 
         raw = ai.generate_reply(
             user_text=user_text,
-            product_candidates=[],        # nothing scripted
+            product_candidates=[],            # nothing scripted
             user_id=user_id,
             system_prompt=persona,
-            context={"has_completed_quiz": bool(profile and profile[0])},
+            context={"has_completed_quiz": has_quiz},
         )
 
-        # light scrub, but **never** force empty
-        cleaned = _clean_reply(_deproductize(raw))
+        cleaned = _clean_reply(_deproductize(raw))  # light scrub; never forces empty
         reply = (cleaned.strip() if cleaned else (raw.strip() if raw else ""))
+
+        # Add a short closer if abrupt / ends on URL
         reply = _maybe_append_ai_closer(reply, user_text, category=None, convo_id=convo_id)
 
+        # If GPT still gave nothing and it's a greeting, send a warm opener
         if not (reply or "").strip() and _is_greeting(user_text):
             reply = "Hey gorgeous — I’m here. What kind of trouble are we getting into today? Pick a lane or vent at me. 💅"
 
-
     except Exception as e:
-        logger.exception("[ChatOnly] GPT pass failed: {}", e)
+        logger.exception("[ChatOnly] GPT pass failed: %s", e)
         reply = ""
 
-    # One safety net: guarantee exactly one message
-    if not reply.strip():
+    # Safety net: guarantee exactly one message
+    if not (reply or "").strip():
         reply = "Babe, I glitched. Say it again and I’ll do better. 💅"
 
-    # Affiliate/link hygiene only (no content rules)
+    # 4) Affiliate/link hygiene and send ----------------------------------------
     try:
-        reply = linkwrap.make_sms_reply(reply)          # wrap any links (Amazon/Geniuslink)
+        reply = linkwrap.make_sms_reply(reply)  # wraps Amazon/Geniuslink/etc
         reply = ensure_not_link_ending(reply)
     except Exception:
         pass
