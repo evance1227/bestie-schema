@@ -634,7 +634,7 @@ def generate_reply_job(
         )
         reply = _clean_reply(reply)
         logger.info(
-            "[Chat] first pass len=%s preview=%s",
+            "[Chat] first pass len={} preview={}",
             0 if reply is None else len(reply),
             "None" if reply is None else repr(reply[:120]),
         )
