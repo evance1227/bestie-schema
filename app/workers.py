@@ -697,12 +697,18 @@ def generate_reply_job(
     if not reply:
         try:
             reply2 = ai.generate_reply(
-                user_text=user_text,
-                product_candidates=[],
-                user_id=user_id,
-                system_prompt="Reply helpfully in ~1 SMS line (<=140 chars). No disclaimers.",
-                context=context,
-            )
+            user_text=user_text,
+            product_candidates=[],
+            user_id=user_id,
+            system_prompt=(
+                "You are Bestie — casual, witty, emotionally fluent. "
+                "No product talk, no ‘options’, no budget/price/vibe questions. "
+                "If the user just greets, greet back playfully and ask one open-ended question. "
+                "Keep it to one SMS (<= 450 chars)."
+            ),
+            context=context,
+        )
+
 
             # clean, but never lose the message
             clean2 = _clean_reply(reply2)
