@@ -625,18 +625,21 @@ def generate_reply_job(
             "Keep the whole reply under ~450 characters."
         )
 
-        reply = ai.generate_reply(
+        raw = ai.generate_reply(
             user_text=user_text,
-            product_candidates=[],  # product pipeline removed
+            product_candidates=[],
             user_id=user_id,
             system_prompt=system_prompt,
             context=context,
         )
-        reply = _clean_reply(reply)
+        # clean, but never lose the message
+        clean = _clean_reply(raw)
+        reply = (clean.strip() if clean else (raw.strip() if raw else ""))
+
         logger.info(
             "[Chat] first pass len={} preview={}",
-            0 if reply is None else len(reply),
-            "None" if reply is None else repr(reply[:120]),
+            0 if not reply else len(reply),
+            "None" if not reply else repr(reply[:120]),
         )
 
     except Exception as e:
@@ -644,6 +647,7 @@ def generate_reply_job(
         reply = None
 
     # --- Second chance if still empty -------------------------------------------
+# --- Second chance if still empty ------------------------------------------------
     if not reply:
         try:
             reply2 = ai.generate_reply(
@@ -653,16 +657,24 @@ def generate_reply_job(
                 system_prompt="Reply helpfully in ~1 SMS line (<=140 chars). No disclaimers.",
                 context=context,
             )
-            reply2 = _clean_reply(reply2)
+
+            # clean, but never lose the message
+            clean2 = _clean_reply(reply2)
+            reply2 = (clean2.strip() if clean2 else (reply2.strip() if reply2 else ""))
+
             logger.info(
-                "[Chat] second pass len=%s preview=%s",
-                0 if reply2 is None else len(reply2),
-                "None" if reply2 is None else repr(reply2[:120]),
+                "[Chat] second pass len={} preview={}",
+                0 if not reply2 else len(reply2),
+                "None" if not reply2 else repr(reply2[:120]),
             )
+
             reply = reply2
+
         except Exception as e:
             logger.exception("[ChatOnly] second pass failed: {}", e)
             reply = None
+
+
 
     # ===================== FINAL SAFETY NET (single place) =======================
     if not reply:
