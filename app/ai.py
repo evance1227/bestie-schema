@@ -355,17 +355,18 @@ def compose_persona(user_id: Optional[int], session_goal: Optional[str] = None) 
         )
 
     policy = f"""
-RULES:
-- Speak in second person. Short replies unless asked for steps.
-- Avoid banned phrases entirely: {", ".join(BANNED_STOCK_PHRASES)}.
-- No em dashes in output. Use commas or periods instead.
-- If user is venting, comfort first, no products. If they ask for products, keep 1-3 picks with one-liners.
-- Use PRODUCT ONE-LINERS when selling: {", ".join(PRODUCT_ONE_LINERS)}.
-- When you mention VIP or prompt packs, be organic and never lead with it.
-- Never dodge direct questions. If specific enough, act without asking clarifiers.
-- Output should be SMS-length friendly. Avoid walls of text.
-- If you reference your name, respond as '{bestie_name}'.
-""".strip()
+    RULES:
+    - Speak in second person. Short replies unless asked for steps.
+    - Avoid banned phrases entirely: {", ".join(BANNED_STOCK_PHRASES)}.
+    - No em dashes in output. Use commas or periods instead.
+    - If user is venting, comfort first, no products. If they ask for products, keep 1-3 picks with one-liners.
+    - Use PRODUCT ONE-LINERS when selling: {", ".join(PRODUCT_ONE_LINERS)}.
+    - When you mention VIP or prompt packs, be organic and never lead with it.
+    - Never dodge direct questions. If specific enough, act without asking clarifiers.
+    - Output should be SMS-length friendly. Avoid walls of text.
+    - If you reference your name, respond as '{bestie_name}'.
+    - Do not ask for budget or to “narrow preferences”. Lead with best; include a smart mid-tier and a real budget alt when listing 2–3.
+    """.strip()
 
     goal = f"\nSESSION GOAL: {session_goal}" if session_goal else ""
     quiz = f"\nUSER QUIZ PROFILE:\n{quiz_profile}" if quiz_profile else ""
@@ -454,17 +455,17 @@ def generate_reply(
         context=context,
     )
 
-    # 2) Model instruction for Good/Better/Best + budget alt if luxury
+    # 2) Best-first product policy (never survey for budget)
     shopping_guidance = """
-When product candidates are present:
-- Start with 1–2 friendly sentences reacting to the user's message (no lists yet).
-- Return 1–3 options total, each with a crisp one-liner benefit (use PRODUCT ONE-LINERS vibe).
-- Prefer a simple Good / Better / Best ordering when user wants a list.
-- If the user asks “which one”, “only buy one”, “best”, or mentions a budget constraint,
-  pick EXACTLY ONE and justify why in 1–2 lines (do not repeat the full list).
--- Do NOT write the literal word "URL". Use links only if they are provided; otherwise omit.
-- Keep the whole reply ~450 characters. No disclaimers. Do not alter provided URLs.
-""".strip()
+    When product help is requested or implied:
+    - Answer first. Do not ask for budget/preferences. No surveys.
+    - Return 2–3 options total, each with a tight one-liner benefit (use PRODUCT ONE-LINERS vibe).
+    - Lead with the BEST-IN-CLASS pick. Then a smart mid-tier. Then an actually-good budget alternative.
+    - If the user says “which one”, “only buy one”, or “best” — pick EXACTLY ONE and justify in 1–2 lines.
+    - Do NOT write the literal word "URL". If links are present, keep them; otherwise omit.
+    - Keep the whole reply ≤ 450 chars. No disclaimers.
+    """.strip()
+
     force_choice = any(
         k in (user_text or "").lower()
         for k in ["which one", "only buy one", "only afford", "best one", "pick one"]
@@ -530,12 +531,12 @@ When product candidates are present:
                 text_out = f"{user_text[:40]}… I’ve got you. Let’s sort this fast."
         else:
             resp = CLIENT.chat.completions.create(
-                model=OPENAI_MODEL,
-                messages=messages,
-                temperature=0.9,
-                max_tokens=360,
-            )
-            text_out = (resp.choices[0].message.content or "").strip()
+            model=OPENAI_MODEL,
+            messages=messages,
+            temperature=float(os.getenv("OPENAI_TEMP", "0.6")),
+            max_tokens=int(os.getenv("OPENAI_MAXTOK", "260")),
+        )
+
 
     # 4) Tone rescue: banned opener and cringe rewrite if needed
     text = text_out or ""

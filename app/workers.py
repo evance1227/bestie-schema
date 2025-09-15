@@ -496,6 +496,31 @@ def _deproductize(text: Optional[str]) -> Optional[str]:
     s = re.sub(r"(?i)\b(budget|price|vibe)\b", "context", s)
     s = re.sub(r"\s{2,}", " ", s).strip()
     return s or text
+# --- Anti-form guard: rewrite survey-y replies into answer-first -------------
+_ANTI_FORM_RE = re.compile(
+    r"(?i)^(what'?s your budget|let'?s narrow (it|this) down|let us narrow|"
+    r"what are your preferences|tell me your preferences|"
+    r"what'?s (your )?price range|"
+    r"share 1-2 specifics|provide options|set constraints)\b.*"
+)
+
+def _anti_form_guard(text: Optional[str], user_text: str) -> Optional[str]:
+    if not text:
+        return text
+    t = text.strip()
+    # If the whole first line is a survey prompt, replace it with an answer-first opener
+    first, *rest = t.splitlines()
+    if _ANTI_FORM_RE.match(first.strip()):
+        # Minimal, on-brand opener with a single follow-up at the end
+        # Note: short, decisive, no survey
+        body = "Here’s what I’d do: focus on what actually moves the needle, then tweak if needed."
+        follow = "Want me to tailor this tighter — or are you ready to try it?"
+        return f"{body}\n{(' '.join(rest)).strip() or follow}"
+    # Also strip any repeat survey prompts anywhere
+    t = _ANTI_FORM_RE.sub("", t).strip()
+    # Kill redundant “let’s narrow it down” lines mid-reply
+    t = re.sub(r"(?im)^\s*let'?s narrow.*$", "", t).strip()
+    return t or text
 
 _GREETING_RE = re.compile(r"^\s*(hi|hey|hello|yo|hiya|sup|good (morning|afternoon|evening))\b", re.I)
 
@@ -639,17 +664,20 @@ def generate_reply_job(
         persona = (
             "You are Bestie — sharp, funny, emotionally fluent, a little savage but kind. "
             "Answer like a close friend, not a form. "
-            "Do NOT ask for 'options', 'budget', 'goal/constraint'. "
-            "If they greet you, greet them back playfully and ask one open-ended question. "
-            "If they ask about pricing, prompt packs, or the quiz, use: "
-            "  Quiz → {quiz}; Prompt Packs ($7 or 3 for $20) → {packs}; Subscription → 7-day trial then $17/mo (cancel anytime). "
-            "If they share a product or link, you may compare, flag risky ingredients for sensitive skin, suggest better/cheaper equivalents, "
-            "or advise skipping if redundant. "
-            "Keep replies <= 450 chars (1 SMS)."
+            "NEVER ask for budget, preferences, options, constraints, or to 'narrow down'. "
+            "If details are missing, make a best guess and give an answer-first plan. "
+            "Structure: 1) a decisive 1–2 sentence take, 2) 2–3 concise actions or products IF asked, "
+            "3) one playful follow-up question at the end (max one). "
+            "If they paste or name a product, you may critique it, flag risky ingredients (e.g., for sensitive skin), "
+            "and suggest a better/cheaper equivalent. "
+            "If they ask pricing/quiz/prompt packs, use: Quiz → {quiz}; Prompt Packs ($7 or 3 for $20) → {packs}; "
+            "Subscription → 7-day trial then $17/mo (cancel anytime). "
+            "Keep replies ≤ 450 chars (one SMS) and avoid numbered lists unless they explicitly ask."
         ).format(
             quiz=os.getenv("QUIZ_URL", "https://tally.so/r/YOUR_QUIZ_ID"),
             packs="https://schizobestie.gumroad.com/"
         )
+
 
         raw = ai.generate_reply(
             user_text=user_text,
@@ -659,15 +687,15 @@ def generate_reply_job(
             context={"has_completed_quiz": has_quiz},
         )
 
-        cleaned = _clean_reply(_deproductize(raw))  # light scrub; never forces empty
+        cleaned = _clean_reply(_deproductize(raw))
         reply = (cleaned.strip() if cleaned else (raw.strip() if raw else ""))
 
-        # Add a short closer if abrupt / ends on URL
+        reply = _anti_form_guard(reply, user_text)
         reply = _maybe_append_ai_closer(reply, user_text, category=None, convo_id=convo_id)
 
-        # If GPT still gave nothing and it's a greeting, send a warm opener
         if not (reply or "").strip() and _is_greeting(user_text):
             reply = "Hey gorgeous — I’m here. What kind of trouble are we getting into today? Pick a lane or vent at me. 💅"
+
 
     except Exception as e:
         logger.exception("[ChatOnly] GPT pass failed: %s", e)
