@@ -274,15 +274,7 @@ def _ensure_profile_defaults(user_id: int) -> Dict[str, object]:
     return {"allowed": False, "reason": "pending"}
 
 def _mini_fallback_reply(user_text: str) -> str:
-    """
-    Deterministic 1-liner when GPT returns empty twice.
-    Keep it friendly, actionable, and short (<140 chars).
-    """
-    t = (user_text or "").lower()
-    if any(w in t for w in ("boot", "shoe", "sneaker", "heel", "dress", "outfit", "top", "jeans", "skirt")):
-        return "Got you. What’s the outcome you want and any must-avoid? I’ll map a quick next step."
-    # general catch-all
-    return "Got you. Tell me the outcome you want in one line and any constraint (time/energy). I’ll map next steps."
+    return "Babe, I blanked like a bad date. Try me again — I swear I’m listening now. 💅"
                                      
 # ---------------------------------------------------------------------- #
 # Final storage and SMS send
@@ -505,83 +497,64 @@ def _deproductize(text: Optional[str]) -> Optional[str]:
     s = re.sub(r"\s{2,}", " ", s).strip()
     return s or text
 
+_GREETING_RE = re.compile(r"^\s*(hi|hey|hello|yo|hiya|sup|good (morning|afternoon|evening))\b", re.I)
+
+def _is_greeting(text: str) -> bool:
+    return bool(_GREETING_RE.match(text or ""))
+
 # ---------------------------------------------------------------------- #
 # Main worker entrypoint
 # ---------------------------------------------------------------------- #
-def generate_reply_job(
-    convo_id: int,
+def generate_reply(
+    user_text: str,
     user_id: int,
-    text_val: str,
-    user_phone: Optional[str] = None,
-    media_urls: Optional[List[str]] = None,
-) -> None:
-    """
-    Routing:
-      0) Plan gate
-      1) First message onboarding
-      2) Media routing (image/audio)
-      ...
-    """
-    logger.info("[Worker][Start] Job: convo_id={} user_id={} text={}", convo_id, user_id, text_val)
-    # initialize reply so UnboundLocalError can never occur
-    reply: Optional[str] = None
-    # 🔑 Normalize the inbound phone so it matches DEV_BYPASS_PHONE
-    try:
-        user_phone = _norm_phone(user_phone) or user_phone
-    except Exception:
-        pass
+    system_prompt: str,
+    product_candidates=None,
+    context=None,
+) -> str:
+    from openai import OpenAI
+    import os, logging
 
-    user_text = str(text_val or "")
-    normalized_text = user_text.lower().strip()
-
-    logger.info(
-        "[Worker][Start] Job: convo_id=%s user_id=%s text_len=%d media_cnt=%d",
-        convo_id, user_id, len(text_val or ""), len(media_urls or [])
+    client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+    system_prompt = system_prompt or (
+        "You are Bestie — sharp, funny, emotionally fluent, a little savage but kind. "
+        "Keep replies <= 450 chars."
     )
 
-        # 0) Gate
+    # Optional: inject sales links so GPT can answer FAQs organically
+    quiz_url = os.getenv("QUIZ_URL", "https://tally.so/r/YOUR_QUIZ_ID")
+    packs_url = "https://schizobestie.gumroad.com/"
+    system_prompt = (
+        system_prompt
+        + f"\nIf asked about pricing/quiz/prompt packs, you may use:\n"
+          f"- Quiz → {quiz_url}\n"
+          f"- Prompt Packs ($7 or 3 for $20) → {packs_url}\n"
+          f"- Subscription → 7-day trial then $17/mo (cancel anytime)."
+    )
+
     try:
-        gate_snapshot = _ensure_profile_defaults(user_id)
-        logger.info("[Gate] user_id={} -> {}", user_id, gate_snapshot)
-
-        # normalize phones for bypass compare
-        try:
-            user_phone = _norm_phone(user_phone) or user_phone
-        except Exception:
-            pass
-        np = _norm_phone(user_phone)
-        nb = _norm_phone(DEV_BYPASS_PHONE)
-        dev_bypass = bool(np and nb and np == nb)
-
-        allowed = bool(gate_snapshot.get("allowed"))
-
-        if not (dev_bypass or allowed):
-            # Deduplicate paywall: if we just sent it, don’t spam.
-            recent = _recent_outbound_texts(convo_id, limit=8)
-            recent_has_paywall = any(
-                ("gumroad.com" in (t or "").lower() or "quiz" in (t or "").lower())
-                for t in recent
-            )
-            if recent_has_paywall:
-                logger.info("[Gate] Paywall already sent recently; skipping re-send.")
-                return
-
-            msg = _wall_start_message(user_id)
-            _store_and_send(user_id, convo_id, msg, send_phone=user_phone)
-            return  # stop here when not allowed
-
-        # dev bypass note
-        if dev_bypass:
-            logger.info("[Gate][Bypass] forcing allow for DEV phone np=%s nb=%s", np, nb)
-
-    except Exception as e:
-        logger.exception("[Gate] snapshot/build error: {}", e)
-        _store_and_send(
-            user_id, convo_id,
-            "Babe, I glitched. Give me one sec to reboot my attitude. 💅",
-            send_phone=user_phone
+        resp = client.chat.completions.create(
+            model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_text or ""},
+            ],
+            temperature=0.8,
+            max_tokens=300,
         )
-        return
+        text = (resp.choices[0].message.content or "").strip()
+        if not text:
+            logging.warning(
+                "[AI] Empty content for user_id=%s prompt_len=%d",
+                user_id, len(user_text or "")
+            )
+            # deterministic friendly fallback
+            return "Okay, I’m here. What do you want to tackle first — vent, advice, or a tiny win?"
+        return text
+    except Exception:
+        logging.exception("[AI] Chat call failed")
+        # bubble up an obvious, friendly fallback
+        return "My brain hiccuped mid-catwalk. Tell me again and I’ll deliver."
 
         # ---------------------------------------------------------------------------
 
@@ -647,17 +620,19 @@ def generate_reply_job(
     # 5) Chat-first (single GPT pass) ===============================================
     try:
         persona = (
-        "You are Bestie — sharp, funny, emotionally fluent, a little savage but kind. "
-        "Answer like a close friend, not a form. "
-        "Do NOT ask for 'options', 'budget', 'goal/constraint'. "
-        "If they greet you, greet them back playfully and ask one open-ended question. "
-        "If they ask about prompt packs, pricing, or the quiz, tell them:\n"
-        " - Quiz: https://tally.so/r/YOUR_QUIZ_ID\n"
-        " - Prompt Packs: $7 each or 3 for $20 → https://schizobestie.gumroad.com/\n"
-        " - Subscription: 7-day trial, then $17/mo. Cancel anytime.\n"
-        "If they share a product link or name, you're allowed to compare it, warn if it's not ideal, or offer an upgrade — like Elise would. "
-        "Keep messages within 450 characters (1 SMS)."
-    )
+            "You are Bestie — sharp, funny, emotionally fluent, a little savage but kind. "
+            "Answer like a close friend, not a form. "
+            "Do NOT ask for 'options', 'budget', 'goal/constraint'. "
+            "If they greet you, greet them back playfully and ask one open-ended question. "
+            "If they ask about pricing, prompt packs, or the quiz, use: "
+            "  Quiz → {quiz}; Prompt Packs ($7 or 3 for $20) → {packs}; Subscription → 7-day trial then $17/mo (cancel anytime). "
+            "If they share a product or link, you may compare, flag risky ingredients for sensitive skin, suggest better/cheaper equivalents, "
+            "or advise skipping if redundant. "
+            "Keep replies <= 450 chars (1 SMS)."
+        ).format(
+            quiz=os.getenv("QUIZ_URL", "https://tally.so/r/YOUR_QUIZ_ID"),
+            packs="https://schizobestie.gumroad.com/"
+        )
 
         raw = ai.generate_reply(
             user_text=user_text,
@@ -671,6 +646,10 @@ def generate_reply_job(
         cleaned = _clean_reply(_deproductize(raw))
         reply = (cleaned.strip() if cleaned else (raw.strip() if raw else ""))
         reply = _maybe_append_ai_closer(reply, user_text, category=None, convo_id=convo_id)
+
+        if not (reply or "").strip() and _is_greeting(user_text):
+            reply = "Hey gorgeous — I’m here. What kind of trouble are we getting into today? Pick a lane or vent at me. 💅"
+
 
     except Exception as e:
         logger.exception("[ChatOnly] GPT pass failed: {}", e)
