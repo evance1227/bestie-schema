@@ -663,97 +663,46 @@ def generate_reply_job(
         ).first()      
     context = {"has_completed_quiz": bool(profile and profile[0])}
 
-   # 5) Chat-first (single GPT pass) ---------------------------------------------
-
+    # 5) Chat-first (single GPT pass) ===============================================
     try:
-        system_prompt = (
-    "You are Bestie — blunt, witty, emotionally fluent. "
-    "Talk like a ride-or-die best friend. "
-    "Do not ask for budget/price/vibe or ‘specifics.’ "
-    "No product catalogs and no URLs unless the user explicitly asks for shopping help. "
-    "Keep it conversational, supportive, and fun. "
-    "Reply in a single SMS length (<= 450 characters)."
-)
+        persona = (
+            "You are Bestie — sharp, funny, emotionally fluent, a little savage but kind. "
+            "Answer like a close friend, not a form. "
+            "Do NOT ask the user for ‘options’, ‘goal/constraint’, ‘budget/price/vibe’. "
+            "If they greet, greet back playfully and ask one fun open-ended question. "
+            "Only suggest products if they clearly ask for them. "
+            "Keep it to one SMS (<= 450 chars)."
+        )
 
         raw = ai.generate_reply(
             user_text=user_text,
-            product_candidates=[],
+            product_candidates=[],        # nothing scripted
             user_id=user_id,
-            system_prompt=system_prompt,
-            context=context,
+            system_prompt=persona,
+            context={"has_completed_quiz": bool(profile and profile[0])},
         )
-        # clean, but never lose the message
-        clean = _clean_reply(raw)
-        reply = (clean.strip() if clean else (raw.strip() if raw else ""))
-        reply = _deproductize(reply)
 
-        logger.info(
-            "[Chat] first pass len={} preview={}",
-            0 if not reply else len(reply),
-            "None" if not reply else repr(reply[:120]),
-        )
+        # light scrub, but **never** force empty
+        cleaned = _clean_reply(_deproductize(raw))
+        reply = (cleaned.strip() if cleaned else (raw.strip() if raw else ""))
 
     except Exception as e:
-        logger.exception("[ChatOnly] first pass failed: {}", e)
-        reply = None
+        logger.exception("[ChatOnly] GPT pass failed: {}", e)
+        reply = ""
 
-    # --- Hard fallback writer if still empty ---
-    if not reply:
-        reply = _mini_fallback_reply(user_text)
-        _store_and_send(user_id, convo_id, reply, send_phone=user_phone)
-        return
+    # One safety net: guarantee exactly one message
+    if not reply.strip():
+        reply = "Babe, I glitched. Say it again and I’ll do better. 💅"
 
-# --- Second chance if still empty ------------------------------------------------
-    if not reply:
-        try:
-            system_prompt = (
-                "You are Bestie — casual, witty, emotionally fluent. "
-                "No product talk, no ‘options,’ no budget/price/vibe questions. "
-                "If the user just greets, greet back playfully and ask one open-ended question. "
-                "Keep it to one SMS (<= 450 chars)."
-            )
+    # Affiliate/link hygiene only (no content rules)
+    try:
+        reply = linkwrap.make_sms_reply(reply)          # wrap any links (Amazon/Geniuslink)
+        reply = ensure_not_link_ending(reply)
+    except Exception:
+        pass
 
-            raw2 = ai.generate_reply(
-                user_text=user_text,
-                product_candidates=[],
-                user_id=user_id,
-                system_prompt=system_prompt,
-                context=context,
-            )
-
-            # scrub briefing/optiony phrasing and normalize without ever making it blank
-            clean2 = _clean_reply(_deproductize(raw2))
-            reply2 = (clean2.strip() if clean2 else (raw2.strip() if raw2 else ""))
-
-            logger.info(
-                "[Chat] second pass len=%s preview=%s",
-                0 if not reply2 else len(reply2),
-                "None" if not reply2 else repr(reply2[:120]),
-            )
-
-            reply = reply2
-
-        except Exception as e:
-            logger.exception("[ChatOnly] second pass failed: {}", e)
-            reply = None
-
-    # ===================== FINAL SAFETY NET (single place) =======================
-    if not reply:
-        _store_and_send(
-            user_id,
-            convo_id,
-            "Babe, I glitched. Say it again and I’ll do better. 💅",
-            send_phone=user_phone,
-        )
-        return
-
-    # polish + send exactly once
-    reply = _fix_cringe_opening(reply)
     _store_and_send(user_id, convo_id, reply, send_phone=user_phone)
     return
-# ============================================================================
-
-# Debug and re-engagement jobs
 
 
 # ---------------------------------------------------------------------- #
