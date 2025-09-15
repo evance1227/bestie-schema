@@ -506,7 +506,43 @@ def generate_reply(
             "- 1–3 short lines, no therapy clichés.\n"
             "- Offer a tiny next step or a question back."
         )
+    def rewrite_as_three_picks(user_text: str, base_reply: str, system_prompt: str) -> str:
+        """
+        Gentle nudge: if the first reply dodged, ask GPT to rewrite with 3 concrete picks.
+                No catalogs or rules; still freeform GPT.
+                """
+        import os, logging
+        from openai import OpenAI
 
+        client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+        model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+
+        rescue_system = (
+            system_prompt +
+            "\nRewrite your advice into a decisive, helpful SMS with 2–3 concrete product/treatment picks "
+            "(BEST → Mid → Budget) each with a crisp one-liner benefit. "
+            "No surveys. One playful quip allowed. ≤ 450 chars. If links appear, keep them."
+        )
+
+        try:
+            resp = client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": rescue_system},
+                    {"role": "user", "content": user_text},
+                    {"role": "assistant", "content": base_reply or ""},
+                    {"role": "user", "content": "Rewrite that into real picks now."},
+                ],
+                temperature=float(os.getenv("OPENAI_TEMP", "0.6")),
+                max_tokens=int(os.getenv("OPENAI_MAXTOK", "260")),
+            )
+            text = (resp.choices[0].message.content or "").strip()
+            return text or base_reply
+        
+        except Exception:
+                logging.exception("[AI] rescue pass failed")
+                return base_reply        
+            
     # If user asks 'which one' or budget-limited, force a single pick with justification
     force_choice = any(
         k in (user_text or "").lower()

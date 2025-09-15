@@ -526,6 +526,21 @@ _GREETING_RE = re.compile(r"^\s*(hi|hey|hello|yo|hiya|sup|good (morning|afternoo
 
 def _is_greeting(text: str) -> bool:
     return bool(_GREETING_RE.match(text or ""))
+# --- Product-intent detector ---------------------------------------------------
+_PRODUCT_INTENT_RE = re.compile(
+    r"(?i)\b(recommend|rec(s)?|suggest|best|top|what should i (get|use)|"
+    r"buy|purchase|which (one|product)|options?|help me (regrow|grow|fix)|"
+    r"hair (regrowth|loss|fall)|minoxidil|ketoconazole|peptide serum)\b"
+)
+def _wants_products(text: str) -> bool:
+    return bool(_PRODUCT_INTENT_RE.search(text or ""))
+
+_LISTY_RE = re.compile(r"(?i)\[(best|mid|budget)\]|http|•|- |1\)|2\)|3\)")
+def _looks_like_picks(text: str) -> bool:
+    t = text or ""
+    # crude: looks like picks if it has labels/links/bullets or multiple short lines
+    lines = [ln.strip() for ln in t.splitlines() if ln.strip()]
+    return bool(_LISTY_RE.search(t) or len(lines) >= 3)
 
 # ---------------------------------------------------------------------- #
 # Main worker entrypoint
@@ -663,21 +678,15 @@ def generate_reply_job(
     try:
         persona = (
             "You are Bestie — sharp, funny, emotionally fluent, a little savage but kind. "
-            "Answer like a close friend, not a form. "
-            "NEVER ask for budget, preferences, options, constraints, or to 'narrow down'. "
-            "If details are missing, make a best guess and give an answer-first plan. "
-            "Structure: 1) a decisive 1–2 sentence take, 2) 2–3 concise actions or products IF asked, "
-            "3) one playful follow-up question at the end (max one). "
-            "If they paste or name a product, you may critique it, flag risky ingredients (e.g., for sensitive skin), "
-            "and suggest a better/cheaper equivalent. "
-            "If they ask pricing/quiz/prompt packs, use: Quiz → {quiz}; Prompt Packs ($7 or 3 for $20) → {packs}; "
-            "Subscription → 7-day trial then $17/mo (cancel anytime). "
-            "Keep replies ≤ 450 chars (one SMS) and avoid numbered lists unless they explicitly ask."
+            "Answer now; do not survey me. One friendly follow-up at most. "
+            "If the user asks for recommendations (or it’s obvious), give a decisive take and real picks. "
+            "Keep replies ≤ 450 chars (one SMS). "
+            "If asked about pricing/quiz/prompt packs, use: "
+            "  Quiz → {quiz}; Prompt Packs ($7 or 3 for $20) → {packs}; Subscription → 7-day trial then $17/mo (cancel anytime). "
         ).format(
             quiz=os.getenv("QUIZ_URL", "https://tally.so/r/YOUR_QUIZ_ID"),
             packs="https://schizobestie.gumroad.com/"
         )
-
 
         raw = ai.generate_reply(
             user_text=user_text,
@@ -687,14 +696,30 @@ def generate_reply_job(
             context={"has_completed_quiz": has_quiz},
         )
 
-        cleaned = _clean_reply(_deproductize(raw))
+        # Keep it light: don’t over-sanitize the model’s content
+        cleaned = _clean_reply(raw)
         reply = (cleaned.strip() if cleaned else (raw.strip() if raw else ""))
+
 
         reply = _anti_form_guard(reply, user_text)
         reply = _maybe_append_ai_closer(reply, user_text, category=None, convo_id=convo_id)
 
-        if not (reply or "").strip() and _is_greeting(user_text):
-            reply = "Hey gorgeous — I’m here. What kind of trouble are we getting into today? Pick a lane or vent at me. 💅"
+        # If the user clearly asked for products and the reply is vague, do a tiny rescue pass
+        if _wants_products(user_text) and not _looks_like_picks(reply):
+            try:
+                rescue = ai.rewrite_as_three_picks(
+                    user_text=user_text,
+                    base_reply=reply,
+                    system_prompt=persona
+                )
+                if rescue and len(rescue.strip()) > len((reply or "").strip()):
+                    reply = rescue.strip()
+            except Exception as _:
+                pass
+            
+
+                if not (reply or "").strip() and _is_greeting(user_text):
+                    reply = "Hey gorgeous — I’m here. What kind of trouble are we getting into today? Pick a lane or vent at me. 💅"
 
 
     except Exception as e:
