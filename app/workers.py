@@ -690,6 +690,32 @@ def generate_reply_job(
         except Exception as e:
             logger.warning("[Worker][Media] Attachment handling failed: %s", e)
             # fall through to text routing
+        # ---- post-chat finishing + send ---------------------------------------------
+        # add closer if abrupt / ends on URL
+        reply = _maybe_append_ai_closer(reply, user_text, category=None, convo_id=convo_id)
+
+        # If they asked for links/buy, append search links and mark them to survive hygiene
+        if re.search(r"(?i)\b(link|links|buy|purchase|where to buy|send.*link|shop)\b", (user_text or "")):
+            reply = _append_links_for_picks(reply)
+            reply = _ALLOW_AMZ_SEARCH_TOKEN + "\n" + reply
+
+        # Greeting fallback (one friendly opener if reply is still blank)
+        if not (reply or "").strip() and _is_greeting(user_text):
+            reply = "Hey gorgeous — I’m here. What kind of trouble are we getting into today? Pick a lane or vent at me. 💅"
+
+        # Safety net: guarantee exactly one message
+        if not (reply or "").strip():
+            reply = "Babe, I glitched. Say it again and I’ll do better. 💅"
+
+        # Affiliate/link hygiene and send
+        try:
+            reply = linkwrap.make_sms_reply(reply)          # wraps Amazon/Geniuslink/SYL
+            reply = ensure_not_link_ending(reply)
+        except Exception:
+            pass
+
+        _store_and_send(user_id, convo_id, reply, send_phone=user_phone)
+        return
 
     # If a naked URL is in the text, quick media sniff
     if "http" in user_text:
