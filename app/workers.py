@@ -617,16 +617,16 @@ def generate_reply_job(
     # 0) Plan gate ---------------------------------------------------------------
     try:
         gate_snapshot = _ensure_profile_defaults(user_id)
-        logger.info("[Gate] user_id=%s -> %s", user_id, gate_snapshot)
+        logger.info("[Gate] user_id={} -> {}", user_id, gate_snapshot)
 
-        # DEV bypass
+        # dev bypass (E.164 compare)
         np = _norm_phone(user_phone)
         nb = _norm_phone(DEV_BYPASS_PHONE)
         dev_bypass = bool(np and nb and np == nb)
         allowed = bool(gate_snapshot.get("allowed"))
 
         if not (dev_bypass or allowed):
-            # Don't spam if we just sent the wall
+            # Deduplicate paywall: if we just sent it, don’t spam
             recent = _recent_outbound_texts(convo_id, limit=8)
             recent_has_paywall = any(
                 ("gumroad.com" in (t or "").lower() or "quiz" in (t or "").lower())
@@ -644,13 +644,14 @@ def generate_reply_job(
             logger.info("[Gate][Bypass] forcing allow for DEV phone np=%s nb=%s", np, nb)
 
     except Exception as e:
-        logger.exception("[Gate] snapshot/build error: %s", e)
+        logger.exception("[Gate] snapshot/build error: {}", e)
         _store_and_send(
             user_id, convo_id,
             "Babe, I glitched. Give me one sec to reboot my attitude. 💅",
             send_phone=user_phone
         )
         return
+
     # add closer if abrupt / URL-ending
     reply = _maybe_append_ai_closer(reply, user_text, category=None, convo_id=convo_id)
 
@@ -689,35 +690,8 @@ def generate_reply_job(
                 return
         except Exception as e:
             logger.warning("[Worker][Media] Attachment handling failed: %s", e)
-            # fall through to text routing
-        # ---- post-chat finishing + send ---------------------------------------------
-        # add closer if abrupt / ends on URL
-        reply = _maybe_append_ai_closer(reply, user_text, category=None, convo_id=convo_id)
-
-        # If they asked for links/buy, append search links and mark them to survive hygiene
-        if re.search(r"(?i)\b(link|links|buy|purchase|where to buy|send.*link|shop)\b", (user_text or "")):
-            reply = _append_links_for_picks(reply)
-            reply = _ALLOW_AMZ_SEARCH_TOKEN + "\n" + reply
-
-        # Greeting fallback (one friendly opener if reply is still blank)
-        if not (reply or "").strip() and _is_greeting(user_text):
-            reply = "Hey gorgeous — I’m here. What kind of trouble are we getting into today? Pick a lane or vent at me. 💅"
-
-        # Safety net: guarantee exactly one message
-        if not (reply or "").strip():
-            reply = "Babe, I glitched. Say it again and I’ll do better. 💅"
-
-        # Affiliate/link hygiene and send
-        try:
-            reply = linkwrap.make_sms_reply(reply)          # wraps Amazon/Geniuslink/SYL
-            reply = ensure_not_link_ending(reply)
-        except Exception:
-            pass
-
-        _store_and_send(user_id, convo_id, reply, send_phone=user_phone)
-        return
-
-    # If a naked URL is in the text, quick media sniff
+         # ---- post-chat finishing + send ---------------------------------------------
+        # If a naked URL is in the text, quick media sniff
     if "http" in user_text:
         if any(ext in normalized_text for ext in [".jpg", ".jpeg", ".png", ".gif", ".webp"]):
             logger.info("[Worker][Media] Image URL detected, describing.")
@@ -746,12 +720,16 @@ def generate_reply_job(
     # context needed for the GPT call
     user_text = str(text_val or "")
 
-    with db.session() as s:
-        _row = s.execute(
-            sqltext("SELECT is_quiz_completed FROM user_profiles WHERE user_id = :uid"),
-            {"uid": user_id}
-        ).first()
-    has_quiz = bool(_row and _row[0])
+    try:
+        with db.session() as s:
+            _row = s.execute(
+                sqltext("SELECT is_quiz_completed FROM user_profiles WHERE user_id = :uid"),
+                {"uid": user_id}
+            ).first()
+        has_quiz = bool(_row and _row[0])
+    except Exception:
+        # dev shouldn’t crash if the table/row isn’t present
+        has_quiz = False
 
         # 5) Chat-first (single GPT pass)
     try:
@@ -772,7 +750,7 @@ def generate_reply_job(
             product_candidates=[],        # nothing scripted
             user_id=user_id,
             system_prompt=persona,
-            context={"has_completed_quiz": bool(profile and profile[0])},
+            context={"has_completed_quiz": has_quiz},
         )
 
         # keep it light — don't over-sanitize
@@ -798,6 +776,31 @@ def generate_reply_job(
     except Exception as e:
         logger.exception("[ChatOnly] GPT pass failed: {}", e)
         reply = ""
+# add closer if abrupt / ends on URL
+    reply = _maybe_append_ai_closer(reply, user_text, category=None, convo_id=convo_id)
+
+    # If they asked for links/buy, append search links and mark them to survive hygiene
+    if re.search(r"(?i)\b(link|links|buy|purchase|where to buy|send.*link|shop)\b", (user_text or "")):
+        reply = _append_links_for_picks(reply)
+        reply = _ALLOW_AMZ_SEARCH_TOKEN + "\n" + reply
+
+    # Greeting fallback (one friendly opener if reply is still blank)
+    if not (reply or "").strip() and _is_greeting(user_text):
+        reply = "Hey gorgeous — I’m here. What kind of trouble are we getting into today? Pick a lane or vent at me. 💅"
+
+    # Safety net: guarantee exactly one message
+    if not (reply or "").strip():
+        reply = "Babe, I glitched. Say it again and I’ll do better. 💅"
+
+    # Affiliate/link hygiene and send
+    try:
+        reply = linkwrap.make_sms_reply(reply)          # wraps Amazon/Geniuslink/SYL
+        reply = ensure_not_link_ending(reply)
+    except Exception:
+        pass
+
+    _store_and_send(user_id, convo_id, reply, send_phone=user_phone)
+    return
 
 # ---------------------------------------------------------------------- #
 # Debug and re-engagement jobs
