@@ -243,6 +243,23 @@ def _sentiment_hint(user_text: str) -> str:
     if any(x in t for x in ["excited", "love", "omg", "obsessed"]):
         return "User is excited. Match energy and lean into enthusiasm."
     return ""
+# --- Product-intent helpers (add above def single_line) -----------------------
+import re  # already imported at line 21; keeping here is harmless
+
+_PRODUCT_INTENT_RE = re.compile(
+    r"(?i)\b(recommend|rec(s)?|suggest|best|top|what should i (get|use)|"
+    r"buy|purchase|which (one|product)|options?|help me (regrow|grow|fix)|"
+    r"hair (regrowth|loss|fall)|minoxidil|ketoconazole|peptide serum)\b"
+)
+def _looks_like_product_intent(t: str) -> bool:
+    return bool(_PRODUCT_INTENT_RE.search(t or ""))
+
+_LISTY_RE = re.compile(r"(?i)\[(best|mid|budget)\]|http|•|- |1\)|2\)|3\)")
+def _looks_like_concrete_picks(t: str) -> bool:
+    t = t or ""
+    lines = [ln.strip() for ln in t.splitlines() if ln.strip()]
+    return bool(_LISTY_RE.search(t) or len(lines) >= 3)
+
 def single_line(system: str, user: str, *, max_tokens: int = 60, temperature: float = 0.7) -> str:
     """
     Ask the model for exactly one short line.
@@ -530,10 +547,55 @@ def generate_reply(
     # 5) Memory
     _remember_turn(user_id, "user", user_text or "")
     _remember_turn(user_id, "assistant", text or "")
+    # If it's clearly a product ask and the text is vague, rewrite as 3 concrete picks
+    if _looks_like_product_intent(user_text) and not _looks_like_concrete_picks(text):
+        try:
+            rescue = rewrite_as_three_picks(
+                user_text=user_text,
+                base_reply=text,
+                system_prompt=messages[0]["content"]
+            )
+            if rescue and len(rescue) > len(text):
+                text = rescue
+        except Exception:
+            pass
 
-    # 6) Return (your old function forgot to return anything)
     return text
-   
+def rewrite_as_three_picks(user_text: str, base_reply: str, system_prompt: str) -> str:
+    """
+    Gentle nudge: if the first reply dodged, ask GPT to rewrite with 3 concrete picks.
+    """
+    import os, logging
+    from openai import OpenAI
+
+    client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+    model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+
+    rescue_system = (
+        system_prompt +
+        "\nRewrite your advice into a decisive, helpful SMS with 2–3 concrete product/treatment picks "
+        "(BEST → Mid → Budget) each with a crisp one-liner benefit. "
+        "No surveys. One playful quip allowed. ≤ 450 chars. If links appear, keep them."
+    )
+
+    try:
+        resp = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": rescue_system},
+                {"role": "user", "content": user_text},
+                {"role": "assistant", "content": base_reply or ""},
+                {"role": "user", "content": "Rewrite that into real picks now."},
+            ],
+            temperature=float(os.getenv("OPENAI_TEMP", "0.6")),
+            max_tokens=int(os.getenv("OPENAI_MAXTOK", "260")),
+        )
+        text = (resp.choices[0].message.content or "").strip()
+        return text or base_reply
+    except Exception:
+        logging.exception("[AI] rescue pass failed")
+        return base_reply
+    
 # ------------------ Multimodal routes --------------- #
 def describe_image(image_url: str) -> str:
     """Analyze an image and answer in Bestie voice."""
