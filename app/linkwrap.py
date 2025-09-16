@@ -18,6 +18,7 @@ SYL_DENYLIST      = [d.strip().lower() for d in (os.getenv("SYL_DENYLIST") or "g
 
 GENIUSLINK_WRAP   = (os.getenv("GENIUSLINK_WRAP") or "").strip()
 GENIUSLINK_DOMAIN = (os.getenv("GENIUSLINK_DOMAIN") or "").strip()   # optional DOMAIN mode
+AMAZON_ASSOCIATE_TAG = (os.getenv("AMAZON_ASSOCIATE_TAG") or "").strip()
 
 CLOSER_MODE       = (os.getenv("CLOSER_MODE") or "off").strip().lower()  # 'ai' | 'static' | 'off'
 
@@ -58,20 +59,30 @@ def _amazon_dp(url: str) -> str:
     except Exception:
         return url
 
+from urllib.parse import urlparse, urlunparse, parse_qs, urlencode
+
+def _append_amz_tag(u: str) -> str:
+    if not AMAZON_ASSOCIATE_TAG:
+        return u
+    try:
+        p = urlparse(u)
+        q = parse_qs(p.query)
+        if "tag" not in q:
+            q["tag"] = [AMAZON_ASSOCIATE_TAG]
+        return urlunparse((p.scheme, p.netloc, p.path, p.params, urlencode(q, doseq=True), p.fragment))
+    except Exception:
+        return u
+
 def _wrap_amazon(url: str) -> str:
-    """
-    Wrap an Amazon DP URL via Geniuslink.
-    Priority: WRAP template → DOMAIN → original DP.
-    """
     u = _amazon_dp(url)
     if GENIUSLINK_WRAP:
-        # ex: https://geni.us/redirect?url={url}
         return GENIUSLINK_WRAP.format(url=quote_plus(u))
     if GENIUSLINK_DOMAIN:
         m = re.search(r"/dp/([A-Z0-9]{10})", u)
         if m:
             return f"https://{GENIUSLINK_DOMAIN.rstrip('/')}/{m.group(1)}"
-    return u
+    return _append_amz_tag(u)
+
 
 def _should_syl(domain: str) -> bool:
     """
@@ -162,6 +173,7 @@ def ensure_not_link_ending(text: str) -> str:
         ]
         return text.rstrip() + "\n" + closers[0]
     return text
+
 # Back-compat shim for existing code paths in workers.py
 def convert_to_geniuslink(url: str) -> str:
     """
