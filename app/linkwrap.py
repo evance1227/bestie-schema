@@ -73,6 +73,20 @@ def _append_amz_tag(u: str) -> str:
     except Exception:
         return u
 
+from urllib.parse import urlparse, urlunparse, parse_qs, urlencode
+
+def _append_amz_tag(u: str) -> str:
+    if not AMAZON_ASSOCIATE_TAG:
+        return u
+    try:
+        p = urlparse(u)
+        q = parse_qs(p.query)
+        if "tag" not in q:
+            q["tag"] = [AMAZON_ASSOCIATE_TAG]
+        return urlunparse((p.scheme, p.netloc, p.path, p.params, urlencode(q, doseq=True), p.fragment))
+    except Exception:
+        return u
+
 def _wrap_amazon(url: str) -> str:
     u = _amazon_dp(url)
     if GENIUSLINK_WRAP:
@@ -82,6 +96,7 @@ def _wrap_amazon(url: str) -> str:
         if m:
             return f"https://{GENIUSLINK_DOMAIN.rstrip('/')}/{m.group(1)}"
     return _append_amz_tag(u)
+
 
 
 def _should_syl(domain: str) -> bool:

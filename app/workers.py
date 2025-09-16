@@ -50,7 +50,6 @@ REDIS_URL = os.getenv("REDIS_URL", "")
 _rds = redis.from_url(REDIS_URL, decode_responses=True) if REDIS_URL else None
 USE_GHL_ONLY = (os.getenv("USE_GHL_ONLY", "1").lower() not in ("0","false","no"))
 SEND_FALLBACK_ON_ERROR = True  # keep it True so we still send if GPT path hiccups
-_ALLOW_AMZ_SEARCH_TOKEN = "[[ALLOW_AMZ_SEARCH]]"
 
 logger.info("[Boot] USE_GHL_ONLY=%s  SEND_FALLBACK_ON_ERROR=%s", USE_GHL_ONLY, SEND_FALLBACK_ON_ERROR)
 
@@ -72,6 +71,7 @@ QUIZ_URL  = os.getenv("QUIZ_URL",  "https://tally.so/r/YOUR_QUIZ_ID")
 
 # Optional toggles (default OFF)
 VIP_SOFT_ENABLED = os.getenv("VIP_SOFT_ENABLED", "0").lower() not in ("0","false","no","off")
+_ALLOW_AMZ_SEARCH_TOKEN = "[[ALLOW_AMZ_SEARCH]]"
 BESTIE_PRODUCT_CTA_ENABLED = os.getenv("BESTIE_PRODUCT_CTA_ENABLED", "0").lower() not in ("0","false","no","off")
 
 # VIP soft-pitch throttles (used only if VIP_SOFT_ENABLED)
@@ -122,6 +122,12 @@ BANNED_STOCK_PHRASES = [
     # kill any stale cringe if it sneaks in
     "I’ll cry a little", "houseplant", "you’re already on the VIP list",
 ]
+
+# ---------------------------------------------------------------------- #
+# Utilities
+# ---------------------------------------------------------------------- #
+_URL_END_RE = re.compile(r"(https?://[^\s)]+)\s*$", re.I)
+
 from urllib.parse import quote_plus
 
 def _amz_search_url(name: str) -> str:
@@ -151,11 +157,6 @@ def _append_links_for_picks(reply: str) -> str:
     for p in picks:
         lines.append(f"{p}: {_amz_search_url(p)}")
     return "\n".join(lines).strip()
-
-# ---------------------------------------------------------------------- #
-# Utilities
-# ---------------------------------------------------------------------- #
-_URL_END_RE = re.compile(r"(https?://[^\s)]+)\s*$", re.I)
 
 def _maybe_append_ai_closer(reply: str, user_text: str, category: str | None, convo_id: int) -> str:
     """
@@ -357,11 +358,10 @@ def _store_and_send(
     # ==== Final shaping ====
     text_val = _add_personality_if_flat(text_val)
     text_val = _strip_link_placeholders(text_val)
-    if not _allow_amz:                    # <— new guard
+    if not _allow_amz:
         text_val = _strip_amazon_search_links(text_val)
     text_val = wrap_all_affiliates(text_val)
-
-
+    text_val = ensure_not_link_ending(text_val)
 
     # ==== One-time debug marker ====
     DEBUG_MARKER = os.getenv("DEBUG_MARKER", "")
@@ -651,6 +651,13 @@ def generate_reply_job(
             send_phone=user_phone
         )
         return
+    # add closer if abrupt / URL-ending
+    reply = _maybe_append_ai_closer(reply, user_text, category=None, convo_id=convo_id)
+
+    # If they asked for links/buy, append search links and mark them to survive hygiene
+    if re.search(r"(?i)\b(link|links|buy|purchase|where to buy|send.*link|shop)\b", (user_text or "")):
+        reply = _append_links_for_picks(reply)
+        reply = _ALLOW_AMZ_SEARCH_TOKEN + "\n" + reply
 
     # 1) Media routing -----------------------------------------------------------
     if media_urls:
@@ -710,16 +717,25 @@ def generate_reply_job(
             sqltext("SELECT is_quiz_completed FROM user_profiles WHERE user_id = :uid"),
             {"uid": user_id}
         ).first()
-    has_quiz = bool(profile and profile[0])
+    # context needed for the GPT call
+    user_text = str(text_val or "")
 
+    with db.session() as s:
+        _row = s.execute(
+            sqltext("SELECT is_quiz_completed FROM user_profiles WHERE user_id = :uid"),
+            {"uid": user_id}
+        ).first()
+    has_quiz = bool(_row and _row[0])
+
+        # 5) Chat-first (single GPT pass)
     try:
         persona = (
             "You are Bestie — sharp, funny, emotionally fluent, a little savage but kind. "
-            "Answer now; do not survey me. One friendly follow-up at most. "
-            "If the user asks for recommendations (or it’s obvious), give a decisive take and real picks. "
-            "Keep replies ≤ 450 chars (one SMS). "
-            "If asked about pricing/quiz/prompt packs, use: "
-            "  Quiz → {quiz}; Prompt Packs ($7 or 3 for $20) → {packs}; Subscription → 7-day trial then $17/mo (cancel anytime). "
+            "Answer like a close friend, not a form. "
+            "Do NOT ask for 'options', 'budget', 'goal/constraint'. "
+            "If they greet you, greet them back playfully and ask one open-ended question. "
+            "Only suggest products if they clearly ask for them, or if they paste a link you can critique/compare. "
+            "Keep it to one SMS (<= 450 chars)."
         ).format(
             quiz=os.getenv("QUIZ_URL", "https://tally.so/r/YOUR_QUIZ_ID"),
             packs="https://schizobestie.gumroad.com/"
@@ -727,21 +743,20 @@ def generate_reply_job(
 
         raw = ai.generate_reply(
             user_text=user_text,
-            product_candidates=[],            # nothing scripted
+            product_candidates=[],        # nothing scripted
             user_id=user_id,
             system_prompt=persona,
-            context={"has_completed_quiz": has_quiz},
+            context={"has_completed_quiz": bool(profile and profile[0])},
         )
 
-        # Keep it light: don’t over-sanitize the model’s content
+        # keep it light — don't over-sanitize
         cleaned = _clean_reply(raw)
         reply = (cleaned.strip() if cleaned else (raw.strip() if raw else ""))
 
-
+        # de-formalize if the model slipped into survey mode
         reply = _anti_form_guard(reply, user_text)
-        reply = _maybe_append_ai_closer(reply, user_text, category=None, convo_id=convo_id)
 
-        # If the user clearly asked for products and the reply is vague, do a tiny rescue pass
+        # If user clearly asked for products and the reply is vague, do a tiny rescue pass
         if _wants_products(user_text) and not _looks_like_picks(reply):
             try:
                 rescue = ai.rewrite_as_three_picks(
@@ -751,30 +766,12 @@ def generate_reply_job(
                 )
                 if rescue and len(rescue.strip()) > len((reply or "").strip()):
                     reply = rescue.strip()
-            except Exception as _:
+            except Exception:
                 pass
-            
-
-                if not (reply or "").strip() and _is_greeting(user_text):
-                    reply = "Hey gorgeous — I’m here. What kind of trouble are we getting into today? Pick a lane or vent at me. 💅"
 
     except Exception as e:
-        logger.exception("[ChatOnly] GPT pass failed: %s", e)
+        logger.exception("[ChatOnly] GPT pass failed: {}", e)
         reply = ""
-
-    # Safety net: guarantee exactly one message
-    if not (reply or "").strip():
-        reply = "Babe, I glitched. Say it again and I’ll do better. 💅"
-
-    # 4) Affiliate/link hygiene and send ----------------------------------------
-    try:
-        reply = linkwrap.make_sms_reply(reply)  # wraps Amazon/Geniuslink/etc
-        reply = ensure_not_link_ending(reply)
-    except Exception:
-        pass
-
-    _store_and_send(user_id, convo_id, reply, send_phone=user_phone)
-    return
 
 # ---------------------------------------------------------------------- #
 # Debug and re-engagement jobs
