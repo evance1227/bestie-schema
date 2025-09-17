@@ -652,14 +652,6 @@ def generate_reply_job(
         )
         return
 
-    # add closer if abrupt / URL-ending
-    reply = _maybe_append_ai_closer(reply, user_text, category=None, convo_id=convo_id)
-
-    # If they asked for links/buy, append search links and mark them to survive hygiene
-    if re.search(r"(?i)\b(link|links|buy|purchase|where to buy|send.*link|shop)\b", (user_text or "")):
-        reply = _append_links_for_picks(reply)
-        reply = _ALLOW_AMZ_SEARCH_TOKEN + "\n" + reply
-
     # 1) Media routing -----------------------------------------------------------
     if media_urls:
         first = (media_urls[0] or "").strip()
@@ -776,7 +768,7 @@ def generate_reply_job(
     except Exception as e:
         logger.exception("[ChatOnly] GPT pass failed: {}", e)
         reply = ""
-# add closer if abrupt / ends on URL
+    # add closer if abrupt / ends on URL
     reply = _maybe_append_ai_closer(reply, user_text, category=None, convo_id=convo_id)
 
     # If they asked for links/buy, append search links and mark them to survive hygiene
@@ -798,9 +790,10 @@ def generate_reply_job(
         reply = ensure_not_link_ending(reply)
     except Exception:
         pass
-
+    logger.info("[FINISH] sending reply len=%d", len(reply or ""))    
     _store_and_send(user_id, convo_id, reply, send_phone=user_phone)
     return
+
 
 # ---------------------------------------------------------------------- #
 # Debug and re-engagement jobs
