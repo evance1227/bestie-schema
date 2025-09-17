@@ -128,6 +128,33 @@ BANNED_STOCK_PHRASES = [
 # ---------------------------------------------------------------------- #
 _URL_END_RE = re.compile(r"(https?://[^\s)]+)\s*$", re.I)
 
+# --- SMS segmentation (emoji-safe) -------------------------------------------
+def _segments_for_sms(body: str) -> List[str]:
+    """
+    Split body into GSM-7 (153 chars) or UCS-2 (67 chars) segments with room
+    for a "[1/3] " prefix. Conservative word-boundary split.
+    """
+    text = (body or "").strip()
+    if not text:
+        return []
+
+    # crude but reliable: emojis/non-ascii => UCS-2
+    is_basic = all(ord(c) < 128 for c in text)
+    per = 153 if is_basic else 67
+    limit = max(10, per - 8)  # reserve ~8 chars for "[1/2] "
+
+    parts: List[str] = []
+    t = text
+    while len(t) > limit:
+        cut = t.rfind(" ", 0, limit)
+        if cut == -1:
+            cut = limit
+        parts.append(t[:cut].strip())
+        t = t[cut:].strip()
+    if t:
+        parts.append(t)
+    return parts
+
 from urllib.parse import quote_plus
 
 def _amz_search_url(name: str) -> str:
@@ -150,12 +177,26 @@ def _extract_pick_names(text: str, maxn: int = 3) -> list[str]:
         if len(out) >= maxn: break
     return out
 
-def _append_links_for_picks(reply: str) -> str:
-    picks = _extract_pick_names(reply, maxn=3)
-    if not picks: return reply
+def _append_links_for_picks(reply: str, convo_id: Optional[int] = None) -> str:
+    """
+    Append search links for 2–3 pick names. If none found in `reply`,
+    look back at recent outbound messages and reuse the last picks.
+    """
+    names = _extract_pick_names(reply, maxn=3)
+
+    if not names and convo_id:
+        recent = _recent_outbound_texts(convo_id, limit=3)
+        for text in recent:
+            names = _extract_pick_names(text or "", maxn=3)
+            if names:
+                break
+
+    if not names:
+        return reply
+
     lines = [reply.rstrip(), ""]
-    for p in picks:
-        lines.append(f"{p}: {_amz_search_url(p)}")
+    for n in names:
+        lines.append(f"{n}: {_amz_search_url(n)}")
     return "\n".join(lines).strip()
 
 def _maybe_append_ai_closer(reply: str, user_text: str, category: str | None, convo_id: int) -> str:
@@ -343,9 +384,6 @@ def _store_and_send(
     except Exception:
         pass
 
-    max_len = 450
-    parts: List[str] = []
-
     text_val = (text_val or "").strip()
     if not text_val:
         return
@@ -362,57 +400,13 @@ def _store_and_send(
         text_val = _strip_amazon_search_links(text_val)
     text_val = wrap_all_affiliates(text_val)
     text_val = ensure_not_link_ending(text_val)
-
     # ==== One-time debug marker ====
     DEBUG_MARKER = os.getenv("DEBUG_MARKER", "")
     if DEBUG_MARKER:
         text_val = text_val.rstrip() + f"\n{DEBUG_MARKER}"
-
-    # ==== POST to GHL (use the real inbound phone if provided) ====
-    # Normalize: prefer job-supplied phone; fall back to TEST_PHONE only for dev
-   # always use the real phone the webhook passed to the worker; no test fallbacks
-    # ---- Primary send path: GHL; if that fails, fallback to direct sender once ----
-    user_phone = _norm_phone(send_phone) if send_phone else None
-    GHL_WEBHOOK_URL = os.getenv("GHL_OUTBOUND_WEBHOOK_URL")
-
-    sent_ok = False
-
-    if GHL_WEBHOOK_URL:
-        try:
-            ghl_payload = {
-                "phone": user_phone,
-                "message": text_val,
-                "user_id": user_id,
-                "convo_id": convo_id
-            }
-            resp = requests.post(GHL_WEBHOOK_URL, json=ghl_payload, timeout=8)
-            logger.info("[GHL_SEND] status={} body={}",
-                        getattr(resp, "status_code", None),
-                        (getattr(resp, "text", "") or "")[:200])
-            sent_ok = True
-        except Exception as e:
-            logger.warning("[GHL_SEND] Failed to POST to GHL: {}", e)
-
-    # Fallback only if the GHL POST did not succeed
-    if not sent_ok:
-        try:
-            integrations.send_sms_reply(user_id, text_val)
-            logger.success("[Worker][Send] Fallback SMS send attempted for user_id={}", user_id)
-            sent_ok = True
-        except Exception:
-            logger.exception("[Worker][Send] Exception while calling fallback send_sms_reply")
-
-
+    parts = _segments_for_sms(text_val)   
     # ==== Break into SMS chunks ====
-    while len(text_val) > max_len:
-        split_point = text_val[:max_len].rfind(" ")
-        if split_point == -1:
-            split_point = max_len
-        parts.append(text_val[:split_point].strip())
-        text_val = text_val[split_point:].strip()
-    if text_val:
-        parts.append(text_val)
-
+    GHL_WEBHOOK_URL = os.getenv("GHL_OUTBOUND_WEBHOOK_URL")
     total_parts = len(parts)
     for idx, part in enumerate(parts, 1):
         prefix = f"[{idx}/{total_parts}] " if total_parts > 1 else ""
@@ -426,6 +420,22 @@ def _store_and_send(
             logger.info("[Worker][DB] Outbound stored: convo_id={} user_id={} msg_id={}", convo_id, user_id, message_id)
         except Exception:
             logger.exception("[Worker][DB] Failed to insert outbound, will still attempt send")
+
+        # Primary send to GHL per-part (outside the DB session)
+        if GHL_WEBHOOK_URL:
+            try:
+                ghl_payload = {
+                    "phone": send_phone,
+                    "message": full_text,
+                    "user_id": user_id,
+                    "convo_id": convo_id
+                }
+                resp = requests.post(GHL_WEBHOOK_URL, json=ghl_payload, timeout=8)
+                logger.info("[GHL_SEND] status={} body={}",
+                            getattr(resp, "status_code", None),
+                            (getattr(resp, "text", "") or "")[:200])
+            except Exception as e:
+                logger.warning("[GHL_SEND] Failed to POST to GHL: {}", e)
 
         if not USE_GHL_ONLY:
             try:
@@ -441,10 +451,10 @@ def _store_and_send(
                 time.sleep(SMS_PART_DELAY_MS / 1000.0)
         except Exception:
             pass
-   
+
 # ---------------------------------------------------------------------- #
 # Rename flow
-# ---------------------------------------------------------------------- #
+#---------------------------------------------------------------------- #
 RENAME_PATTERNS = [
     r"\bname\s+you\s+are\s+['\"]?([A-Za-z0-9\- _]{2,32})['\"]?",
     r"\bi(?:'|)ll\s+call\s+you\s+['\"]?([A-Za-z0-9\- _]{2,32})['\"]?",
@@ -703,15 +713,6 @@ def generate_reply_job(
         return
 
     # 3) Chat-first (single GPT pass) -------------------------------------------
-    # Pull a tiny bit of context
-    with db.session() as s:
-        profile = s.execute(
-            sqltext("SELECT is_quiz_completed FROM user_profiles WHERE user_id = :uid"),
-            {"uid": user_id}
-        ).first()
-    # context needed for the GPT call
-    user_text = str(text_val or "")
-
     try:
         with db.session() as s:
             _row = s.execute(
@@ -723,11 +724,11 @@ def generate_reply_job(
         # dev shouldn’t crash if the table/row isn’t present
         has_quiz = False
 
-        # 5) Chat-first (single GPT pass)
+    # 5) Chat-first (single GPT pass)
     try:
         persona = (
-            "You are Bestie — sharp, funny, emotionally fluent, a little savage but kind. "
-            "Answer like a close friend, not a form. "
+            "You are Bestie — sharp, funny, emotionally fluent, and glamorously blunt. "
+            "Answer now; don’t interview me. One playful follow-up at most. "
             "Do NOT ask for 'options', 'budget', 'goal/constraint'. "
             "If they greet you, greet them back playfully and ask one open-ended question. "
             "Only suggest products if they clearly ask for them, or if they paste a link you can critique/compare. "
@@ -773,7 +774,7 @@ def generate_reply_job(
 
     # If they asked for links/buy, append search links and mark them to survive hygiene
     if re.search(r"(?i)\b(link|links|buy|purchase|where to buy|send.*link|shop)\b", (user_text or "")):
-        reply = _append_links_for_picks(reply)
+        reply = _append_links_for_picks(reply, convo_id=convo_id)
         reply = _ALLOW_AMZ_SEARCH_TOKEN + "\n" + reply
 
     # Greeting fallback (one friendly opener if reply is still blank)
