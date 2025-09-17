@@ -88,16 +88,14 @@ def _append_amz_tag(u: str) -> str:
         return u
 
 def _wrap_amazon(url: str) -> str:
-    u = _amazon_dp(url)
+    u = _amazon_dp(url)  # keeps DP if present; otherwise returns original (search)
     if GENIUSLINK_WRAP:
         return GENIUSLINK_WRAP.format(url=quote_plus(u))
     if GENIUSLINK_DOMAIN:
         m = re.search(r"/dp/([A-Z0-9]{10})", u)
         if m:
             return f"https://{GENIUSLINK_DOMAIN.rstrip('/')}/{m.group(1)}"
-    return _append_amz_tag(u)
-
-
+    return _append_amz_tag(u)   # <— THIS LINE ensures search links get ?tag=
 
 def _should_syl(domain: str) -> bool:
     """

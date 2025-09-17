@@ -46,6 +46,7 @@ from app import db, models, ai, integrations, linkwrap
 # ---------------------------------------------------------------------- #
 # Environment and globals
 # ---------------------------------------------------------------------- #
+SMS_PART_DELAY_MS = int(os.getenv("SMS_PART_DELAY_MS", "1600"))
 REDIS_URL = os.getenv("REDIS_URL", "")
 _rds = redis.from_url(REDIS_URL, decode_responses=True) if REDIS_URL else None
 USE_GHL_ONLY = (os.getenv("USE_GHL_ONLY", "1").lower() not in ("0","false","no"))
@@ -129,10 +130,11 @@ BANNED_STOCK_PHRASES = [
 _URL_END_RE = re.compile(r"(https?://[^\s)]+)\s*$", re.I)
 
 # --- SMS segmentation (emoji-safe) -------------------------------------------
-def _segments_for_sms(body: str) -> List[str]:
+def _segments_for_sms(body: str, max_parts: int | None = None) -> List[str]:
     """
-    Split body into GSM-7 (153 chars) or UCS-2 (67 chars) segments with room
-    for a "[1/3] " prefix. Conservative word-boundary split.
+    Split body into GSM-7 (153) or UCS-2 (67) segments, leaving room
+    for a "[1/3] " style prefix. If max_parts is set, clamp to that many parts
+    by merging the tail and adding an ellipsis.
     """
     text = (body or "").strip()
     if not text:
@@ -141,7 +143,7 @@ def _segments_for_sms(body: str) -> List[str]:
     # crude but reliable: emojis/non-ascii => UCS-2
     is_basic = all(ord(c) < 128 for c in text)
     per = 153 if is_basic else 67
-    limit = max(10, per - 8)  # reserve ~8 chars for "[1/2] "
+    limit = max(10, per - 8)  # reserve ~8 chars for "[1/3] "
 
     parts: List[str] = []
     t = text
@@ -153,6 +155,14 @@ def _segments_for_sms(body: str) -> List[str]:
         t = t[cut:].strip()
     if t:
         parts.append(t)
+
+    if max_parts and len(parts) > max_parts:
+        head = parts[: max_parts - 1]
+        tail = " ".join(parts[max_parts - 1:]).strip()
+        # re-split tail once so last part still respects limit
+        last = tail[: (limit - 1)].rstrip() + "…"
+        parts = head + [last]
+
     return parts
 
 from urllib.parse import quote_plus
@@ -404,7 +414,10 @@ def _store_and_send(
     DEBUG_MARKER = os.getenv("DEBUG_MARKER", "")
     if DEBUG_MARKER:
         text_val = text_val.rstrip() + f"\n{DEBUG_MARKER}"
-    parts = _segments_for_sms(text_val)   
+    parts = _segments_for_sms(
+    text_val,
+    max_parts=int(os.getenv("SMS_MAX_PARTS", "3"))
+)  
     # ==== Break into SMS chunks ====
     GHL_WEBHOOK_URL = os.getenv("GHL_OUTBOUND_WEBHOOK_URL")
     total_parts = len(parts)
@@ -752,6 +765,8 @@ def generate_reply_job(
 
         # de-formalize if the model slipped into survey mode
         reply = _anti_form_guard(reply, user_text)
+        # keep the list crisp if the model rambled
+        reply = re.sub(r"\s*\n\s*\n\s*", "\n", reply or "").strip()
 
         # If user clearly asked for products and the reply is vague, do a tiny rescue pass
         if _wants_products(user_text) and not _looks_like_picks(reply):
@@ -770,6 +785,12 @@ def generate_reply_job(
         logger.exception("[ChatOnly] GPT pass failed: {}", e)
         reply = ""
     # add closer if abrupt / ends on URL
+    # hard cap so we don't explode into too many parts
+    if len(reply or "") > int(os.getenv("SMS_CLAMP_CHARS", "420")):
+        cut = (reply or "")[:int(os.getenv("SMS_CLAMP_CHARS", "420"))]
+        dot = cut.rfind(".")
+        reply = (cut[:dot+1] if dot != -1 else cut).strip()
+
     reply = _maybe_append_ai_closer(reply, user_text, category=None, convo_id=convo_id)
 
     # If they asked for links/buy, append search links and mark them to survive hygiene
