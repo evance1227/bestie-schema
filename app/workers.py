@@ -54,9 +54,6 @@ SEND_FALLBACK_ON_ERROR = True  # keep it True so we still send if GPT path hiccu
 
 logger.info("[Boot] USE_GHL_ONLY=%s  SEND_FALLBACK_ON_ERROR=%s", USE_GHL_ONLY, SEND_FALLBACK_ON_ERROR)
 
-# Message pacing so carriers preserve multipart ordering
-SMS_PART_DELAY_MS = int(os.getenv("SMS_PART_DELAY_MS", "800"))
-
 # Dev bypass
 DEV_BYPASS_PHONE = os.getenv("DEV_BYPASS_PHONE", "").strip()
 
@@ -189,23 +186,27 @@ def _extract_pick_names(text: str, maxn: int = 3) -> list[str]:
 
 def _append_links_for_picks(reply: str, convo_id: Optional[int] = None) -> str:
     """
-    Append search links for 2–3 pick names. If none found in `reply`,
-    look back at recent outbound messages and reuse the last picks.
+    Append search links for 2–3 pick names. If none found in reply, look back.
+    If still none, derive from user context keywords as a last resort.
     """
     names = _extract_pick_names(reply, maxn=3)
 
     if not names and convo_id:
-        recent = _recent_outbound_texts(convo_id, limit=3)
+        recent = _recent_outbound_texts(convo_id, limit=5)
         for text in recent:
             names = _extract_pick_names(text or "", maxn=3)
             if names:
                 break
 
     if not names:
-        return reply
+        # last-resort keyword guesses
+        # keep this tiny so we don't invent a catalog
+        kw = re.search(r"(?i)\b(minoxidil|ketoconazole|peptide serum|nutrafol|viviscal)\b", reply or "")
+        base = kw.group(1) if kw else "5% minoxidil foam"
+        names = [base]
 
     lines = [reply.rstrip(), ""]
-    for n in names:
+    for n in names[:3]:
         lines.append(f"{n}: {_amz_search_url(n)}")
     return "\n".join(lines).strip()
 
@@ -378,16 +379,14 @@ def _store_and_send(
     send_phone: Optional[str] = None,
 ) -> None:
     """
-    Single place to store and send. Splits long messages to ~450 chars with [1/2] prefix.
-    Adds a tiny headway between multipart sends so carriers keep order.
-    Applies final link and tone cleanup before sending and storage.
+    Store once, send once. No manual segmentation or [1/3] prefixes.
+    Carriers will stitch if the payload segments on their side.
     """
     # --- outbound dedupe: skip if we just sent the exact same text in this convo ---
     try:
         from hashlib import sha1
         sig = sha1((str(convo_id) + "::" + str(text_val)).encode("utf-8")).hexdigest()
         k   = f"sent:{convo_id}:{sig}"
-        # try to set for 30s; if it already exists, someone just sent the same text
         if _rds and not _rds.set(k, "1", ex=30, nx=True):
             logger.info("[Send][Dedup] Skipping duplicate send for convo %s", convo_id)
             return
@@ -397,7 +396,8 @@ def _store_and_send(
     text_val = (text_val or "").strip()
     if not text_val:
         return
-    
+
+    # keep Amazon search links iff token present
     _allow_amz = False
     if text_val.startswith(_ALLOW_AMZ_SEARCH_TOKEN):
         _allow_amz = True
@@ -410,60 +410,48 @@ def _store_and_send(
         text_val = _strip_amazon_search_links(text_val)
     text_val = wrap_all_affiliates(text_val)
     text_val = ensure_not_link_ending(text_val)
-    # ==== One-time debug marker ====
+
+    # optional debug marker
     DEBUG_MARKER = os.getenv("DEBUG_MARKER", "")
     if DEBUG_MARKER:
         text_val = text_val.rstrip() + f"\n{DEBUG_MARKER}"
-    parts = _segments_for_sms(
-    text_val,
-    max_parts=int(os.getenv("SMS_MAX_PARTS", "3"))
-)  
-    # ==== Break into SMS chunks ====
+
+    message_id = str(uuid.uuid4())
+
+    # === DB store once
+    try:
+        with db.session() as s:
+            models.insert_message(s, convo_id, "out", message_id, text_val)
+            s.commit()
+        logger.info("[Worker][DB] Outbound stored: convo_id={} user_id={} msg_id={}", convo_id, user_id, message_id)
+    except Exception:
+        logger.exception("[Worker][DB] Failed to insert outbound, will still attempt send")
+
+    # === Send once (GHL first, optional fallback)
     GHL_WEBHOOK_URL = os.getenv("GHL_OUTBOUND_WEBHOOK_URL")
-    total_parts = len(parts)
-    for idx, part in enumerate(parts, 1):
-        prefix = f"[{idx}/{total_parts}] " if total_parts > 1 else ""
-        full_text = prefix + part
-        message_id = str(uuid.uuid4())
-
+    if GHL_WEBHOOK_URL:
         try:
-            with db.session() as s:
-                models.insert_message(s, convo_id, "out", message_id, full_text)
-                s.commit()
-            logger.info("[Worker][DB] Outbound stored: convo_id={} user_id={} msg_id={}", convo_id, user_id, message_id)
+            payload = {"phone": send_phone, "message": text_val, "user_id": user_id, "convo_id": convo_id}
+            resp = requests.post(GHL_WEBHOOK_URL, json=payload, timeout=8)
+            logger.info("[GHL_SEND] status={} body={}",
+                        getattr(resp, "status_code", None),
+                        (getattr(resp, "text", "") or "")[:200])
+        except Exception as e:
+            logger.warning("[GHL_SEND] Failed to POST to GHL: {}", e)
+
+    if not USE_GHL_ONLY:
+        try:
+            integrations.send_sms_reply(user_id, text_val)
+            logger.success("[Worker][Send] Fallback SMS send attempted for user_id={}", user_id)
         except Exception:
-            logger.exception("[Worker][DB] Failed to insert outbound, will still attempt send")
-
-        # Primary send to GHL per-part (outside the DB session)
-        if GHL_WEBHOOK_URL:
-            try:
-                ghl_payload = {
-                    "phone": send_phone,
-                    "message": full_text,
-                    "user_id": user_id,
-                    "convo_id": convo_id
-                }
-                resp = requests.post(GHL_WEBHOOK_URL, json=ghl_payload, timeout=8)
-                logger.info("[GHL_SEND] status={} body={}",
-                            getattr(resp, "status_code", None),
-                            (getattr(resp, "text", "") or "")[:200])
-            except Exception as e:
-                logger.warning("[GHL_SEND] Failed to POST to GHL: {}", e)
-
-        if not USE_GHL_ONLY:
-            try:
-                integrations.send_sms_reply(user_id, full_text)
-                logger.success("[Worker][Send] SMS send attempted for user_id={}", user_id)
-            except Exception:
-                logger.exception("[Worker][Send] Exception while calling send_sms_reply")
-
+            logger.exception("[Worker][Send] Exception while calling send_sms_reply")
 
         # tiny pause so carriers preserve ordering
         try:
             if total_parts > 1 and idx < total_parts:
                 time.sleep(SMS_PART_DELAY_MS / 1000.0)
         except Exception:
-            pass
+                    pass        
 
 # ---------------------------------------------------------------------- #
 # Rename flow
@@ -568,19 +556,13 @@ def _anti_form_guard(text: Optional[str], user_text: str) -> Optional[str]:
     if not text:
         return text
     t = text.strip()
-    # If the whole first line is a survey prompt, replace it with an answer-first opener
+
+    # If the first line is a survey prompt, replace with an answer-first opener
     first, *rest = t.splitlines()
     if _ANTI_FORM_RE.match(first.strip()):
-        # Minimal, on-brand opener with a single follow-up at the end
-        # Note: short, decisive, no survey
         body = "Here’s what I’d do: focus on what actually moves the needle, then tweak if needed."
         follow = "Want me to tailor this tighter — or are you ready to try it?"
-        return f"{body}\n{(' '.join(rest)).strip() or follow}"
-    # Also strip any repeat survey prompts anywhere
-    t = _ANTI_FORM_RE.sub("", t).strip()
-    # Kill redundant “let’s narrow it down” lines mid-reply
-    t = re.sub(r"(?im)^\s*let'?s narrow.*$", "", t).strip()
-    return t or text
+        t = f"{body}\n{(' '.join(rest)).strip() or follow}"
 
 _GREETING_RE = re.compile(r"^\s*(hi|hey|hello|yo|hiya|sup|good (morning|afternoon|evening))\b", re.I)
 
@@ -762,6 +744,23 @@ def generate_reply_job(
         # keep it light — don't over-sanitize
         cleaned = _clean_reply(raw)
         reply = (cleaned.strip() if cleaned else (raw.strip() if raw else ""))
+        # remove survey-ish prompts
+        reply = _anti_form_guard(reply, user_text)
+
+        # light clamp so we don't blast novels; still a single send
+        CLAMP = int(os.getenv("SMS_CLAMP_CHARS", "520"))
+        if len(reply or "") > CLAMP:
+            cut = (reply or "")[:CLAMP]
+            sp = cut.rfind(" ")
+            reply = (cut[:sp] if sp != -1 else cut).rstrip()
+
+        # add closer if abrupt / ends on URL
+        reply = _maybe_append_ai_closer(reply, user_text, category=None, convo_id=convo_id)
+
+        # If they asked for links/buy, append search links and mark them to survive hygiene
+        if re.search(r"(?i)\b(link|links|buy|purchase|where to buy|send.*link|shop)\b", (user_text or "")):
+            reply = _append_links_for_picks(reply, convo_id=convo_id)
+            reply = _ALLOW_AMZ_SEARCH_TOKEN + "\n" + reply
 
         # de-formalize if the model slipped into survey mode
         reply = _anti_form_guard(reply, user_text)
