@@ -445,13 +445,7 @@ def _store_and_send(
             logger.success("[Worker][Send] Fallback SMS send attempted for user_id={}", user_id)
         except Exception:
             logger.exception("[Worker][Send] Exception while calling send_sms_reply")
-
-        # tiny pause so carriers preserve ordering
-        try:
-            if total_parts > 1 and idx < total_parts:
-                time.sleep(SMS_PART_DELAY_MS / 1000.0)
-        except Exception:
-                    pass        
+   
 
 # ---------------------------------------------------------------------- #
 # Rename flow
@@ -556,13 +550,14 @@ def _anti_form_guard(text: Optional[str], user_text: str) -> Optional[str]:
     if not text:
         return text
     t = text.strip()
-
-    # If the first line is a survey prompt, replace with an answer-first opener
     first, *rest = t.splitlines()
     if _ANTI_FORM_RE.match(first.strip()):
         body = "Here’s what I’d do: focus on what actually moves the needle, then tweak if needed."
         follow = "Want me to tailor this tighter — or are you ready to try it?"
         t = f"{body}\n{(' '.join(rest)).strip() or follow}"
+    t = _ANTI_FORM_RE.sub("", t).strip()
+    t = re.sub(r"(?im)^\s*let'?s narrow.*$", "", t).strip()
+    return t
 
 _GREETING_RE = re.compile(r"^\s*(hi|hey|hello|yo|hiya|sup|good (morning|afternoon|evening))\b", re.I)
 
@@ -766,7 +761,7 @@ def generate_reply_job(
         reply = _anti_form_guard(reply, user_text)
         # keep the list crisp if the model rambled
         reply = re.sub(r"\s*\n\s*\n\s*", "\n", reply or "").strip()
-
+        
         # If user clearly asked for products and the reply is vague, do a tiny rescue pass
         if _wants_products(user_text) and not _looks_like_picks(reply):
             try:
