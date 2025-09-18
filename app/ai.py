@@ -477,13 +477,14 @@ def generate_reply(
     # 2) Best-first product policy (never survey for budget)
     shopping_guidance = """
     When product help is requested or implied:
-    - Answer first. Do not ask for budget/preferences. No surveys.
-    - Return 2–3 options total, each with a tight one-liner benefit (use PRODUCT ONE-LINERS vibe).
-    - Lead with the BEST-IN-CLASS pick. Then a smart Mid. Then a real Budget that still works.
-    - If the user says “which one”, “only buy one”, or “best” — pick EXACTLY ONE and justify in 1–2 lines.
-    - Do NOT write the literal word "URL". If links are present, keep them; otherwise omit.
-    - Keep the whole reply ≤ 450 chars. No disclaimers.
+    - Answer first. No surveys. 
+    - Return 2–3 options total, each with a tight one-liner benefit.
+    - If the user asks for links, include 2–3 links (brand sites or Amazon DP/search). Avoid the literal word “URL”.
+    - Keep the whole reply ≤ 520 chars. No disclaimers.
     """.strip()
+
+    system_prompt = (system_prompt or "") + "\n\n" + shopping_guidance
+
 
     # Tiny domain nudge (hair) so she stops hand-waving
     hair_nudge = ""
@@ -504,28 +505,18 @@ def generate_reply(
     # 3) Call OpenAI (prefer app.integrations if present)
     text_out = ""
     try:
-        from app.integrations import openai_complete  # centralized path
+        from app.integrations import openai_complete
         text_out = openai_complete(messages=messages, user_id=user_id, context=context)
     except Exception as e:
         logger.info("[AI] Falling back to direct OpenAI call: {}", e)
-        if CLIENT is None or not os.getenv("OPENAI_API_KEY"):
-            # ultra fallback: echo with tiny nudge
-            if product_candidates:
-                p = product_candidates[0]
-                text_out = f"{p.get('name','Product')} — easy win. {p.get('url','')}"
-            else:
-                text_out = f"{(user_text or '')[:40]}… I’ve got you."
-        else:
-            resp = CLIENT.chat.completions.create(
-                model=OPENAI_MODEL,
-                messages=messages,
-                temperature=float(os.getenv("OPENAI_TEMP", "0.6")),
-                max_tokens=int(os.getenv("OPENAI_MAXTOK", "260")),
-            )
-            # *** THIS LINE WAS MISSING IN YOUR FILE — caused empty replies ***
-            text_out = (resp.choices[0].message.content or "").strip()
-
-    text = text_out or ""
+        resp = CLIENT.chat.completions.create(
+        model=OPENAI_MODEL,
+        messages=messages,
+        temperature=float(os.getenv("OPENAI_TEMP", "0.7")),
+        max_tokens=int(os.getenv("OPENAI_MAXTOK", "520")),
+    )
+    text = (resp.choices[0].message.content or "").strip()
+    logger.info("[AI][Raw][:160] %s", text[:160])
 
     # 4) Tone rescue: banned opener and cringe rewrite if needed
     lines = [l for l in text.splitlines() if l.strip()]

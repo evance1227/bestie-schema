@@ -399,9 +399,9 @@ def _store_and_send(
 
     # keep Amazon search links iff token present
     _allow_amz = False
-    if text_val.startswith(_ALLOW_AMZ_SEARCH_TOKEN):
+    if _ALLOW_AMZ_SEARCH_TOKEN in text_val:
         _allow_amz = True
-        text_val = text_val.replace(_ALLOW_AMZ_SEARCH_TOKEN, "", 1).strip()
+        text_val = text_val.replace(_ALLOW_AMZ_SEARCH_TOKEN, "", 1).lstrip()
 
     # ==== Final shaping ====
     text_val = _add_personality_if_flat(text_val)
@@ -741,16 +741,37 @@ def generate_reply_job(
         reply = (cleaned.strip() if cleaned else (raw.strip() if raw else ""))
         # remove survey-ish prompts
         reply = _anti_form_guard(reply, user_text)
+        # is the user explicitly asking for links?
+        link_request = bool(re.search(
+            r"(?i)\b(link|links|buy|purchase|where to buy|send.*link|shop)\b",
+            (user_text or "")
+        ))
 
         # light clamp so we don't blast novels; still a single send
-        CLAMP = int(os.getenv("SMS_CLAMP_CHARS", "520"))
-        if len(reply or "") > CLAMP:
-            cut = (reply or "")[:CLAMP]
-            sp = cut.rfind(" ")
-            reply = (cut[:sp] if sp != -1 else cut).rstrip()
+        if not link_request:
+            CLAMP = int(os.getenv("SMS_CLAMP_CHARS", "520"))
+            if len(reply or "") > CLAMP:
+                cut = (reply or "")[:CLAMP]
+                sp = cut.rfind(" ")
+                reply = (cut[:sp] if sp != -1 else cut).rstrip()
+
 
         # add closer if abrupt / ends on URL
         reply = _maybe_append_ai_closer(reply, user_text, category=None, convo_id=convo_id)
+        if link_request:
+            # build a compact links-only reply; backfill names from recent if needed
+            names = _extract_pick_names(reply, maxn=3)
+            if not names:
+                recent = _recent_outbound_texts(convo_id, limit=5)
+                for t in recent:
+                    names = _extract_pick_names(t or "", maxn=3)
+                    if names:
+                        break
+            if names:
+                lines = [f"{n}: {_amz_search_url(n)}" for n in names]
+                reply = "Here you go:\n" + "\n".join(lines)
+                # mark so _store_and_send keeps Amazon search links
+                reply = _ALLOW_AMZ_SEARCH_TOKEN + "\n" + reply
 
         # If they asked for links/buy, append search links and mark them to survive hygiene
         if re.search(r"(?i)\b(link|links|buy|purchase|where to buy|send.*link|shop)\b", (user_text or "")):
