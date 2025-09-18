@@ -67,35 +67,22 @@ def _append_amz_tag(u: str) -> str:
     try:
         p = urlparse(u)
         q = parse_qs(p.query)
-        if "tag" not in q:
-            q["tag"] = [AMAZON_ASSOCIATE_TAG]
-        return urlunparse((p.scheme, p.netloc, p.path, p.params, urlencode(q, doseq=True), p.fragment))
-    except Exception:
-        return u
-
-from urllib.parse import urlparse, urlunparse, parse_qs, urlencode
-
-def _append_amz_tag(u: str) -> str:
-    if not AMAZON_ASSOCIATE_TAG:
-        return u
-    try:
-        p = urlparse(u)
-        q = parse_qs(p.query)
-        if "tag" not in q:
+        # don’t overwrite a tag if one already exists
+        if "tag" not in q or not q["tag"]:
             q["tag"] = [AMAZON_ASSOCIATE_TAG]
         return urlunparse((p.scheme, p.netloc, p.path, p.params, urlencode(q, doseq=True), p.fragment))
     except Exception:
         return u
 
 def _wrap_amazon(url: str) -> str:
-    u = _amazon_dp(url)  # keeps DP if present; otherwise returns original (search)
+    u = _amazon_dp(url)  # returns DP if present; otherwise leaves search unchanged
     if GENIUSLINK_WRAP:
         return GENIUSLINK_WRAP.format(url=quote_plus(u))
     if GENIUSLINK_DOMAIN:
         m = re.search(r"/dp/([A-Z0-9]{10})", u)
         if m:
             return f"https://{GENIUSLINK_DOMAIN.rstrip('/')}/{m.group(1)}"
-    return _append_amz_tag(u)   # <— THIS LINE ensures search links get ?tag=
+    return _append_amz_tag(u)   # <— must be this line
 
 def _should_syl(domain: str) -> bool:
     """
