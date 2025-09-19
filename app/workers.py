@@ -239,13 +239,48 @@ def _extract_pick_names(text: str, maxn: int = 3) -> list[str]:
         if n not in seen:
             seen.add(n); out.append(n)
         if len(out) >= maxn: break
+    return out
+
+# --- phrase extractor so "link to NeoCell Super Collagen" never returns empty ----
+_PHRASE_RE = re.compile(
+    r"(?i)\b(?:link|buy|purchase|shop|url|send)\s*(?:to|for|the)?\s*([A-Za-z0-9' \-\+\&]+)"
+)
+
+def _phrase_from_user_text(user_text: str) -> Optional[str]:
+    t = (user_text or "").strip()
+    m = _PHRASE_RE.search(t)
+    if m:
+        phrase = m.group(1).strip(" .?!")
+        # avoid obviously generic words
+        if len(phrase) >= 3 and not re.fullmatch(r"(it|this|that|one|two|three)", phrase, flags=re.I):
+            return phrase
+    # fall back to whole text (last resort)
+    words = re.sub(r"(?i)\b(link|buy|purchase|shop|send|url|for|to)\b", "", t).strip()
+    return words or None
+
+def _pick_names_to_link(names: list[str], user_text: str) -> list[str]:
+    """
+    If the user said '#2' or 'second', pick that index.
+    If they typed a product phrase, prefer the name that contains it.
+    Otherwise, return the original names (max 3).
+    """
+    if not names:
+        return []
+    idx = _requested_index(user_text)
+    if idx and 1 <= idx <= len(names):
+        return [names[idx - 1]]
+    phrase = (_phrase_from_user_text(user_text) or "").lower()
+    if phrase:
+        for n in names:
+            if phrase and phrase in n.lower():
+                return [n]
+    return names[:3]
+
    # --- Ordinal/number parser so "link #2" selects the 2nd item -------------
+
 _ORDINAL_RE = re.compile(r"(?i)\b(?:#?\s*(\d{1,2})\b|first|second|third)\b")
 
 def _requested_index(text: str) -> Optional[int]:
-    """
-    Returns 1-based index if user asked for a specific item (e.g., "#2", "second").
-    """
     t = text or ""
     m = _ORDINAL_RE.search(t)
     if not m:
@@ -256,11 +291,48 @@ def _requested_index(text: str) -> Optional[int]:
             return n if 1 <= n <= 50 else None
         except Exception:
             return None
-    # words
+    # words  <-- these four lines belong inside this function
     if re.search(r"(?i)\bfirst\b", t):  return 1
     if re.search(r"(?i)\bsecond\b", t): return 2
     if re.search(r"(?i)\bthird\b", t):  return 3
     return None
+
+# --- phrase extractor so "link to NeoCell Super Collagen" never returns empty ----
+_PHRASE_RE = re.compile(
+    r"(?i)\b(?:link|buy|purchase|shop|url|send)\s*(?:to|for|the)?\s*([A-Za-z0-9' \-\+\&]+)"
+)
+
+def _phrase_from_user_text(user_text: str) -> Optional[str]:
+    t = (user_text or "").strip()
+    m = _PHRASE_RE.search(t)
+    if m:
+        phrase = m.group(1).strip(" .?!")
+        # avoid obviously generic words
+        if len(phrase) >= 3 and not re.fullmatch(r"(it|this|that|one|two|three)", phrase, flags=re.I):
+            return phrase
+    # fall back to whole text (last resort)
+    words = re.sub(r"(?i)\b(link|buy|purchase|shop|send|url|for|to)\b", "", t).strip()
+    return words or None
+
+def _pick_names_to_link(names: list[str], user_text: str) -> list[str]:
+    """
+    If the user said '#2' or 'second', pick that index.
+    If they typed a product phrase, prefer the name that contains it.
+    Otherwise, return the original names (max 3).
+    """
+    if not names:
+        return []
+    idx = _requested_index(user_text)
+    if idx and 1 <= idx <= len(names):
+        return [names[idx - 1]]
+    phrase = (_phrase_from_user_text(user_text) or "").lower()
+    if phrase:
+        for n in names:
+            if phrase and phrase in n.lower():
+                return [n]
+    return names[:3]
+
+
 
 def _append_links_for_picks(reply: str, convo_id: Optional[int] = None) -> str:
     """
@@ -762,7 +834,7 @@ def generate_reply_job(
                 return
         except Exception as e:
             logger.warning("[Worker][Media] Attachment handling failed: %s", e)
-         # ---- post-chat finishing + send ---------------------------------------------
+
         # If a naked URL is in the text, quick media sniff
     if "http" in user_text:
         if any(ext in normalized_text for ext in [".jpg", ".jpeg", ".png", ".gif", ".webp"]):
@@ -852,10 +924,10 @@ def generate_reply_job(
 
         # add closer if abrupt / ends on URL
         reply = _maybe_append_ai_closer(reply, user_text, category=None, convo_id=convo_id)
-               # Build links when explicitly asked OR when auto-linking is enabled on product asks
+        # Build links when explicitly asked OR when auto-linking is enabled on product asks
         make_links_now = link_request or (auto_link_flag and _looks_like_product_intent(user_text))
         if make_links_now:
-            # pick names from current reply or recent messages
+            # 1) get pick names from current reply (or recent outbounds as back-up)
             names = _extract_pick_names(reply, maxn=3)
             if not names:
                 recent = _recent_outbound_texts(convo_id, limit=5)
@@ -863,15 +935,19 @@ def generate_reply_job(
                     names = _extract_pick_names(t or "", maxn=3)
                     if names: break
 
-            if names:
-                # If user asked for a specific index ("#2", "second"), keep only that one.
-                idx = _requested_index(user_text)
-                if idx and 1 <= idx <= len(names):
-                    names = [names[idx - 1]]
+            # 2) if still nothing, use phrase directly from the user’s message
+            if not names:
+                phrase = _phrase_from_user_text(user_text)
+                if phrase:
+                    names = [phrase]
 
-                strategy = (os.getenv("LINK_STRATEGY") or "dual").lower().strip()
+            if names:
+                # 3) narrow to the referenced item (e.g., '#2' or named phrase)
+                names = _pick_names_to_link(names, user_text)
+
+                strategy = (os.getenv("LINK_STRATEGY") or "dual").lower().strip()  # dual | syl-first | amazon-first | syl-only | amazon-only
                 link_lines = []
-                for n in names[:3]:
+                for n in names:
                     amz = _amz_search_url(n)
                     syl = _syl_search_url(n, user_text)
                     if   strategy == "syl-only":     link_lines.append(f"{n}: {syl}")
@@ -883,30 +959,21 @@ def generate_reply_job(
                 link_block = "\n".join(link_lines)
 
                 if link_request:
-                    # links-only reply when they explicitly ask
+                    # links-only reply when explicitly asked
                     reply = "Here you go:\n" + link_block
                 else:
-                    # keep the great dialogue and append links
+                    # append links under the great prose
                     reply = reply.rstrip() + "\n\nHere are the links:\n" + link_block
 
-                # mark so _store_and_send keeps search links; tag/SYL wrapping happens downstream
+                # 4) keep search links through _store_and_send(); tag/SYL wrapping happens downstream
                 reply = _ALLOW_AMZ_SEARCH_TOKEN + "\n" + reply
 
-            # keep the list crisp if the model rambled
-            reply = re.sub(r"\s*\n\s*\n\s*", "\n", reply or "").strip()
-
+        # keep the list crisp if the model rambled (one line only)
+        reply = re.sub(r"\s*\n\s*\n\s*", "\n", reply or "").strip()
 
     except Exception as e:
         logger.exception("[ChatOnly] GPT pass failed: {}", e)
         reply = ""
-    # add closer if abrupt / ends on URL
-    # hard cap so we don't explode into too many parts
-    if len(reply or "") > int(os.getenv("SMS_CLAMP_CHARS", "420")):
-        cut = (reply or "")[:int(os.getenv("SMS_CLAMP_CHARS", "420"))]
-        dot = cut.rfind(".")
-        reply = (cut[:dot+1] if dot != -1 else cut).strip()
-
-    reply = _maybe_append_ai_closer(reply, user_text, category=None, convo_id=convo_id)
 
     # Greeting fallback (one friendly opener if reply is still blank)
     if not (reply or "").strip() and _is_greeting(user_text):
