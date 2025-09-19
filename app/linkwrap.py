@@ -7,7 +7,8 @@ Link wrapping & SMS hygiene for Bestie.
 
 import os
 import re
-from urllib.parse import urlparse, urlunparse, quote_plus
+from urllib.parse import quote_plus, urlparse, urlunparse, parse_qs, urlencode
+
 
 # ---------- ENV ----------
 SYL_ENABLED       = (os.getenv("SYL_ENABLED") or "0").strip().lower() in ("1","true","yes")
@@ -29,6 +30,36 @@ _URL_END_RE   = re.compile(r"(https?://[^\s)]+)\s*$", re.I)
 _AMAZON_HOST  = re.compile(r"amazon\.[^/]+$", re.I)
 
 # ---------- HELPERS ----------
+def _wrap_syl(url: str) -> str:
+    """
+    Wrap a retailer URL with ShopYourLikes redirect.
+    """
+    if not (SYL_ENABLED and SYL_PUBLISHER_ID):
+        return url
+    return f"https://goto.shopyourlikes.com/redirect?publisher_id={SYL_PUBLISHER_ID}&url={quote_plus(url)}"
+
+def _append_amz_tag(u: str) -> str:
+    if not AMAZON_ASSOCIATE_TAG:
+        return u
+    try:
+        p = urlparse(u)
+        q = parse_qs(p.query)
+        if "tag" not in q or not q["tag"]:
+            q["tag"] = [AMAZON_ASSOCIATE_TAG]
+        return urlunparse((p.scheme, p.netloc, p.path, p.params, urlencode(q, doseq=True), p.fragment))
+    except Exception:
+        return u
+
+def _wrap_amazon(url: str) -> str:
+    u = _amazon_dp(url)  # returns DP if present; otherwise leaves search path
+    if GENIUSLINK_WRAP:
+        return GENIUSLINK_WRAP.format(url=quote_plus(u))
+    if GENIUSLINK_DOMAIN:
+        m = re.search(r"/dp/([A-Z0-9]{10})", u)
+        if m:
+            return f"https://{GENIUSLINK_DOMAIN.rstrip('/')}/{m.group(1)}"
+    return _append_amz_tag(u)
+
 def _is_denied(url: str) -> bool:
     low = url.lower()
     return any(d in low for d in SYL_DENYLIST)
@@ -58,31 +89,6 @@ def _amazon_dp(url: str) -> str:
         return urlunparse((parsed.scheme, parsed.netloc, f"/dp/{asin}", "", "", ""))
     except Exception:
         return url
-
-from urllib.parse import urlparse, urlunparse, parse_qs, urlencode
-
-def _append_amz_tag(u: str) -> str:
-    if not AMAZON_ASSOCIATE_TAG:
-        return u
-    try:
-        p = urlparse(u)
-        q = parse_qs(p.query)
-        # don’t overwrite a tag if one already exists
-        if "tag" not in q or not q["tag"]:
-            q["tag"] = [AMAZON_ASSOCIATE_TAG]
-        return urlunparse((p.scheme, p.netloc, p.path, p.params, urlencode(q, doseq=True), p.fragment))
-    except Exception:
-        return u
-
-def _wrap_amazon(url: str) -> str:
-    u = _amazon_dp(url)  # returns DP if present; otherwise leaves search unchanged
-    if GENIUSLINK_WRAP:
-        return GENIUSLINK_WRAP.format(url=quote_plus(u))
-    if GENIUSLINK_DOMAIN:
-        m = re.search(r"/dp/([A-Z0-9]{10})", u)
-        if m:
-            return f"https://{GENIUSLINK_DOMAIN.rstrip('/')}/{m.group(1)}"
-    return _append_amz_tag(u)   # <— must be this line
 
 def _should_syl(domain: str) -> bool:
     """
@@ -177,7 +183,9 @@ def ensure_not_link_ending(text: str) -> str:
 # Back-compat shim for existing code paths in workers.py
 def convert_to_geniuslink(url: str) -> str:
     """
-    Legacy name used by workers.py. Keep it as a thin wrapper that applies the same
+    Legacy name used by workers.py. Keep it as a thin wrapper that applies
     affiliate logic as wrap_all_affiliates() but for a single URL.
     """
-    return _append_amz_tag(u)
+    return _append_amz_tag(url)
+
+

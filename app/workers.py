@@ -51,6 +51,9 @@ REDIS_URL = os.getenv("REDIS_URL", "")
 _rds = redis.from_url(REDIS_URL, decode_responses=True) if REDIS_URL else None
 USE_GHL_ONLY = (os.getenv("USE_GHL_ONLY", "1").lower() not in ("0","false","no"))
 SEND_FALLBACK_ON_ERROR = True  # keep it True so we still send if GPT path hiccups
+SYL_ENABLED = (os.getenv("SYL_ENABLED") or "0").lower() in ("1","true","yes")
+SYL_PUBLISHER_ID = (os.getenv("SYL_PUBLISHER_ID") or "").strip()
+AMAZON_ASSOCIATE_TAG = (os.getenv("AMAZON_ASSOCIATE_TAG") or "").strip()
 
 logger.info("[Boot] USE_GHL_ONLY=%s  SEND_FALLBACK_ON_ERROR=%s", USE_GHL_ONLY, SEND_FALLBACK_ON_ERROR)
 
@@ -236,7 +239,28 @@ def _extract_pick_names(text: str, maxn: int = 3) -> list[str]:
         if n not in seen:
             seen.add(n); out.append(n)
         if len(out) >= maxn: break
-    return out
+   # --- Ordinal/number parser so "link #2" selects the 2nd item -------------
+_ORDINAL_RE = re.compile(r"(?i)\b(?:#?\s*(\d{1,2})\b|first|second|third)\b")
+
+def _requested_index(text: str) -> Optional[int]:
+    """
+    Returns 1-based index if user asked for a specific item (e.g., "#2", "second").
+    """
+    t = text or ""
+    m = _ORDINAL_RE.search(t)
+    if not m:
+        return None
+    if m.group(1):
+        try:
+            n = int(m.group(1))
+            return n if 1 <= n <= 50 else None
+        except Exception:
+            return None
+    # words
+    if re.search(r"(?i)\bfirst\b", t):  return 1
+    if re.search(r"(?i)\bsecond\b", t): return 2
+    if re.search(r"(?i)\bthird\b", t):  return 3
+    return None
 
 def _append_links_for_picks(reply: str, convo_id: Optional[int] = None) -> str:
     """
@@ -815,9 +839,10 @@ def generate_reply_job(
             r"(?i)\b(link|links|buy|purchase|where to buy|send.*link|shop)\b",
             (user_text or "")
         ))
+        auto_link_flag = os.getenv("AUTO_LINK_ON_RECS", "1").lower() in ("1","true","yes")
 
-        # light clamp so we don't blast novels; still a single send
-        if not link_request:
+        # don’t clamp when we’re about to append links automatically
+        if not (link_request or (auto_link_flag and _looks_like_product_intent(user_text))):
             CLAMP = int(os.getenv("SMS_CLAMP_CHARS", "520"))
             if len(reply or "") > CLAMP:
                 cut = (reply or "")[:CLAMP]
@@ -827,31 +852,49 @@ def generate_reply_job(
 
         # add closer if abrupt / ends on URL
         reply = _maybe_append_ai_closer(reply, user_text, category=None, convo_id=convo_id)
-        if link_request:
-            # Build a compact links-only reply (Amazon + SYL)
+               # Build links when explicitly asked OR when auto-linking is enabled on product asks
+        make_links_now = link_request or (auto_link_flag and _looks_like_product_intent(user_text))
+        if make_links_now:
+            # pick names from current reply or recent messages
             names = _extract_pick_names(reply, maxn=3)
             if not names:
                 recent = _recent_outbound_texts(convo_id, limit=5)
                 for t in recent:
                     names = _extract_pick_names(t or "", maxn=3)
-                    if names:
-                        break
+                    if names: break
+
             if names:
-                strategy = (os.getenv("LINK_STRATEGY") or "dual").lower().strip()  # dual | syl-first | amazon-first | syl-only | amazon-only
-                lines = ["Here you go:"]
+                # If user asked for a specific index ("#2", "second"), keep only that one.
+                idx = _requested_index(user_text)
+                if idx and 1 <= idx <= len(names):
+                    names = [names[idx - 1]]
+
+                strategy = (os.getenv("LINK_STRATEGY") or "dual").lower().strip()
+                link_lines = []
                 for n in names[:3]:
                     amz = _amz_search_url(n)
                     syl = _syl_search_url(n, user_text)
-                    if   strategy == "syl-only":     lines.append(f"{n}: {syl}")
-                    elif strategy == "amazon-only":  lines.append(f"{n}: {amz}")
-                    elif strategy == "syl-first":    lines += [f"{n}: {syl}", f"{n} (alt): {amz}"]
-                    elif strategy == "amazon-first": lines += [f"{n}: {amz}", f"{n} (alt): {syl}"]
-                    else:                            lines += [f"{n}: {amz}", f"{n} (alt): {syl}"]
-                reply = _ALLOW_AMZ_SEARCH_TOKEN + "\n" + "\n".join(lines)
+                    if   strategy == "syl-only":     link_lines.append(f"{n}: {syl}")
+                    elif strategy == "amazon-only":  link_lines.append(f"{n}: {amz}")
+                    elif strategy == "syl-first":    link_lines += [f"{n}: {syl}", f"{n} (alt): {amz}"]
+                    elif strategy == "amazon-first": link_lines += [f"{n}: {amz}", f"{n} (alt): {syl}"]
+                    else:                            link_lines += [f"{n}: {amz}", f"{n} (alt): {syl}"]
 
+                link_block = "\n".join(link_lines)
 
-        # keep the list crisp if the model rambled
-        reply = re.sub(r"\s*\n\s*\n\s*", "\n", reply or "").strip()
+                if link_request:
+                    # links-only reply when they explicitly ask
+                    reply = "Here you go:\n" + link_block
+                else:
+                    # keep the great dialogue and append links
+                    reply = reply.rstrip() + "\n\nHere are the links:\n" + link_block
+
+                # mark so _store_and_send keeps search links; tag/SYL wrapping happens downstream
+                reply = _ALLOW_AMZ_SEARCH_TOKEN + "\n" + reply
+
+            # keep the list crisp if the model rambled
+            reply = re.sub(r"\s*\n\s*\n\s*", "\n", reply or "").strip()
+
 
     except Exception as e:
         logger.exception("[ChatOnly] GPT pass failed: {}", e)
