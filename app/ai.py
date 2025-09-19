@@ -474,16 +474,18 @@ def generate_reply(
         context=context,
     )
 
-    # 2) Best-first product policy (never survey for budget)
+    # --- Best-first shopping guidance (no surveys; allow links when asked) -------
     shopping_guidance = """
-    When product help is requested or implied:
-    - Answer first. No surveys. 
-    - Return 2–3 options total, each with a tight one-liner benefit.
-    - If the user asks for links, include 2–3 links (brand sites or Amazon DP/search). Avoid the literal word “URL”.
-    - Keep the whole reply ≤ 520 chars. No disclaimers.
+    When the user asks for product help or a recommendation:
+    - Answer first. No surveys or “identify concerns”.
+    - Return 2–3 concrete products, each with a tight one-liner benefit.
+    - Order: [BEST] then [Mid] then [Budget] if space allows.
+    - Avoid phrases like “check reviews”, “narrow down by price”, “identify skin concerns”.
+    - If (and only if) the user asks for links, include 2–3 links (brand sites or Amazon DP/search). Avoid the literal word “URL”.
+    - Keep the whole reply ≤ 520 characters. No disclaimers.
     """.strip()
 
-    system_prompt = (system_prompt or "") + "\n\n" + shopping_guidance
+    system_prompt = ((system_prompt or "").strip() + "\n\n" + shopping_guidance).strip()
 
 
     # Tiny domain nudge (hair) so she stops hand-waving
@@ -494,29 +496,31 @@ def generate_reply(
             "\nFor hair regrowth after extensions/perimenopause: mention 5% minoxidil nightly, "
             "ketoconazole shampoo 2–3x/wk, and a daytime peptide serum; note sensitive-scalp caution."
         )
+    device_nudge = ""
+    if re.search(r"(?i)\b(sofwave|ultherapy|hifu|ultrasound tightening|radiofrequency microneedling|rf microneedling)\b",
+                user_text or ""):
+        device_nudge = (
+            "\nIf asked about non-surgical tightening (e.g., Sofwave/ultrasound): explain how it stimulates collagen; "
+            "note many see an early 'glow' in ~1–2 weeks, with stronger changes over several weeks to a few months; "
+            "encourage follow-up with a provider for personal timelines. Keep it upbeat and precise; no medical claims."
+        )
 
     # Replace system content if workers passed an explicit system_prompt
     if system_prompt and messages and messages[0]["role"] == "system":
-        messages[0]["content"] = f"{system_prompt}\n\n{shopping_guidance}{hair_nudge}"
+        messages[0]["content"] = f"{system_prompt}{hair_nudge}{device_nudge}"
     else:
-        # Append guidance to composed persona
-        messages[0]["content"] = f"{messages[0]['content']}\n\n{shopping_guidance}{hair_nudge}"
+        messages[0]["content"] = f"{messages[0]['content']}\n\n{shopping_guidance}{hair_nudge}{device_nudge}"
 
     # 3) Call OpenAI (prefer app.integrations if present)
-    text_out = ""
-    try:
-        from app.integrations import openai_complete
-        text_out = openai_complete(messages=messages, user_id=user_id, context=context)
-    except Exception as e:
-        logger.info("[AI] Falling back to direct OpenAI call: {}", e)
-        resp = CLIENT.chat.completions.create(
+    resp = CLIENT.chat.completions.create(
         model=OPENAI_MODEL,
         messages=messages,
         temperature=float(os.getenv("OPENAI_TEMP", "0.7")),
         max_tokens=int(os.getenv("OPENAI_MAXTOK", "520")),
     )
     text = (resp.choices[0].message.content or "").strip()
-    logger.info("[AI][Raw][:160] %s", text[:160])
+    logger.info("[AI][Raw][:160] %s", text[:160])    
+
 
     # 4) Tone rescue: banned opener and cringe rewrite if needed
     lines = [l for l in text.splitlines() if l.strip()]
@@ -554,19 +558,18 @@ def generate_reply(
     return text
 def rewrite_as_three_picks(user_text: str, base_reply: str, system_prompt: str) -> str:
     """
-    Gentle nudge: if the first reply dodged, ask GPT to rewrite with 3 concrete picks.
+    If the first reply dodged, ask GPT to rewrite into 2–3 product picks with one-liners.
     """
     import os, logging
     from openai import OpenAI
-
     client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
     model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
     rescue_system = (
         system_prompt +
-        "\nRewrite your advice into a decisive, helpful SMS with 2–3 concrete product/treatment picks "
+        "\nRewrite your advice into a decisive, helpful SMS with 2–3 concrete product picks "
         "(BEST → Mid → Budget) each with a crisp one-liner benefit. "
-        "No surveys. One playful quip allowed. ≤ 450 chars. If links appear, keep them."
+        "No surveys. Avoid 'check reviews'/'identify concerns'. ≤ 520 chars. No links unless asked."
     )
 
     try:
@@ -576,16 +579,17 @@ def rewrite_as_three_picks(user_text: str, base_reply: str, system_prompt: str) 
                 {"role": "system", "content": rescue_system},
                 {"role": "user", "content": user_text},
                 {"role": "assistant", "content": base_reply or ""},
-                {"role": "user", "content": "Rewrite that into real picks now."},
+                {"role": "user", "content": "Rewrite as concrete picks now."},
             ],
-            temperature=float(os.getenv("OPENAI_TEMP", "0.6")),
-            max_tokens=int(os.getenv("OPENAI_MAXTOK", "260")),
+            temperature=float(os.getenv("OPENAI_TEMP", "0.7")),
+            max_tokens=int(os.getenv("OPENAI_MAXTOK", "520")),
         )
         text = (resp.choices[0].message.content or "").strip()
         return text or base_reply
     except Exception:
         logging.exception("[AI] rescue pass failed")
         return base_reply
+
     
 # ------------------ Multimodal routes --------------- #
 def describe_image(image_url: str) -> str:

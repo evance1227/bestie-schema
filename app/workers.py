@@ -168,6 +168,60 @@ def _amz_search_url(name: str) -> str:
     q = quote_plus((name or "").strip())
     return f"https://www.amazon.com/s?k={q}"
 
+# --- Retailer search URLs for SYL wrapping -----------------------------------
+_RETAILER_SEARCH = {
+    "sephora":  "https://www.sephora.com/search?keyword={q}",
+    "ulta":     "https://www.ulta.com/search?searchText={q}",
+    "nordstrom":"https://www.nordstrom.com/sr?keyword={q}",
+    "revolve":  "https://www.revolve.com/r/search?search={q}",
+    "shopbop":  "https://www.shopbop.com/actions/searchResultsAction.action?query={q}",
+    "target":   "https://www.target.com/s?searchTerm={q}",
+    "walmart":  "https://www.walmart.com/search?q={q}",
+}
+
+# simple brand→retailer hints (extend anytime)
+_BRAND_HINTS = {
+    # beauty (prestige)
+    r"charlotte\s*tilbury|drunk\s*elephant|tatcha|rare\s*beauty|kosas|saie|milk\s*makeup|sunday\s*riley": "sephora",
+    # beauty (masstige/drugstore)
+    r"cerave|cera\s*ve|la\s*roche|the\s*ordinary|elf|e\.l\.f|neutrogena|loreal|l'or[eé]al|olay|aveeno": "ulta",
+    # hair
+    r"olaplex|k[ée]rastase|moroccanoil|living\s*proof|amika": "sephora",
+    # fashion
+    r"reformation|agolde|vince|sam\s*edelman|madewell|rag\s*&\s*bone|stuart\s*weitzman": "nordstrom",
+}
+
+_BEAUTY_WORDS  = re.compile(r"(?i)\b(serum|moisturizer|cleanser|toner|retinol|vitamin\s*c|spf|sunscreen|hyaluronic|glycolic|niacinamide|collagen|peptide)\b")
+_FASHION_WORDS = re.compile(r"(?i)\b(dress|jeans|denim|sweater|coat|boots?|heels?|sneakers?|top|skirt|bag|handbag|purse)\b")
+
+def _syl_search_url(name: str, user_text: str) -> str:
+    """Pick a SYL-friendly retailer by brand + context; no hard-wiring."""
+    q = quote_plus((name or "").strip())
+
+    # 0) optional nudge (only if you set SYL_DEFAULT; otherwise ignored)
+    default = (os.getenv("SYL_DEFAULT") or "").lower().strip()
+    if default in _RETAILER_SEARCH:
+        return _RETAILER_SEARCH[default].format(q=q)
+
+    t = f"{name} {user_text}".lower()
+
+    # 1) brand hints
+    for patt, retailer in _BRAND_HINTS.items():
+        if re.search(patt, t, flags=re.I):
+            return _RETAILER_SEARCH[retailer].format(q=q)
+
+    # 2) context fallback
+    if _BEAUTY_WORDS.search(t):
+        # if drugstore-y words appear, bias ulta; otherwise sephora
+        prefer = "ulta" if re.search(r"(?i)\b(cera ?ve|la roche|the ordinary|elf|neutrogena|loreal|olay|aveeno)\b", t) else "sephora"
+        return _RETAILER_SEARCH[prefer].format(q=q)
+
+    if _FASHION_WORDS.search(t):
+        return _RETAILER_SEARCH["nordstrom"].format(q=q)
+
+    # 3) otherwise, mass fallback
+    return _RETAILER_SEARCH["target"].format(q=q)
+
 _BOLD_NAME = re.compile(r"\*\*(.+?)\*\*")
 _NUM_NAME  = re.compile(r"^\s*\d+[\.\)]\s+([^\-–—:]+)", re.M)
 _BUL_NAME  = re.compile(r"^\s*[-•]\s+([^\-–—:]+)", re.M)
@@ -403,12 +457,11 @@ def _store_and_send(
         _allow_amz = True
         text_val = text_val.replace(_ALLOW_AMZ_SEARCH_TOKEN, "", 1).lstrip()
 
-    # ==== Final shaping ====
-    text_val = _add_personality_if_flat(text_val)
+    # shaping
     text_val = _strip_link_placeholders(text_val)
     if not _allow_amz:
         text_val = _strip_amazon_search_links(text_val)
-    text_val = wrap_all_affiliates(text_val)
+    text_val = wrap_all_affiliates(text_val)    # adds ?tag=; SYL wraps retailers
     text_val = ensure_not_link_ending(text_val)
 
     # optional debug marker
@@ -565,17 +618,20 @@ def _is_greeting(text: str) -> bool:
     return bool(_GREETING_RE.match(text or ""))
 # --- Product-intent detector ---------------------------------------------------
 _PRODUCT_INTENT_RE = re.compile(
-    r"(?i)\b(recommend|rec(s)?|suggest|best|top|what should i (get|use)|"
-    r"buy|purchase|which (one|product)|options?|help me (regrow|grow|fix)|"
-    r"hair (regrowth|loss|fall)|minoxidil|ketoconazole|peptide serum)\b"
+    r"(?i)\b("
+    r"recommend|recommendation|rec(s)?|suggest|best|top|"
+    r"what should i (get|use)|which (one|product)|"
+    r"product (pick|suggestion)|"
+    r"collagen|retinol|vitamin c|peptide|serum|moisturizer|sunscreen|minoxidil|ketoconazole"
+    r")\b"
 )
-def _wants_products(text: str) -> bool:
+
+def _looks_like_product_intent(text: str) -> bool:
     return bool(_PRODUCT_INTENT_RE.search(text or ""))
 
 _LISTY_RE = re.compile(r"(?i)\[(best|mid|budget)\]|http|•|- |1\)|2\)|3\)")
-def _looks_like_picks(text: str) -> bool:
+def _looks_like_concrete_picks(text: str) -> bool:
     t = text or ""
-    # crude: looks like picks if it has labels/links/bullets or multiple short lines
     lines = [ln.strip() for ln in t.splitlines() if ln.strip()]
     return bool(_LISTY_RE.search(t) or len(lines) >= 3)
 
@@ -741,6 +797,19 @@ def generate_reply_job(
         reply = (cleaned.strip() if cleaned else (raw.strip() if raw else ""))
         # remove survey-ish prompts
         reply = _anti_form_guard(reply, user_text)
+        # If user clearly asked for products but reply is vague, rewrite to concrete picks
+        if _looks_like_product_intent(user_text) and not _looks_like_concrete_picks(reply):
+            try:
+                rescue = ai.rewrite_as_three_picks(
+                    user_text=user_text,
+                    base_reply=reply,
+                    system_prompt=persona
+                )
+                if rescue and len(rescue.strip()) > len((reply or "").strip()):
+                    reply = rescue.strip()
+            except Exception:
+                pass
+
         # is the user explicitly asking for links?
         link_request = bool(re.search(
             r"(?i)\b(link|links|buy|purchase|where to buy|send.*link|shop)\b",
@@ -759,7 +828,7 @@ def generate_reply_job(
         # add closer if abrupt / ends on URL
         reply = _maybe_append_ai_closer(reply, user_text, category=None, convo_id=convo_id)
         if link_request:
-            # build a compact links-only reply; backfill names from recent if needed
+            # Build a compact links-only reply (Amazon + SYL)
             names = _extract_pick_names(reply, maxn=3)
             if not names:
                 recent = _recent_outbound_texts(convo_id, limit=5)
@@ -768,33 +837,21 @@ def generate_reply_job(
                     if names:
                         break
             if names:
-                lines = [f"{n}: {_amz_search_url(n)}" for n in names]
-                reply = "Here you go:\n" + "\n".join(lines)
-                # mark so _store_and_send keeps Amazon search links
-                reply = _ALLOW_AMZ_SEARCH_TOKEN + "\n" + reply
+                strategy = (os.getenv("LINK_STRATEGY") or "dual").lower().strip()  # dual | syl-first | amazon-first | syl-only | amazon-only
+                lines = ["Here you go:"]
+                for n in names[:3]:
+                    amz = _amz_search_url(n)
+                    syl = _syl_search_url(n, user_text)
+                    if   strategy == "syl-only":     lines.append(f"{n}: {syl}")
+                    elif strategy == "amazon-only":  lines.append(f"{n}: {amz}")
+                    elif strategy == "syl-first":    lines += [f"{n}: {syl}", f"{n} (alt): {amz}"]
+                    elif strategy == "amazon-first": lines += [f"{n}: {amz}", f"{n} (alt): {syl}"]
+                    else:                            lines += [f"{n}: {amz}", f"{n} (alt): {syl}"]
+                reply = _ALLOW_AMZ_SEARCH_TOKEN + "\n" + "\n".join(lines)
 
-        # If they asked for links/buy, append search links and mark them to survive hygiene
-        if re.search(r"(?i)\b(link|links|buy|purchase|where to buy|send.*link|shop)\b", (user_text or "")):
-            reply = _append_links_for_picks(reply, convo_id=convo_id)
-            reply = _ALLOW_AMZ_SEARCH_TOKEN + "\n" + reply
 
-        # de-formalize if the model slipped into survey mode
-        reply = _anti_form_guard(reply, user_text)
         # keep the list crisp if the model rambled
         reply = re.sub(r"\s*\n\s*\n\s*", "\n", reply or "").strip()
-        
-        # If user clearly asked for products and the reply is vague, do a tiny rescue pass
-        if _wants_products(user_text) and not _looks_like_picks(reply):
-            try:
-                rescue = ai.rewrite_as_three_picks(
-                    user_text=user_text,
-                    base_reply=reply,
-                    system_prompt=persona
-                )
-                if rescue and len(rescue.strip()) > len((reply or "").strip()):
-                    reply = rescue.strip()
-            except Exception:
-                pass
 
     except Exception as e:
         logger.exception("[ChatOnly] GPT pass failed: {}", e)
@@ -808,11 +865,6 @@ def generate_reply_job(
 
     reply = _maybe_append_ai_closer(reply, user_text, category=None, convo_id=convo_id)
 
-    # If they asked for links/buy, append search links and mark them to survive hygiene
-    if re.search(r"(?i)\b(link|links|buy|purchase|where to buy|send.*link|shop)\b", (user_text or "")):
-        reply = _append_links_for_picks(reply, convo_id=convo_id)
-        reply = _ALLOW_AMZ_SEARCH_TOKEN + "\n" + reply
-
     # Greeting fallback (one friendly opener if reply is still blank)
     if not (reply or "").strip() and _is_greeting(user_text):
         reply = "Hey gorgeous — I’m here. What kind of trouble are we getting into today? Pick a lane or vent at me. 💅"
@@ -821,16 +873,9 @@ def generate_reply_job(
     if not (reply or "").strip():
         reply = "Babe, I glitched. Say it again and I’ll do better. 💅"
 
-    # Affiliate/link hygiene and send
-    try:
-        reply = linkwrap.make_sms_reply(reply)          # wraps Amazon/Geniuslink/SYL
-        reply = ensure_not_link_ending(reply)
-    except Exception:
-        pass
     logger.info("[FINISH] sending reply len=%d", len(reply or ""))    
     _store_and_send(user_id, convo_id, reply, send_phone=user_phone)
     return
-
 
 # ---------------------------------------------------------------------- #
 # Debug and re-engagement jobs
