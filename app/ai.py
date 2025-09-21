@@ -476,14 +476,16 @@ def generate_reply(
 
     # --- Best-first shopping guidance (no surveys; allow links when asked) -------
     shopping_guidance = """
-    When the user asks for product help or a recommendation:
-    - Answer first. No surveys or “identify concerns”.
-    - Return 2–3 concrete products, each with a tight one-liner benefit.
-    - Order: [BEST] then [Mid] then [Budget] if space allows.
-    - Avoid phrases like “check reviews”, “narrow down by price”, “identify skin concerns”.
-    - If (and only if) the user asks for links, include 2–3 links (brand sites or Amazon DP/search). Avoid the literal word “URL”.
-    - Keep the whole reply ≤ 520 characters. No disclaimers.
+    When asked for advice or recommendations:
+    - Be decisive and a little savage-but-kind. One playful quip allowed.
+    - Answer in one compact SMS; no surveys or “narrow down your choices” boilerplate.
+    - Never say “check reviews”, “consider budget”, “identify concerns”, or “narrow it down”.
+    - If the user asks for links/websites/addresses, include them yourself:
+        • Products: brand site or a reputable retailer; Amazon is fine.
+        • Places: official website and (optionally) a Google Maps link.
+    - Whole reply ≤ 520 chars. Avoid the literal word “URL”.
     """.strip()
+
 
     system_prompt = ((system_prompt or "").strip() + "\n\n" + shopping_guidance).strip()
 
@@ -515,7 +517,7 @@ def generate_reply(
     resp = CLIENT.chat.completions.create(
         model=OPENAI_MODEL,
         messages=messages,
-        temperature=float(os.getenv("OPENAI_TEMP", "0.7")),
+        temperature=float(os.getenv("OPENAI_TEMP", "0.8")),
         max_tokens=int(os.getenv("OPENAI_MAXTOK", "520")),
     )
     text = (resp.choices[0].message.content or "").strip()
