@@ -228,9 +228,12 @@ def _syl_search_url(name: str, user_text: str) -> str:
 _BOLD_NAME = re.compile(r"\*\*(.+?)\*\*")
 _NUM_NAME  = re.compile(r"^\s*\d+[\.\)]\s+([^\-–—:]+)", re.M)
 _BUL_NAME  = re.compile(r"^\s*[-•]\s+([^\-–—:]+)", re.M)
-
+_LABEL_LINE = re.compile(
+    r"\*\*\s*(BEST|MID|BUDGET)\s*:\s*\*\*\s*([^\n\r\-–—:]+)", re.I
+)
 def _extract_pick_names(text: str, maxn: int = 3) -> list[str]:
     names = []
+    names += [m.group(2).strip() for m in _LABEL_LINE.finditer(text or "")]    
     names += _BOLD_NAME.findall(text or "")
     names += _NUM_NAME.findall(text or "")
     names += _BUL_NAME.findall(text or "")
@@ -298,7 +301,9 @@ def _pick_names_to_link(names: list[str], user_text: str) -> list[str]:
     return names[:3]
 
 # --- Place (spa/salon/clinic) search helpers ---------------------------------
-_PLACE_WORDS = re.compile(r"(?i)\b(spa|salon|nail|bar|lounge|clinic|med\s*spa|medspa|studio|massage|facial|hair|brow|lash|blowout|restaurant|cafe|coffee)\b")
+_PLACE_WORDS = re.compile(
+    r"(?i)\b(spa|salon|nail\s+bar|nail\s+salon|bar|lounge|clinic|med\s*spa|medspa|studio|massage|facial)\b"
+)
 
 def _city_hint(user_text: str) -> str:
     """
