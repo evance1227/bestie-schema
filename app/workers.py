@@ -944,6 +944,21 @@ def generate_reply_job(
             except Exception:
                 pass
         reply = _maybe_append_ai_closer(reply, user_text, category=None, convo_id=convo_id)
+        # is the user explicitly asking for links?
+        link_request = bool(re.search(
+            r"(?i)\b(link|links|website|websites|site|sites|url|buy|purchase|where to buy|map|maps|address|google|yelp|send.*(link|site|url))\b",
+            (user_text or "")
+        ))
+        auto_link_flag = os.getenv("AUTO_LINK_ON_RECS", "1").lower() in ("1","true","yes")
+
+        # don’t clamp when we’re about to append links automatically
+        if not (link_request or (auto_link_flag and _looks_like_product_intent(user_text))):
+            CLAMP = int(os.getenv("SMS_CLAMP_CHARS", "520"))
+            if len(reply or "") > CLAMP:
+                cut = (reply or "")[:CLAMP]
+                sp = cut.rfind(" ")
+                reply = (cut[:sp] if sp != -1 else cut).rstrip()
+
         # GPT pass-through links:
         # If user asked for links (or we auto-link product asks) AND GPT didn't include any URL,
         # add a minimal Amazon fallback; otherwise do nothing (we'll just wrap).
@@ -970,45 +985,6 @@ def generate_reply_job(
 
         # keep the list crisp if the model rambled
         reply = re.sub(r"\s*\n\s*\n\s*", "\n", reply or "").strip()
-    
-        # is the user explicitly asking for links?
-        link_request = bool(re.search(
-        r"(?i)\b(link|links|website|websites|site|sites|url|buy|purchase|where to buy|map|maps|address|google|yelp|send.*(link|site|url))\b",
-        (user_text or "")
-    ))
-
-        auto_link_flag = os.getenv("AUTO_LINK_ON_RECS", "1").lower() in ("1","true","yes")
-
-        # don’t clamp when we’re about to append links automatically
-        if not (link_request or (auto_link_flag and _looks_like_product_intent(user_text))):
-            CLAMP = int(os.getenv("SMS_CLAMP_CHARS", "520"))
-            if len(reply or "") > CLAMP:
-                cut = (reply or "")[:CLAMP]
-                sp = cut.rfind(" ")
-                reply = (cut[:sp] if sp != -1 else cut).rstrip()
-                # --- GPT pass-through links -----------------------------------------
-        # If they asked for links (or we auto-link product asks) and GPT hasn't
-        # included any URL, add a minimal fallback (Amazon search). Otherwise do nothing.
-        make_links_now = link_request or (auto_link_flag and _looks_like_product_intent(user_text))
-        if make_links_now and not _URL_RE.search(reply or ""):
-            names = _extract_pick_names(reply, maxn=3)
-            if not names:
-                recent = _recent_outbound_texts(convo_id, limit=5)
-                for t in recent:
-                    names = _extract_pick_names(t or "", maxn=3)
-                    if names: break
-            if not names:
-                phrase = _phrase_from_user_text(user_text)
-                if phrase:
-                    names = [phrase]
-            if names:
-                # synthesize Amazon searches; tagging will be added downstream
-                link_lines = [f"{n}: {_amz_search_url(n)}" for n in _pick_names_to_link(names, user_text)]
-                link_block = "\n".join(link_lines)
-                reply = ("Here you go:\n" + link_block) if link_request \
-                        else (reply.rstrip() + "\n\nHere are the links:\n" + link_block)
-                # keep Amazon search links so linkwrap can append ?tag=
-                reply = _ALLOW_AMZ_SEARCH_TOKEN + "\n" + reply
        
     except Exception as e:
         logger.exception("[ChatOnly] GPT pass failed: {}", e)

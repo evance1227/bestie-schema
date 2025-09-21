@@ -66,7 +66,6 @@ def _is_denied(url: str) -> bool:
     low = (url or "").lower()
     return any(d in low for d in SYL_DENYLIST)
 
-
 def _amazon_dp(url: str) -> str:
     """
     Try to canonicalize Amazon URLs to /dp/ASIN. If not possible, return original.
@@ -96,7 +95,6 @@ def _amazon_dp(url: str) -> str:
         return urlunparse((parsed.scheme, parsed.netloc, f"/dp/{asin}", "", "", ""))
     except Exception:
         return url
-
 
 def _append_amz_tag(u: str) -> str:
     """
@@ -134,7 +132,6 @@ def _wrap_amazon(url: str) -> str:
 
     return _append_amz_tag(u)
 
-
 def _should_syl(domain: str) -> bool:
     """
     Decide if a retailer should be SYL-wrapped.
@@ -152,7 +149,6 @@ def _should_syl(domain: str) -> bool:
 
     return True
 
-
 def _wrap_syl(url: str) -> str:
     """
     Wrap a retailer URL via ShopYourLikes/ShopMy redirect.
@@ -162,12 +158,11 @@ def _wrap_syl(url: str) -> str:
         return url
 
     low = (url or "").lower()
-    # already wrapped?
-    if "go.shopmy.us" in low or "goto.shopyourlikes.com" in low:
+    if "go.shopmy.us" in low or "goto.shopyourlikes.com" in low or "go.sylikes.com" in low:
         return url
 
-    return SYL_WRAP_TEMPLATE.format(pub=SYL_PUBLISHER_ID, url=quote_plus(url))
 
+    return SYL_WRAP_TEMPLATE.format(pub=SYL_PUBLISHER_ID, url=quote_plus(url))
 
 def _wrap_url(url: str) -> str:
     """
@@ -199,7 +194,6 @@ def _wrap_url(url: str) -> str:
         return url
     except Exception:
         return url
-
 
 # =========================
 # PUBLIC
@@ -234,7 +228,6 @@ def wrap_all_affiliates(text: str) -> str:
     out = _URL_RE.sub(_plain_repl, out)
     return out
 
-
 def ensure_not_link_ending(text: str) -> str:
     """
     If CLOSER_MODE=static, append a short closer when a message ends with a URL.
@@ -248,7 +241,6 @@ def ensure_not_link_ending(text: str) -> str:
         return text.rstrip() + "\n" + closer
 
     return text
-
 
 # Legacy shim: single URL path (used by older call sites)
 def convert_to_geniuslink(url: str) -> str:
