@@ -342,30 +342,6 @@ def _pick_names_to_link(names: list[str], user_text: str) -> list[str]:
                 return [n]
     return names[:3]
 
-# --- Place (spa/salon/clinic) search helpers ---------------------------------
-_PLACE_WORDS = re.compile(
-    r"(?i)\b(spa|salon|nail\s+bar|nail\s+salon|bar|lounge|clinic|med\s*spa|medspa|studio|massage|facial)\b"
-)
-
-def _city_hint(user_text: str) -> str:
-    """
-    Super-light 'in Dallas', 'Dallas TX' extractor; safe if nothing found.
-    """
-    t = user_text or ""
-    m = re.search(r"(?i)\bin\s+([A-Za-z .'-]{2,40})(?:,?\s*(tx|az|ca|ny|fl|co|wa|il|oh|pa|ga|nc|sc|ut|nv|or|mi|ma|va|nj|md|dc))?\b", t)
-    if not m:
-        m = re.search(r"(?i)\b([A-Za-z .'-]{2,40}),?\s*(tx|az|ca|ny|fl|co|wa|il|oh|pa|ga|nc|sc|ut|nv|or|mi|ma|va|nj|md|dc)\b", t)
-    city = " ".join([x for x in m.groups() if x]) if m else ""
-    return city.strip()
-
-def _google_search_url(name: str, user_text: str) -> str:
-    q = name if not user_text else f"{name} {_city_hint(user_text)}".strip()
-    return f"https://www.google.com/search?q={quote_plus(q)}"
-
-def _gmaps_search_url(name: str, user_text: str) -> str:
-    q = name if not user_text else f"{name} {_city_hint(user_text)}".strip()
-    return f"https://www.google.com/maps/search/{quote_plus(q)}"
-
 def _append_links_for_picks(reply: str, convo_id: Optional[int] = None) -> str:
     """
     Append search links for 2–3 pick names. If none found in reply, look back.
@@ -564,7 +540,7 @@ def _store_and_send(
     Store once, send once. No manual segmentation or [1/3] prefixes.
     Carriers will stitch if the payload segments on their side.
     """
-        # --- outbound dedupe (whole body) ----------------------------------------
+    # --- outbound dedupe (whole body) ----------------------------------------
     try:
         from hashlib import sha1
         sig = sha1((str(convo_id) + "::" + str(text_val)).encode("utf-8")).hexdigest()
@@ -983,64 +959,30 @@ def generate_reply_job(
                 cut = (reply or "")[:CLAMP]
                 sp = cut.rfind(" ")
                 reply = (cut[:sp] if sp != -1 else cut).rstrip()
-
-
-        # add closer if abrupt / ends on URL
-        reply = _maybe_append_ai_closer(reply, user_text, category=None, convo_id=convo_id)
-        
-        # Build links when explicitly asked OR when auto-linking is enabled on product asks
+                # --- GPT pass-through links -----------------------------------------
+        # If they asked for links (or we auto-link product asks) and GPT hasn't
+        # included any URL, add a minimal fallback (Amazon search). Otherwise do nothing.
         make_links_now = link_request or (auto_link_flag and _looks_like_product_intent(user_text))
-        if make_links_now:
-            # 1) names from reply or recent outbounds
+        if make_links_now and not _URL_RE.search(reply or ""):
             names = _extract_pick_names(reply, maxn=3)
             if not names:
                 recent = _recent_outbound_texts(convo_id, limit=5)
                 for t in recent:
                     names = _extract_pick_names(t or "", maxn=3)
                     if names: break
-
-            # 2) if still nothing, use phrase from user text (e.g., "NeoCell Super Collagen", "The Nail Lounge")
             if not names:
                 phrase = _phrase_from_user_text(user_text)
                 if phrase:
                     names = [phrase]
-
             if names:
-                # 3) decide intent: product or place?
-                is_product = _looks_like_product_intent(user_text)
-                looks_place = bool(_PLACE_WORDS.search(user_text)) or any(_PLACE_WORDS.search(n or "") for n in names)
-
-                # narrow to '#2' or the named phrase if present
-                names = _pick_names_to_link(names, user_text)
-
-                link_lines = []
-                if is_product and not looks_place:
-                    # ----- Product links: Amazon + SYL retailer -----
-                    strategy = (os.getenv("LINK_STRATEGY") or "dual").lower().strip()  # dual | syl-first | amazon-first | syl-only | amazon-only
-                    for n in names:
-                        amz = _amz_search_url(n)
-                        syl = _syl_search_url(n, user_text)
-                        if   strategy == "syl-only":     link_lines.append(f"{n}: {syl}")
-                        elif strategy == "amazon-only":  link_lines.append(f"{n}: {amz}")
-                        elif strategy == "syl-first":    link_lines += [f"{n}: {syl}", f"{n} (alt): {amz}"]
-                        elif strategy == "amazon-first": link_lines += [f"{n}: {amz}", f"{n} (alt): {syl}"]
-                        else:                            link_lines += [f"{n}: {amz}", f"{n} (alt): {syl}"]
-                    # mark so Amazon search links survive; tag/SYL wrapping happens in _store_and_send
-                    reply = _ALLOW_AMZ_SEARCH_TOKEN + "\n" + ( "Here you go:\n" + "\n".join(link_lines) if link_request
-                                                            else reply.rstrip() + "\n\nHere are the links:\n" + "\n".join(link_lines) )
-                else:
-                    # ----- Place links: Google + Google Maps -----
-                    for n in names:
-                        g = _google_search_url(n, user_text)
-                        m = _gmaps_search_url(n, user_text)
-                        link_lines += [f"{n}: {g}", f"{n} (map): {m}"]
-                    reply = ("Here you go:\n" + "\n".join(link_lines)) if link_request \
-                            else (reply.rstrip() + "\n\nHere are the links:\n" + "\n".join(link_lines))
-
-        # keep the list crisp if the model rambled (one line only)
-        reply = re.sub(r"\s*\n\s*\n\s*", "\n", reply or "").strip()
-
-
+                # synthesize Amazon searches; tagging will be added downstream
+                link_lines = [f"{n}: {_amz_search_url(n)}" for n in _pick_names_to_link(names, user_text)]
+                link_block = "\n".join(link_lines)
+                reply = ("Here you go:\n" + link_block) if link_request \
+                        else (reply.rstrip() + "\n\nHere are the links:\n" + link_block)
+                # keep Amazon search links so linkwrap can append ?tag=
+                reply = _ALLOW_AMZ_SEARCH_TOKEN + "\n" + reply
+       
     except Exception as e:
         logger.exception("[ChatOnly] GPT pass failed: {}", e)
         reply = ""
