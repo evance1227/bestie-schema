@@ -241,42 +241,7 @@ def _extract_pick_names(text: str, maxn: int = 3) -> list[str]:
         if len(out) >= maxn: break
     return out
 
-# --- phrase extractor so "link to NeoCell Super Collagen" never returns empty ----
-_PHRASE_RE = re.compile(
-    r"(?i)\b(?:link|buy|purchase|shop|url|send)\s*(?:to|for|the)?\s*([A-Za-z0-9' \-\+\&]+)"
-)
-
-def _phrase_from_user_text(user_text: str) -> Optional[str]:
-    t = (user_text or "").strip()
-    m = _PHRASE_RE.search(t)
-    if m:
-        phrase = m.group(1).strip(" .?!")
-        # avoid obviously generic words
-        if len(phrase) >= 3 and not re.fullmatch(r"(it|this|that|one|two|three)", phrase, flags=re.I):
-            return phrase
-    # fall back to whole text (last resort)
-    words = re.sub(r"(?i)\b(link|buy|purchase|shop|send|url|for|to)\b", "", t).strip()
-    return words or None
-
-def _pick_names_to_link(names: list[str], user_text: str) -> list[str]:
-    """
-    If the user said '#2' or 'second', pick that index.
-    If they typed a product phrase, prefer the name that contains it.
-    Otherwise, return the original names (max 3).
-    """
-    if not names:
-        return []
-    idx = _requested_index(user_text)
-    if idx and 1 <= idx <= len(names):
-        return [names[idx - 1]]
-    phrase = (_phrase_from_user_text(user_text) or "").lower()
-    if phrase:
-        for n in names:
-            if phrase and phrase in n.lower():
-                return [n]
-    return names[:3]
-
-   # --- Ordinal/number parser so "link #2" selects the 2nd item -------------
+# --- Ordinal/number parser so "link #2" selects the 2nd item -------------
 
 _ORDINAL_RE = re.compile(r"(?i)\b(?:#?\s*(\d{1,2})\b|first|second|third)\b")
 
