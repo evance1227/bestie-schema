@@ -1012,12 +1012,7 @@ def generate_reply_job(
         # add a minimal Amazon fallback; otherwise do nothing (we'll just wrap).
         make_links_now = link_request or (auto_link_flag and _looks_like_product_intent(user_text))
         if make_links_now and not _URL_RE.search(reply or ""):
-            names = _extract_pick_names(reply, maxn=3)
-            if not names:
-                recent = _recent_outbound_texts(convo_id, limit=5)
-                for t in recent:
-                    names = _extract_pick_names(t or "", maxn=3)
-                    if names: break
+            names = _extract_pick_names(reply, maxn=3)           
             if not names:
                 phrase = _phrase_from_user_text(user_text)
                 if phrase:
