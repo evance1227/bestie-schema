@@ -476,15 +476,12 @@ def generate_reply(
 
     # --- Best-first shopping guidance (no surveys; allow links when asked) -------
     shopping_guidance = """
-    When asked for advice or recommendations:
-    - Be decisive and a little savage-but-kind. One playful quip allowed.
-    - Answer in one compact SMS; no surveys or “narrow down your choices” boilerplate.
-    - Never say “check reviews”, “consider budget”, “identify concerns”, or “narrow it down”.
-    - If the user asks for links/websites/addresses, include them yourself:
-        • Products: brand site or a reputable retailer; Amazon is fine.
-        • Places: official website and (optionally) a Google Maps link.
-    - Whole reply ≤ 520 chars. Avoid the literal word “URL”.
+    When giving recommendations, write one compact SMS (≤ 520 chars), no surveys.
+    If the user asks for links/websites, put each link on the same line as the pick, e.g.:
+    - Best: <Product> — <primary link> (alt: <alt link, optional>)
+    Prefer reputable brand/retailer links; Amazon is fine. Avoid the literal word “URL”.
     """.strip()
+
 
 
     system_prompt = ((system_prompt or "").strip() + "\n\n" + shopping_guidance).strip()

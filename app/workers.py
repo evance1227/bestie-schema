@@ -276,39 +276,46 @@ _LABEL_AFTER_COLON= re.compile(r"\*\*\s*(?:best|mid|budget)\s*\*\*\s*:\s*([^\n\r
 _LIKE_BRAND       = re.compile(r"\(\s*.*?\blike\s+([^)]+?)\b.*?\)", re.I)
 
 def _extract_pick_names(text: str, maxn: int = 3) -> list[str]:
-    """
-    Pull up to `maxn` product-like names from the reply.
-    - Prefer "**Best:** <name>" / "**Best**: **<name>**" lines
-    - Add "like <Brand>" as a brand hint to improve Amazon/SYL search quality
-    - Fall back to bold/numbered/bulleted names (excluding 'Best/Mid/Budget')
-    """
     t = text or ""
     names: list[str] = []
 
-    # 1) parse label lines first
+    # 1) prefer "**Best:** <name>" / "**Best**: **<name>**"
     for line in t.splitlines():
         line = line.strip()
         if not line:
             continue
-
         m = _LABEL_TWO_BOLDS.search(line) or _LABEL_AFTER_COLON.search(line)
         if m:
             prod = m.group(1).strip()
             b = _LIKE_BRAND.search(line)
-            if b:
-                prod = f"{prod} {b.group(1).strip()}"  # brand hint
+            if b:  # brand hint makes Amazon/SYL searches better
+                prod = f"{prod} {b.group(1).strip()}"
             names.append(prod)
-            continue
+
+    if names:
+        seen, out = set(), []
+        for n in names:
+            n = n.strip()
+            if n and n not in seen:
+                seen.add(n)
+                out.append(n)
+            if len(out) >= maxn:
+                break
+        return out
 
     # 2) fallback to generic patterns (filter label tokens)
-    names += [n.strip() for n in _BOLD_NAME.findall(t) if n.strip().lower() not in _LABEL_WORDS]
-    names += _NUM_NAME.findall(t)
-    names += _BUL_NAME.findall(t)
+    raw = []
+    raw += _BOLD_NAME.findall(t)
+    raw += _NUM_NAME.findall(t)
+    raw += _BUL_NAME.findall(t)
 
-    # normalize & dedupe, keep order
     seen, out = set(), []
-    for n in [x.strip(" -*•") for x in names if x.strip()]:
-        if n.lower() in _LABEL_WORDS:
+    for n in raw:
+        n = n.strip(" -*•")
+        if not n:
+            continue
+        lab = re.sub(r"[^a-z]", "", n.lower())
+        if lab in _LABEL_WORDS:  # drop "best/mid/budget"
             continue
         if n not in seen:
             seen.add(n)
@@ -316,7 +323,6 @@ def _extract_pick_names(text: str, maxn: int = 3) -> list[str]:
         if len(out) >= maxn:
             break
     return out
-
 
 # --- Ordinal/number parser so "link #2" selects the 2nd item -------------
 
@@ -605,6 +611,14 @@ def _store_and_send(
     DEBUG_MARKER = os.getenv("DEBUG_MARKER", "")
     if DEBUG_MARKER:
         text_val = text_val.rstrip() + f"\n{DEBUG_MARKER}"
+    OFFER_EMAIL = (os.getenv("OFFER_EMAIL_ON_OVERFLOW") or "0").lower() in ("1","true","yes")
+    per  = int(os.getenv("SMS_PER_PART", "320"))
+    maxp = int(os.getenv("SMS_MAX_PARTS", "3"))
+    if OFFER_EMAIL and len(text_val) > (per * maxp):
+        text_val = (
+            text_val[: (per * maxp) - 80].rstrip()
+            + "\n\nToo long to fit by SMS. Want the full list by email? Reply EMAIL."
+        )
 
     # ==== Segment after shaping (URL-safe) ====
     parts = _segments_for_sms(text_val,
@@ -622,9 +636,6 @@ def _store_and_send(
     for idx, part in enumerate(parts, 1):
         # prefix only when multipart
         # Add a zero-width timestamp to help carrier ordering without changing what users see
-        zts = str(int(time.time() * 1000)).rjust(13, "0")  # 13-digit ms
-        zw  = "".join(chr(8203) for _ in range(5))         # five zero-width spaces
-        hidden = f"{zw}{zts}{zw}" if total_parts > 1 else ""
         prefix = f"[{idx}/{total_parts}] " if total_parts > 1 else ""
         full_text = prefix + part
         message_id = str(uuid.uuid4())
@@ -1023,7 +1034,8 @@ def generate_reply_job(
                     elif strategy == "syl-first":    link_lines += [f"{n}: {syl}", f"{n} (alt): {amz}"]
                     elif strategy == "amazon-first": link_lines += [f"{n}: {amz}", f"{n} (alt): {syl}"]
                     else:                            link_lines += [f"{n}: {amz}", f"{n} (alt): {syl}"]
-                link_block = "\n".join(link_lines)                
+                link_block = "\n".join(link_lines)
+                
                 reply = ("Here you go:\n" + link_block) if link_request \
                         else (reply.rstrip() + "\n\nHere are the links:\n" + link_block)
                 # keep Amazon searches so they won't be stripped; tagging happens downstream
