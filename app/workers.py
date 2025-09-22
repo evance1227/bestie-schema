@@ -271,35 +271,33 @@ _BEAUTY_WORDS  = re.compile(r"(?i)\b(serum|moisturizer|cleanser|toner|retinol|vi
 _FASHION_WORDS = re.compile(r"(?i)\b(dress|jeans|denim|sweater|coat|boots?|heels?|sneakers?|top|skirt|bag|handbag|purse)\b")
 
 def _syl_search_url(name: str, user_text: str) -> str:
-        # skip retailer wrapping for procedures/techniques (not buyable products)
+# skip non-buyable procedures/techniques
     if re.search(r"(?i)\b(procedure|microneedling|prp|fraxel|laser|hyaluronic|injectable|filler|botox)\b", name):
         return ""
-    """Pick a SYL-friendly retailer by brand + context; no hard-wiring."""
+
+    base = (os.getenv("SYL_WRAP_TEMPLATE") or "").strip()
+    pub  = (os.getenv("SYL_PUBLISHER_ID") or "").strip()
+    if not (base and pub):
+        return ""
+
     q = quote_plus((name or "").strip())
 
-    # 0) optional nudge (only if you set SYL_DEFAULT; otherwise ignored)
-    default = (os.getenv("SYL_DEFAULT") or "").lower().strip()
-    if default in _RETAILER_SEARCH:
-        return _RETAILER_SEARCH[default].format(q=q)
+    # route to the retailer the user typed
+    if re.search(r"(?i)\bsephora\b", user_text or ""):
+        retailer = f"https://www.sephora.com/search?keyword={q}"
+    elif re.search(r"(?i)\bultra\b|\bulta\b", user_text or ""):
+        retailer = f"https://www.ulta.com/search?Ntt={q}"
+    elif re.search(r"(?i)\bnordstrom\b", user_text or ""):
+        retailer = f"https://www.nordstrom.com/sr?keyword={q}"
+    elif re.search(r"(?i)\btarget\b", user_text or ""):
+        retailer = f"https://www.target.com/s?searchTerm={q}"
+    elif re.search(r"(?i)\bamazon\b", user_text or ""):
+        return ""  # Amazon is primary via _amz_search_url
+    else:
+        return ""  # no retailer named -> skip SYL alt to avoid 404
 
-    t = f"{name} {user_text}".lower()
+    return base.format(pub=pub, url=quote_plus(retailer))
 
-    # 1) brand hints
-    for patt, retailer in _BRAND_HINTS.items():
-        if re.search(patt, t, flags=re.I):
-            return _RETAILER_SEARCH[retailer].format(q=q)
-
-    # 2) context fallback
-    if _BEAUTY_WORDS.search(t):
-        # if drugstore-y words appear, bias ulta; otherwise sephora
-        prefer = "ulta" if re.search(r"(?i)\b(cera ?ve|la roche|the ordinary|elf|neutrogena|loreal|olay|aveeno)\b", t) else "sephora"
-        return _RETAILER_SEARCH[prefer].format(q=q)
-
-    if _FASHION_WORDS.search(t):
-        return _RETAILER_SEARCH["nordstrom"].format(q=q)
-
-    # 3) otherwise, mass fallback
-    return _RETAILER_SEARCH["target"].format(q=q)
 
 _BOLD_NAME = re.compile(r"\*\*(.+?)\*\*")
 _NUM_NAME  = re.compile(r"^\s*\d+[\.\)]\s+([^\-–—:]+)", re.M)
@@ -420,13 +418,6 @@ def _append_links_for_picks(reply: str, convo_id: Optional[int] = None) -> str:
     If still none, derive from user context keywords as a last resort.
     """
     names = _extract_pick_names(reply, maxn=3)
-
-    if not names and convo_id:
-        recent = _recent_outbound_texts(convo_id, limit=5)
-        for text in recent:
-            names = _extract_pick_names(text or "", maxn=3)
-            if names:
-                break
 
     if not names:
         # last-resort keyword guesses
