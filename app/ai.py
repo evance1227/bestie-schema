@@ -517,7 +517,7 @@ def generate_reply(
     resp = CLIENT.chat.completions.create(
         model=OPENAI_MODEL,
         messages=messages,
-        temperature=float(os.getenv("OPENAI_TEMP", "0.8")),
+        temperature=float(os.getenv("OPENAI_TEMP", "0.85")),
         max_tokens=int(os.getenv("OPENAI_MAXTOK", "520")),
     )
     text = (resp.choices[0].message.content or "").strip()

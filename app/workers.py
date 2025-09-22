@@ -270,20 +270,54 @@ def _syl_search_url(name: str, user_text: str) -> str:
 _BOLD_NAME = re.compile(r"\*\*(.+?)\*\*")
 _NUM_NAME  = re.compile(r"^\s*\d+[\.\)]\s+([^\-–—:]+)", re.M)
 _BUL_NAME  = re.compile(r"^\s*[-•]\s+([^\-–—:]+)", re.M)
+_LABEL_WORDS      = {"best", "mid", "budget"}
+_LABEL_TWO_BOLDS  = re.compile(r"\*\*\s*(?:best|mid|budget)\s*\*\*\s*:\s*\*\*([^*]+)\*\*", re.I)
+_LABEL_AFTER_COLON= re.compile(r"\*\*\s*(?:best|mid|budget)\s*\*\*\s*:\s*([^\n\r\(\-–—:]+)", re.I)
+_LIKE_BRAND       = re.compile(r"\(\s*.*?\blike\s+([^)]+?)\b.*?\)", re.I)
 _LABEL_LINE = re.compile(
     r"\*\*\s*(BEST|MID|BUDGET)\s*:\s*\*\*\s*([^\n\r\-–—:]+)", re.I
 )
 def _extract_pick_names(text: str, maxn: int = 3) -> list[str]:
-    names = []
-    names += [m.group(2).strip() for m in _LABEL_LINE.finditer(text or "")]    
-    names += _BOLD_NAME.findall(text or "")
-    names += _NUM_NAME.findall(text or "")
-    names += _BUL_NAME.findall(text or "")
+    """
+    Pull up to `maxn` product-like names from the reply.
+    - Prefer "**Best:** <name>" / "**Best**: **<name>**" lines
+    - Add "like <Brand>" as a brand hint to improve Amazon/SYL search quality
+    - Fall back to bold/numbered/bulleted names (excluding 'Best/Mid/Budget')
+    """
+    t = text or ""
+    names: list[str] = []
+
+    # 1) Parse line-by-line to capture label + product + optional brand
+    for line in t.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+
+        m = _LABEL_TWO_BOLDS.search(line) or _LABEL_AFTER_COLON.search(line)
+        if m:
+            prod = m.group(1).strip()
+            b = _LIKE_BRAND.search(line)
+            if b:
+                # Improve search quality with brand hint
+                prod = f"{prod} {b.group(1).strip()}"
+            names.append(prod)
+            continue
+
+    # 2) Fall back to generic patterns (filter label words)
+    names += [n.strip() for n in _BOLD_NAME.findall(t) if n.strip().lower() not in _LABEL_WORDS]
+    names += _NUM_NAME.findall(t)
+    names += _BUL_NAME.findall(t)
+
+    # normalize & dedupe, keep order
     seen, out = set(), []
-    for n in [x.strip(" *•-") for x in names if x.strip()]:
+    for n in [x.strip(" -*•") for x in names if x.strip()]:
+        if n.lower() in _LABEL_WORDS:   # final guard
+            continue
         if n not in seen:
-            seen.add(n); out.append(n)
-        if len(out) >= maxn: break
+            seen.add(n)
+            out.append(n)
+        if len(out) >= maxn:
+            break
     return out
 
 # --- Ordinal/number parser so "link #2" selects the 2nd item -------------
@@ -585,7 +619,7 @@ def _store_and_send(
 
     total_parts = len(parts)
     GHL_WEBHOOK_URL = os.getenv("GHL_OUTBOUND_WEBHOOK_URL")
-    delay_ms = int(os.getenv("SMS_PART_DELAY_MS", "1600"))
+    delay_ms = int(os.getenv("SMS_PART_DELAY_MS", "2200"))
 
     for idx, part in enumerate(parts, 1):
         # prefix only when multipart
@@ -943,6 +977,7 @@ def generate_reply_job(
                     reply = rescue.strip()
             except Exception:
                 pass
+
         reply = _maybe_append_ai_closer(reply, user_text, category=None, convo_id=convo_id)
         # is the user explicitly asking for links?
         link_request = bool(re.search(
