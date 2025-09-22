@@ -619,12 +619,16 @@ def _store_and_send(
 
     total_parts = len(parts)
     GHL_WEBHOOK_URL = os.getenv("GHL_OUTBOUND_WEBHOOK_URL")
-    delay_ms = int(os.getenv("SMS_PART_DELAY_MS", "2200"))
+    delay_ms = int(os.getenv("SMS_PART_DELAY_MS", "3500"))
 
     for idx, part in enumerate(parts, 1):
         # prefix only when multipart
+        # Add a zero-width timestamp to help carrier ordering without changing what users see
+        zts = str(int(time.time() * 1000)).rjust(13, "0")  # 13-digit ms
+        zw  = "".join(chr(8203) for _ in range(5))         # five zero-width spaces
+        hidden = f"{zw}{zts}{zw}" if total_parts > 1 else ""
         prefix = f"[{idx}/{total_parts}] " if total_parts > 1 else ""
-        full_text = prefix + part
+        full_text = hidden + prefix + part
         message_id = str(uuid.uuid4())
 
         # DB store each part
