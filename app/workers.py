@@ -130,6 +130,37 @@ BANNED_STOCK_PHRASES = [
 _URL_END_RE = re.compile(r"(https?://[^\s)]+)\s*$", re.I)
 _URL_RE = re.compile(r"https?://[^\s)>\]]+", re.I)
 
+import random  # put this with your other imports
+
+_EMAIL_LINES = [
+    "I’ve got more to say—reply EMAIL and I’ll send a fully curated list. 💌",
+    "Want the long-winded tea (with links stacked neatly)? Reply EMAIL. ✨",
+    "If you want my no-character-limit brain, reply EMAIL and I’ll drop the whole shebang in your inbox. 📬",
+    "Prefer a tidy one-pager with picks & why? Reply EMAIL and I’ll shoot it over. 📨",
+    "Thirsty for receipts, not snippets? Reply EMAIL and I’ll send the deep dive. 🔎"
+]
+
+def _maybe_add_email_offer(text_val: str, per: int, maxp: int) -> str:
+    enabled = (os.getenv("EMAIL_OFFER_ENABLED") or "1").lower() in ("1","true","yes")
+    if not enabled:
+        return text_val
+    if "EMAIL" in (text_val or "").upper():
+        return text_val
+
+    link_cnt = len(_URL_RE.findall(text_val or ""))
+    overflow = len(text_val or "") > (per * maxp)
+    prob = float(os.getenv("EMAIL_OFFER_PROB", "0.35"))
+
+    if not (overflow or link_cnt >= 3 or random.random() < prob):
+        return text_val
+
+    closer = random.choice(_EMAIL_LINES)
+    extra = " " + closer
+    space = (per * maxp) - len(text_val)
+    if space < len(extra):
+        text_val = text_val[: (per * maxp) - len(extra) - 1].rstrip()
+    return (text_val + extra).strip()
+
 # --- SMS segmentation (URL-safe) ---------------------------------------------
 def _segments_for_sms(body: str,
                       per: int = int(os.getenv("SMS_PER_PART", "320")),
@@ -240,6 +271,9 @@ _BEAUTY_WORDS  = re.compile(r"(?i)\b(serum|moisturizer|cleanser|toner|retinol|vi
 _FASHION_WORDS = re.compile(r"(?i)\b(dress|jeans|denim|sweater|coat|boots?|heels?|sneakers?|top|skirt|bag|handbag|purse)\b")
 
 def _syl_search_url(name: str, user_text: str) -> str:
+        # skip retailer wrapping for procedures/techniques (not buyable products)
+    if re.search(r"(?i)\b(procedure|microneedling|prp|fraxel|laser|hyaluronic|injectable|filler|botox)\b", name):
+        return ""
     """Pick a SYL-friendly retailer by brand + context; no hard-wiring."""
     q = quote_plus((name or "").strip())
 
@@ -619,6 +653,10 @@ def _store_and_send(
             text_val[: (per * maxp) - 80].rstrip()
             + "\n\nToo long to fit by SMS. Want the full list by email? Reply EMAIL."
         )
+    # Optional email-offer (rotating, only when helpful)
+    per  = int(os.getenv("SMS_PER_PART", "320"))
+    maxp = int(os.getenv("SMS_MAX_PARTS", "3"))
+    text_val = _maybe_add_email_offer(text_val, per, maxp)
 
     # ==== Segment after shaping (URL-safe) ====
     parts = _segments_for_sms(text_val,
@@ -1024,11 +1062,33 @@ def generate_reply_job(
                 for n in _pick_names_to_link(names, user_text):
                     amz = _amz_search_url(n)
                     syl = _syl_search_url(n, user_text)
-                    if   strategy == "syl-only":     link_lines.append(f"{n}: {syl}")
-                    elif strategy == "amazon-only":  link_lines.append(f"{n}: {amz}")
-                    elif strategy == "syl-first":    link_lines += [f"{n}: {syl}", f"{n} (alt): {amz}"]
-                    elif strategy == "amazon-first": link_lines += [f"{n}: {amz}", f"{n} (alt): {syl}"]
-                    else:                            link_lines += [f"{n}: {amz}", f"{n} (alt): {syl}"]
+
+                    if strategy == "syl-only":
+                        # only SYL; if syl is empty (not a retailer), fall back to Amazon
+                        link_lines.append(f"{n}: {syl or amz}")
+
+                    elif strategy == "amazon-only":
+                        # only Amazon
+                        link_lines.append(f"{n}: {amz}")
+
+                    elif strategy == "syl-first":
+                        # prefer SYL when available; otherwise show Amazon
+                        link_lines.append(f"{n}: {syl or amz}")
+                        if syl and amz:
+                            link_lines.append(f"{n} (alt): {amz}")
+
+                    elif strategy == "amazon-first":
+                        # prefer Amazon; include SYL only if we actually have one
+                        link_lines.append(f"{n}: {amz}")
+                        if syl:
+                            link_lines.append(f"{n} (alt): {syl}")
+
+                    else:  # dual
+                        # show both; omit SYL if empty (procedures/techniques etc.)
+                        link_lines.append(f"{n}: {amz}")
+                        if syl:
+                            link_lines.append(f"{n} (alt): {syl}")
+
                 link_block = "\n".join(link_lines)
                 
                 reply = ("Here you go:\n" + link_block) if link_request \
