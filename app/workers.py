@@ -274,9 +274,7 @@ _LABEL_WORDS      = {"best", "mid", "budget"}
 _LABEL_TWO_BOLDS  = re.compile(r"\*\*\s*(?:best|mid|budget)\s*\*\*\s*:\s*\*\*([^*]+)\*\*", re.I)
 _LABEL_AFTER_COLON= re.compile(r"\*\*\s*(?:best|mid|budget)\s*\*\*\s*:\s*([^\n\r\(\-–—:]+)", re.I)
 _LIKE_BRAND       = re.compile(r"\(\s*.*?\blike\s+([^)]+?)\b.*?\)", re.I)
-_LABEL_LINE = re.compile(
-    r"\*\*\s*(BEST|MID|BUDGET)\s*:\s*\*\*\s*([^\n\r\-–—:]+)", re.I
-)
+
 def _extract_pick_names(text: str, maxn: int = 3) -> list[str]:
     """
     Pull up to `maxn` product-like names from the reply.
@@ -287,7 +285,7 @@ def _extract_pick_names(text: str, maxn: int = 3) -> list[str]:
     t = text or ""
     names: list[str] = []
 
-    # 1) Parse line-by-line to capture label + product + optional brand
+    # 1) parse label lines first
     for line in t.splitlines():
         line = line.strip()
         if not line:
@@ -298,12 +296,11 @@ def _extract_pick_names(text: str, maxn: int = 3) -> list[str]:
             prod = m.group(1).strip()
             b = _LIKE_BRAND.search(line)
             if b:
-                # Improve search quality with brand hint
-                prod = f"{prod} {b.group(1).strip()}"
+                prod = f"{prod} {b.group(1).strip()}"  # brand hint
             names.append(prod)
             continue
 
-    # 2) Fall back to generic patterns (filter label words)
+    # 2) fallback to generic patterns (filter label tokens)
     names += [n.strip() for n in _BOLD_NAME.findall(t) if n.strip().lower() not in _LABEL_WORDS]
     names += _NUM_NAME.findall(t)
     names += _BUL_NAME.findall(t)
@@ -311,7 +308,7 @@ def _extract_pick_names(text: str, maxn: int = 3) -> list[str]:
     # normalize & dedupe, keep order
     seen, out = set(), []
     for n in [x.strip(" -*•") for x in names if x.strip()]:
-        if n.lower() in _LABEL_WORDS:   # final guard
+        if n.lower() in _LABEL_WORDS:
             continue
         if n not in seen:
             seen.add(n)
@@ -319,6 +316,7 @@ def _extract_pick_names(text: str, maxn: int = 3) -> list[str]:
         if len(out) >= maxn:
             break
     return out
+
 
 # --- Ordinal/number parser so "link #2" selects the 2nd item -------------
 
@@ -628,7 +626,7 @@ def _store_and_send(
         zw  = "".join(chr(8203) for _ in range(5))         # five zero-width spaces
         hidden = f"{zw}{zts}{zw}" if total_parts > 1 else ""
         prefix = f"[{idx}/{total_parts}] " if total_parts > 1 else ""
-        full_text = hidden + prefix + part
+        full_text = prefix + part
         message_id = str(uuid.uuid4())
 
         # DB store each part
@@ -1015,8 +1013,17 @@ def generate_reply_job(
                     names = [phrase]
             if names:
                 # synthesize Amazon searches; linkwrap will add ?tag= later
-                link_lines = [f"{n}: {_amz_search_url(n)}" for n in _pick_names_to_link(names, user_text)]
-                link_block = "\n".join(link_lines)
+                strategy = (os.getenv("LINK_STRATEGY") or "dual").lower().strip()  # dual | syl-first | amazon-first | syl-only | amazon-only
+                link_lines = []
+                for n in _pick_names_to_link(names, user_text):
+                    amz = _amz_search_url(n)
+                    syl = _syl_search_url(n, user_text)
+                    if   strategy == "syl-only":     link_lines.append(f"{n}: {syl}")
+                    elif strategy == "amazon-only":  link_lines.append(f"{n}: {amz}")
+                    elif strategy == "syl-first":    link_lines += [f"{n}: {syl}", f"{n} (alt): {amz}"]
+                    elif strategy == "amazon-first": link_lines += [f"{n}: {amz}", f"{n} (alt): {syl}"]
+                    else:                            link_lines += [f"{n}: {amz}", f"{n} (alt): {syl}"]
+                link_block = "\n".join(link_lines)                
                 reply = ("Here you go:\n" + link_block) if link_request \
                         else (reply.rstrip() + "\n\nHere are the links:\n" + link_block)
                 # keep Amazon searches so they won't be stripped; tagging happens downstream
