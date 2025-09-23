@@ -887,6 +887,19 @@ def generate_reply_job(
         "[Worker][Start] Job: convo_id=%s user_id=%s text_len=%d media_cnt=%d",
         convo_id, user_id, len(user_text), len(media_urls or [])
     )
+    # normalize attachment strings like "url1, url2, url3" -> ["url1","url2","url3"]
+    import re
+    def _split_clean_urls(lst):
+        out = []
+        for v in (lst or []):
+            if isinstance(v, str):
+                for p in re.split(r"[,\s]+", v):
+                    p = p.strip().strip(".,;:)]")
+                    if p.startswith("http"):
+                        out.append(p)
+        return out
+
+    media_urls = _split_clean_urls(media_urls)
 
     # 0) Plan gate ---------------------------------------------------------------
     try:
@@ -928,47 +941,37 @@ def generate_reply_job(
 
     # 1) Media routing -----------------------------------------------------------
     if media_urls:
-        first = (media_urls[0] or "").strip()
+        first = (media_urls[-1] or "").strip()  # last image/audio is primary
         lower = first.lower()
         try:
-            if any(lower.endswith(ext) for ext in [".jpg", ".jpeg", ".png", ".gif", ".webp"]):
-                logger.info("[Worker][Media] Attachment image detected: %s", first)
-                reply = ai.describe_image(first)
-                _store_and_send(user_id, convo_id, reply, send_phone=user_phone)
-                return
-
+            # If it's audio, transcribe immediately and return
             if any(lower.endswith(ext) for ext in [".mp3", ".m4a", ".wav", ".ogg"]):
                 logger.info("[Worker][Media] Attachment audio detected: %s", first)
                 reply = ai.transcribe_and_respond(first, user_id=user_id)
                 _store_and_send(user_id, convo_id, reply, send_phone=user_phone)
                 return
-
-            # Extensionless: try image, then audio
-            logger.info("[Worker][Media] Attachment extless; trying image describe: %s", first)
-            try:
-                reply = ai.describe_image(first)
-                _store_and_send(user_id, convo_id, reply, send_phone=user_phone)
-                return
-            except Exception:
-                logger.info("[Worker][Media] describe_image failed; trying audio transcribe: %s", first)
-                reply = ai.transcribe_and_respond(first, user_id=user_id)
-                _store_and_send(user_id, convo_id, reply, send_phone=user_phone)
-                return
+            # If it's an image, DO NOT call describe_image here.
+            # Let the chat path handle the image(s) via context['media_urls'].
         except Exception as e:
             logger.warning("[Worker][Media] Attachment handling failed: %s", e)
 
-        # If a naked URL is in the text, quick media sniff
+    # If the user pasted a naked URL in text, only fast-path audio; let images fall through
     if "http" in user_text:
-        if any(ext in normalized_text for ext in [".jpg", ".jpeg", ".png", ".gif", ".webp"]):
-            logger.info("[Worker][Media] Image URL detected, describing.")
-            reply = ai.describe_image(user_text.strip())
-            _store_and_send(user_id, convo_id, reply, send_phone=user_phone)
-            return
         if any(ext in normalized_text for ext in [".mp3", ".m4a", ".wav", ".ogg"]):
             logger.info("[Worker][Media] Audio URL detected, transcribing.")
             reply = ai.transcribe_and_respond(user_text.strip(), user_id=user_id)
             _store_and_send(user_id, convo_id, reply, send_phone=user_phone)
             return
+        
+    # If a naked URL is in the text, quick media sniff
+    if "http" in user_text:
+        if any(ext in normalized_text for ext in [".mp3", ".m4a", ".wav", ".ogg"]):
+            logger.info("[Worker][Media] Audio URL detected, transcribing.")
+            reply = ai.transcribe_and_respond(user_text.strip(), user_id=user_id)
+            _store_and_send(user_id, convo_id, reply, send_phone=user_phone)
+            return
+    # image URL in text? fall through to chat (no early describe)
+
 
     # 2) Rename flow -------------------------------------------------------------
     rename_reply = try_handle_bestie_rename(user_id, convo_id, user_text)
@@ -1002,7 +1005,7 @@ def generate_reply_job(
             packs="https://schizobestie.gumroad.com/"
         )
 
-        rraw = ai.generate_reply(
+        raw = ai.generate_reply(
             user_text=user_text,
             product_candidates=[],        # nothing scripted
             user_id=user_id,
