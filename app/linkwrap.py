@@ -273,18 +273,17 @@ def wrap_all_affiliates(text: str) -> str:
     out = _URL_RE.sub(_plain_repl, out)
     return out
 
+_URL_END_RE = re.compile(r"(https?://[^\s)]+)\s*$", re.I)
+
 def ensure_not_link_ending(text: str) -> str:
     """
-    If CLOSER_MODE=static, append a short closer when a message ends with a URL.
-    Otherwise do nothing (let AI decide).
+    If an SMS ends on a bare URL, add a neutral closer so carriers don't
+    munge previews or eat the message.  No affiliate or AI call here.
     """
-    if not text or CLOSER_MODE != "static":
+    if not text:
         return text
-
     if _URL_END_RE.search(text):
-        closer = "Want the direct page or a cheaper alt?"
-        return text.rstrip() + "\n" + closer
-
+        return text.rstrip() + "\n"
     return text
 
 # Legacy shim: single URL path (used by older call sites)

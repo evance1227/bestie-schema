@@ -33,7 +33,7 @@ from typing import Optional, List, Dict, Tuple
 from datetime import datetime, timezone, timedelta
 from urllib.parse import quote_plus
 
-from app.linkwrap import _amz_search_url, _syl_search_url, wrap_all_affiliates
+from app.linkwrap import _amz_search_url, _syl_search_url, wrap_all_affiliates, ensure_not_link_ending
 import app.integrations as integrations
 
 # ----------------------------- Third party ----------------------------- #
