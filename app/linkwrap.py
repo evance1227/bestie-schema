@@ -117,7 +117,50 @@ def _append_amz_tag(u: str) -> str:
         return urlunparse((p.scheme, p.netloc, p.path, p.params, urlencode(q, doseq=True), p.fragment))
     except Exception:
         return u
+# --- retailer routing map (pattern -> (merchant_key, search_url_format)) ---
+_RETAILER_ROUTES = [
+    (r"(?i)\bsephora\b",        ("sephora",        "https://www.sephora.com/search?keyword={q}")),
+    (r"(?i)\bultra\b|\bulta\b", ("ulta",           "https://www.ulta.com/search?Ntt={q}")),
+    (r"(?i)\bnordstrom\b",      ("nordstrom",      "https://www.nordstrom.com/sr?keyword={q}")),
+    (r"(?i)\btarget\b",         ("target",         "https://www.target.com/s?searchTerm={q}")),
+    # nice-to-haves you asked for:
+    (r"(?i)\banthropologie\b|\banthro\b",
+                                ("anthropologie",  "https://www.anthropologie.com/search?q={q}")),
+    (r"(?i)\bfree\s*people\b|\bfreepeople\b",
+                                ("freepeople",     "https://www.freepeople.com/s?query={q}")),
+]
 
+def _syl_search_url(name: str, user_text: str) -> str:
+    """
+    Build a ShopYourLikes redirect for a specific retailer implied by the user's text.
+    Returns "" if no retailer was requested or SYL is disabled.
+    """
+    # SYL is off or not configured
+    if not (SYL_ENABLED and SYL_PUBLISHER_ID and SYL_WRAP_TEMPLATE):
+        return ""
+
+    # Explicit "amazon" -> we don't SYL-wrap Amazon (we use _amz_search_url instead)
+    if re.search(r"(?i)\bamazon\b", user_text or ""):
+        return ""
+
+    q = quote((name or "").strip(), safe="")
+
+    retailer_url = ""
+    for pat, (merchant_key, fmt) in _RETAILER_ROUTES:
+        if re.search(pat, user_text or ""):
+            # honor allowlist/denylist logic just like other wrappers
+            domain = urlparse(fmt).netloc
+            if not _should_syl(domain):
+                return ""
+            retailer_url = fmt.format(q=q)
+            break
+
+    if not retailer_url:
+        return ""  # nothing matched -> skip SYL alt
+
+    # Produce the redirect using your ENV template (or default)
+    return SYL_WRAP_TEMPLATE.format(pub=SYL_PUBLISHER_ID,
+                                    url=quote(retailer_url, safe=""))
 
 def _wrap_amazon(url: str) -> str:
     """
