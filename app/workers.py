@@ -32,10 +32,9 @@ from app.ai import generate_contextual_closer
 from typing import Optional, List, Dict, Tuple
 from datetime import datetime, timezone, timedelta
 from urllib.parse import quote_plus
-from app.linkwrap import wrap_all_affiliates, ensure_not_link_ending
-from app.linkwrap import _amz_search_url, _syl_search_url
 
-
+from app.linkwrap import _amz_search_url, _syl_search_url, wrap_all_affiliates
+import app.integrations as integrations
 
 # ----------------------------- Third party ----------------------------- #
 import redis

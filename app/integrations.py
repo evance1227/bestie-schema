@@ -11,6 +11,32 @@ from typing import Optional, Dict, Any
 from loguru import logger
 from app import db
 from sqlalchemy import text
+# --- GHL outbound wrapper ----------------------------------------------------
+import os
+import json
+import requests  # make sure 'requests' is in requirements.txt
+
+GHL_OUTBOUND_WEBHOOK_URL = os.getenv("GHL_OUTBOUND_WEBHOOK_URL", "").strip()
+
+def send_outbound(webhook_url: str, phone: str, text: str, user_id: int, convo_id: int) -> bool:
+    """
+    Post SMS to your GHL custom webhook. Returns True if accepted by GHL.
+    """
+    if not webhook_url or not phone or not (text or "").strip():
+        return False
+
+    payload = {
+        "phone":   phone,
+        "message": text,
+        "user_id": user_id,
+        "convo_id": convo_id,
+    }
+
+    try:
+        r = requests.post(webhook_url, json=payload, timeout=8)
+        return bool(getattr(r, "ok", False))
+    except Exception:
+        return False
 
 # Optional Redis de-dupe (safe no-op if REDIS_URL missing)
 try:
