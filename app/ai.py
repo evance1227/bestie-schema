@@ -44,41 +44,7 @@ except Exception as e:
     logger.error("[AI] OpenAI init failed: {}", e)
 
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-def describe_image(image_url: str, *, user_hint: str | None = None, max_chars: int = 450) -> str:
-    """
-    Vision describe for a single image URL. Returns a short, useful analysis.
-    Uses your global CLIENT + OPENAI_MODEL (must support vision, e.g. gpt-4o or gpt-4o-mini).
-    """
-    try:
-        if CLIENT is None:
-            return "I couldn't open the image just now."
 
-        sys = (
-            "You are Bestie: blunt, stylish, helpful. Describe the image in 3–5 punchy lines. "
-            "Focus only on details useful for recommendations (skin tone, undertone, hair color/length, outfit vibe, textures). "
-            "No disclaimers, no emojis, no hashtags."
-        )
-
-        user = (user_hint or "Describe what matters for product/style advice.").strip()
-
-        resp = CLIENT.chat.completions.create(
-            model=OPENAI_MODEL,
-            messages=[
-                {"role": "system", "content": sys},
-                {"role": "user", "content": [
-                    {"type": "text", "text": user},
-                    {"type": "image_url", "image_url": {"url": image_url}},
-                ]},
-            ],
-            temperature=0.6,
-            max_tokens=300,
-        )
-        text = (resp.choices[0].message.content or "").strip()
-        return text[:max_chars]
-    except Exception as e:
-        try: logger.warning("[AI] describe_image failed: {}", e)
-        except Exception: pass
-        return "I couldn't read the image, but if you resend it I’ll try again."
 import tempfile, requests
 
 WHISPER_MODEL = os.getenv("WHISPER_MODEL", "whisper-1")  # or "gpt-4o-mini-transcribe"
@@ -452,7 +418,6 @@ def build_messages(
     return msgs
   
 # ------------------ Core: generate_reply ------------ #
-# ------------------ Core: generate_reply ------------ #
 def generate_reply(
     user_text: str,
     product_candidates: Optional[List[Dict]] = None,
@@ -464,6 +429,16 @@ def generate_reply(
     Single entrypoint used by workers.py. Returns one SMS-ready reply string.
     Answer-first. No surveys. If it's a product ask, give real picks.
     """
+    vision_guidance = """
+    If an image is provided, answer the user's question about the image directly.
+    Give a verdict and one clear next step; keep any description minimal.
+    If multiple images appear, assume the last one is the primary reference unless the user says otherwise.
+    All replies must fit one SMS (≤ 520 chars).
+    """.strip()
+
+    # Combine the persona/system prompt that workers.py already passes with our vision rules
+    sys = ((system_prompt or "").strip() + "\n\n" + vision_guidance).strip()
+
     # 1) Build messages (persona + history + current ask)
     session_goal = (context or {}).get("session_goal")
     messages = build_messages(
@@ -482,12 +457,14 @@ def generate_reply(
     Prefer reputable brand/retailer links; Amazon is fine. Avoid the literal word “URL”.
     """.strip()
 
+    # combine persona (from workers) + both guidance blocks
+    combined_system = "\n\n".join([
+        (system_prompt or "").strip(),
+        vision_guidance,
+        shopping_guidance,
+    ]).strip()
 
-
-    system_prompt = ((system_prompt or "").strip() + "\n\n" + shopping_guidance).strip()
-
-
-    # Tiny domain nudge (hair) so she stops hand-waving
+    # Tiny domain nudges
     hair_nudge = ""
     tlow = (user_text or "").lower()
     if "hair" in tlow and any(k in tlow for k in ("regrow","growth","extensions","perimenopause","thinning","hair loss")):
@@ -495,20 +472,18 @@ def generate_reply(
             "\nFor hair regrowth after extensions/perimenopause: mention 5% minoxidil nightly, "
             "ketoconazole shampoo 2–3x/wk, and a daytime peptide serum; note sensitive-scalp caution."
         )
+
     device_nudge = ""
-    if re.search(r"(?i)\b(sofwave|ultherapy|hifu|ultrasound tightening|radiofrequency microneedling|rf microneedling)\b",
-                user_text or ""):
+    if re.search(r"(?i)\b(sofwave|ultherapy|hifu|ultrasound tightening|radiofrequency microneedling|rf microneedling)\b", user_text or ""):
         device_nudge = (
             "\nIf asked about non-surgical tightening (e.g., Sofwave/ultrasound): explain how it stimulates collagen; "
             "note many see an early 'glow' in ~1–2 weeks, with stronger changes over several weeks to a few months; "
             "encourage follow-up with a provider for personal timelines. Keep it upbeat and precise; no medical claims."
         )
 
-    # Replace system content if workers passed an explicit system_prompt
-    if system_prompt and messages and messages[0]["role"] == "system":
-        messages[0]["content"] = f"{system_prompt}{hair_nudge}{device_nudge}"
-    else:
-        messages[0]["content"] = f"{messages[0]['content']}\n\n{shopping_guidance}{hair_nudge}{device_nudge}"
+    # apply system text to messages[0]
+    if messages and messages[0]["role"] == "system":
+        messages[0]["content"] = f"{combined_system}{hair_nudge}{device_nudge}"
 
     # 3) Call OpenAI (prefer app.integrations if present)
     resp = CLIENT.chat.completions.create(

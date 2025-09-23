@@ -54,6 +54,9 @@ SEND_FALLBACK_ON_ERROR = True  # keep it True so we still send if GPT path hiccu
 SYL_ENABLED = (os.getenv("SYL_ENABLED") or "0").lower() in ("1","true","yes")
 SYL_PUBLISHER_ID = (os.getenv("SYL_PUBLISHER_ID") or "").strip()
 AMAZON_ASSOCIATE_TAG = (os.getenv("AMAZON_ASSOCIATE_TAG") or "").strip()
+SYL_MERCHANTS = set(
+    m.strip().lower() for m in (os.getenv("SYL_MERCHANTS") or "").split(",") if m.strip()
+)
 
 logger.info("[Boot] USE_GHL_ONLY=%s  SEND_FALLBACK_ON_ERROR=%s", USE_GHL_ONLY, SEND_FALLBACK_ON_ERROR)
 
@@ -271,33 +274,38 @@ _BEAUTY_WORDS  = re.compile(r"(?i)\b(serum|moisturizer|cleanser|toner|retinol|vi
 _FASHION_WORDS = re.compile(r"(?i)\b(dress|jeans|denim|sweater|coat|boots?|heels?|sneakers?|top|skirt|bag|handbag|purse)\b")
 
 def _syl_search_url(name: str, user_text: str) -> str:
-# skip non-buyable procedures/techniques
-    if re.search(r"(?i)\b(procedure|microneedling|prp|fraxel|laser|hyaluronic|injectable|filler|botox)\b", name):
-        return ""
-
+    # procedure guard...
     base = (os.getenv("SYL_WRAP_TEMPLATE") or "").strip()
     pub  = (os.getenv("SYL_PUBLISHER_ID") or "").strip()
-    if not (base and pub):
-        return ""
+    if not (base and pub): return ""
 
     q = quote_plus((name or "").strip())
 
-    # route to the retailer the user typed
-    if re.search(r"(?i)\bsephora\b", user_text or ""):
-        retailer = f"https://www.sephora.com/search?keyword={q}"
-    elif re.search(r"(?i)\bultra\b|\bulta\b", user_text or ""):
-        retailer = f"https://www.ulta.com/search?Ntt={q}"
-    elif re.search(r"(?i)\bnordstrom\b", user_text or ""):
-        retailer = f"https://www.nordstrom.com/sr?keyword={q}"
-    elif re.search(r"(?i)\btarget\b", user_text or ""):
-        retailer = f"https://www.target.com/s?searchTerm={q}"
-    elif re.search(r"(?i)\bamazon\b", user_text or ""):
-        return ""  # Amazon is primary via _amz_search_url
-    else:
-        return ""  # no retailer named -> skip SYL alt to avoid 404
+    _RETAILER_ROUTES = [
+        (r"(?i)\bsephora\b",        ("sephora",        "https://www.sephora.com/search?keyword={q}")),
+        (r"(?i)\bultra\b|\bulta\b", ("ulta",           "https://www.ulta.com/search?Ntt={q}")),
+        (r"(?i)\bnordstrom\b",      ("nordstrom",      "https://www.nordstrom.com/sr?keyword={q}")),
+        (r"(?i)\btarget\b",         ("target",         "https://www.target.com/s?searchTerm={q}")),
+        (r"(?i)\banthropologie\b|\banthro\b",
+                                    ("anthropologie",  "https://www.anthropologie.com/search?q={q}")),
+        (r"(?i)\bfree\s*people\b|\bfreepeople\b",
+                                    ("freepeople",     "https://www.freepeople.com/s?query={q}")),
+    ]
 
-    return base.format(pub=pub, url=quote_plus(retailer))
+    if re.search(r"(?i)\bamazon\b", user_text or ""):
+        return ""
 
+    retailer_url = ""
+    for pat, (merchant_key, fmt) in _RETAILER_ROUTES:
+        if re.search(pat, user_text or ""):
+            if merchant_key in SYL_MERCHANTS:
+                retailer_url = fmt.format(q=q)
+            break
+
+    if not retailer_url:
+        return ""  # skip alt to avoid 404
+
+    return base.format(pub=pub, url=quote_plus(retailer_url))
 
 _BOLD_NAME = re.compile(r"\*\*(.+?)\*\*")
 _NUM_NAME  = re.compile(r"^\s*\d+[\.\)]\s+([^\-–—:]+)", re.M)
@@ -994,12 +1002,15 @@ def generate_reply_job(
             packs="https://schizobestie.gumroad.com/"
         )
 
-        raw = ai.generate_reply(
+        rraw = ai.generate_reply(
             user_text=user_text,
             product_candidates=[],        # nothing scripted
             user_id=user_id,
             system_prompt=persona,
-            context={"has_completed_quiz": has_quiz},
+            context={
+                "has_completed_quiz": has_quiz,
+                "media_urls": media_urls or [],
+            }
         )
 
         # keep it light — don't over-sanitize
