@@ -36,6 +36,19 @@ from urllib.parse import quote_plus
 from app.linkwrap import _amz_search_url, _syl_search_url, wrap_all_affiliates, ensure_not_link_ending
 import app.integrations as integrations
 
+# --- keep SMS from ending on a bare URL (prevents weird previews/eating last line) ---
+_URL_END_RE = re.compile(r"(https?://[^\s)]+)\s*$", re.I)
+
+def ensure_not_link_ending(text: str) -> str:
+    """
+    If an SMS ends on a bare URL, append a newline. No AI call, no extra text.
+    """
+    if not text:
+        return text
+    if _URL_END_RE.search(text):
+        return text.rstrip() + "\n"
+    return text
+
 # ----------------------------- Third party ----------------------------- #
 import redis
 from loguru import logger
