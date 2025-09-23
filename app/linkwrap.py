@@ -15,10 +15,9 @@ from __future__ import annotations
 
 import os
 import re
-from urllib.parse import urlparse, urlunparse, parse_qs, urlencode, quote
-from urllib.parse import quote, quote_plus
+import logging
 
-
+from urllib.parse import urlparse, urlunparse, parse_qs, urlencode, quote, quote_plus
 
 # =========================
 # ENV
@@ -30,8 +29,11 @@ SYL_PUBLISHER_ID  = (os.getenv("SYL_PUBLISHER_ID") or "").strip()
 
 # One canonical redirect template (NO profile links). If your account uses a different
 # base, set SYL_WRAP_TEMPLATE in Render to that pattern; keep {pub} and {url}.
-SYL_WRAP_TEMPLATE = (os.getenv("SYL_WRAP_TEMPLATE") or
-                     "https://go.shopmy.us/p-{pub}?url={url}").strip()
+SYL_WRAP_TEMPLATE = (
+    os.getenv("SYL_WRAP_TEMPLATE")
+    or "https://go.sylikes.com/redirect?publisher_id={pub}&url={url}"
+).strip()
+
 
 # '*' means allow all retailers (except denylist & Amazon). Otherwise comma-separated list.
 SYL_RETAILERS     = [d.strip().lower() for d in (os.getenv("SYL_RETAILERS") or "*").split(",") if d.strip()]
@@ -158,8 +160,7 @@ def _syl_search_url(name: str, user_text: str) -> str:
         return ""  # nothing matched -> skip SYL alt
 
     # Produce the redirect using your ENV template (or default)
-    return SYL_WRAP_TEMPLATE.format(pub=SYL_PUBLISHER_ID,
-                                    url=quote(retailer_url, safe=""))
+    return base.format(pub=SYL_PUBLISHER_ID, url=quote(retailer_url, safe=''))
 
 def _wrap_amazon(url: str) -> str:
     """
@@ -172,7 +173,8 @@ def _wrap_amazon(url: str) -> str:
     u = _amazon_dp(url)
 
     if GENIUSLINK_WRAP:
-        return GENIUSLINK_WRAP.format(url=quote_plus(u))
+        return GENIUSLINK_WRAP.format(url=quote(u, safe=''))
+
 
     if GENIUSLINK_DOMAIN:
         m = re.search(r"/dp/([A-Z0-9]{10})", u)
@@ -198,15 +200,32 @@ def _should_syl(domain: str) -> bool:
 
     return True
 
+log = logging.getLogger("linkwrap")
+
 def _wrap_syl(url: str) -> str:
+    """
+    Wrap a retailer URL with SYL redirect.
+    - Force the /redirect?publisher_id=...&url=... route
+    - Do NOT double-encode
+    """
     if not (SYL_ENABLED and SYL_PUBLISHER_ID):
         return url
-    # keep % / ? & # = : intact so we don’t create %252F etc.
+
+    # If someone pasted a legacy profile route (go.shopmy.us/p-...), override it.
+    tpl = SYL_WRAP_TEMPLATE
+    if "/p-" in tpl:
+        tpl = "https://go.sylikes.com/redirect?publisher_id={pub}&url={url}"
+
+    # keep reserved URL chars so we don't create %252F
     safe = ":/?&=#%~"
-    return SYL_WRAP_TEMPLATE.format(
-        pub=SYL_PUBLISHER_ID,
-        url=quote(url, safe=safe)
-    )
+    wrapped = tpl.format(pub=SYL_PUBLISHER_ID, url=quote(url, safe=safe))
+
+    try:
+        log.info("[SYL] tpl=%s  dest=%s  ->  %s", tpl, url, wrapped)
+    except Exception:
+        pass
+
+    return wrapped
 
 def _wrap_url(url: str) -> str:
     """
