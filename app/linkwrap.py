@@ -15,7 +15,8 @@ from __future__ import annotations
 
 import os
 import re
-from urllib.parse import quote_plus, urlparse, urlunparse, parse_qs, urlencode
+from urllib.parse import urlparse, urlunparse, parse_qs, urlencode, quote
+from urllib.parse import quote_plus, quote
 
 
 # =========================
@@ -150,19 +151,14 @@ def _should_syl(domain: str) -> bool:
     return True
 
 def _wrap_syl(url: str) -> str:
-    """
-    Wrap a retailer URL via ShopYourLikes/ShopMy redirect.
-    NOTE: never profile links; always the redirect template.
-    """
     if not (SYL_ENABLED and SYL_PUBLISHER_ID):
         return url
-
     low = (url or "").lower()
-    if "go.shopmy.us" in low or "goto.shopyourlikes.com" in low or "go.sylikes.com" in low:
+    # already wrapped → leave it
+    if "go.shopmy.us" in low or "go.sylikes.com" in low:
         return url
-
-
-    return SYL_WRAP_TEMPLATE.format(pub=SYL_PUBLISHER_ID, url=quote_plus(url))
+    # IMPORTANT: use quote, not quote_plus
+    return SYL_WRAP_TEMPLATE.format(pub=SYL_PUBLISHER_ID, url=quote(url or "", safe=""))
 
 def _wrap_url(url: str) -> str:
     """
