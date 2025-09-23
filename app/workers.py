@@ -727,7 +727,7 @@ def _store_and_send(
 
         # send this part
         if GHL_WEBHOOK_URL:
-            _ = integrations.send_outbound(GHL_WEBHOOK_URL, send_phone, full_text, user_id, convo_id)
+            integrations.send_sms_reply(user_id, full_text)
 
         # tiny pause so carriers keep order
         time.sleep(delay_ms / 1000.0)

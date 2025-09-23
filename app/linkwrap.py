@@ -65,8 +65,7 @@ _AMAZON_HOST  = re.compile(r"(^|\.)(amazon\.[^/]+)$", re.I)
 # =========================
 def _amz_search_url(name: str) -> str:
     base = re.sub(r"[:|–—•\[\]\(\)]+", " ", (name or "").strip())
-    base = re.sub(r"\s{2,}", " ", base).strip()
-    # Amazon prefers %20 spaces (not '+')
+    base = re.sub(r"\s{2,}", " ", base)
     return f"https://www.amazon.com/s?k={quote(base, safe='')}"
 
 def _is_denied(url: str) -> bool:
@@ -202,12 +201,12 @@ def _should_syl(domain: str) -> bool:
 def _wrap_syl(url: str) -> str:
     if not (SYL_ENABLED and SYL_PUBLISHER_ID):
         return url
-    low = (url or "").lower()
-    # already wrapped → leave it
-    if "go.shopmy.us" in low or "go.sylikes.com" in low:
-        return url
-    # IMPORTANT: use quote, not quote_plus
-    return SYL_WRAP_TEMPLATE.format(pub=SYL_PUBLISHER_ID, url=quote(url or "", safe=""))
+    # keep % / ? & # = : intact so we don’t create %252F etc.
+    safe = ":/?&=#%~"
+    return SYL_WRAP_TEMPLATE.format(
+        pub=SYL_PUBLISHER_ID,
+        url=quote(url, safe=safe)
+    )
 
 def _wrap_url(url: str) -> str:
     """
