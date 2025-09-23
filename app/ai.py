@@ -431,9 +431,13 @@ def generate_reply(
     """
     vision_guidance = """
     If an image is provided, answer the user's question about the image directly.
-    Give a verdict and one clear next step; keep any description minimal.
-    If multiple images appear, assume the last one is the primary reference unless the user says otherwise.
-    All replies must fit one SMS (≤ 520 chars).
+    If they ask "would this suit me" or "should I", give a clear verdict (Yes/No or Lean Yes/No)
+    and one next step (cut shape, length, parting, styling, density hack, etc.).
+    Keep description minimal—no scene painting.
+
+    Never list "Best/Mid/Budget" or shopping picks unless the user explicitly asks for products/links.
+    If multiple images are provided, assume the last one is the primary reference unless stated otherwise.
+    Keep replies within a single SMS (≤ 520 chars).
     """.strip()
 
     # Combine the persona/system prompt that workers.py already passes with our vision rules

@@ -54,9 +54,10 @@ SEND_FALLBACK_ON_ERROR = True  # keep it True so we still send if GPT path hiccu
 SYL_ENABLED = (os.getenv("SYL_ENABLED") or "0").lower() in ("1","true","yes")
 SYL_PUBLISHER_ID = (os.getenv("SYL_PUBLISHER_ID") or "").strip()
 AMAZON_ASSOCIATE_TAG = (os.getenv("AMAZON_ASSOCIATE_TAG") or "").strip()
-SYL_MERCHANTS = set(
-    m.strip().lower() for m in (os.getenv("SYL_MERCHANTS") or "").split(",") if m.strip()
-)
+SYL_MERCHANTS = {s.strip().lower() for s in (os.getenv("SYL_MERCHANTS", "").split(",")) if s.strip()}
+def _syl_allowed(merchant_key: str) -> bool:
+    # allow all if wildcard present or if list is empty (no list given)
+    return (not SYL_MERCHANTS) or ("*" in SYL_MERCHANTS) or (merchant_key in SYL_MERCHANTS)
 
 logger.info("[Boot] USE_GHL_ONLY=%s  SEND_FALLBACK_ON_ERROR=%s", USE_GHL_ONLY, SEND_FALLBACK_ON_ERROR)
 
@@ -281,15 +282,80 @@ def _syl_search_url(name: str, user_text: str) -> str:
 
     q = quote_plus((name or "").strip())
 
+    # --- Retailer routing map (pattern -> (merchant_key, search_url_format)) ---
+    # Tip: order from most-common → less-common so the first match wins quickly.
+
     _RETAILER_ROUTES = [
-        (r"(?i)\bsephora\b",        ("sephora",        "https://www.sephora.com/search?keyword={q}")),
-        (r"(?i)\bultra\b|\bulta\b", ("ulta",           "https://www.ulta.com/search?Ntt={q}")),
-        (r"(?i)\bnordstrom\b",      ("nordstrom",      "https://www.nordstrom.com/sr?keyword={q}")),
-        (r"(?i)\btarget\b",         ("target",         "https://www.target.com/s?searchTerm={q}")),
-        (r"(?i)\banthropologie\b|\banthro\b",
-                                    ("anthropologie",  "https://www.anthropologie.com/search?q={q}")),
-        (r"(?i)\bfree\s*people\b|\bfreepeople\b",
-                                    ("freepeople",     "https://www.freepeople.com/s?query={q}")),
+        # Beauty
+        (r"(?i)\bsephora\b",                   ("sephora",        "https://www.sephora.com/search?keyword={q}")),
+        (r"(?i)\bulta\b|\bultra\b",            ("ulta",           "https://www.ulta.com/search?Ntt={q}")),
+        (r"(?i)\bdermstore\b",                 ("dermstore",      "https://www.dermstore.com/search?search={q}")),
+        (r"(?i)\bcredo\b|\bcredo beauty\b",    ("credo",          "https://credobeauty.com/search?q={q}")),
+        (r"(?i)\bglossier\b",                  ("glossier",       "https://www.glossier.com/search?q={q}")),
+        (r"(?i)\bfenty\b|\bfenty beauty\b",    ("fenty beauty",   "https://www.fentybeauty.com/search?q={q}")),
+        (r"(?i)\btatcha\b",                    ("tatcha",         "https://www.tatcha.com/search?q={q}")),
+        (r"(?i)\btarte\b",                     ("tarte cosmetics","https://tartecosmetics.com/search?q={q}")),
+        (r"(?i)\bmac cosmetics\b|\bmac\b",     ("mac cosmetics",  "https://www.maccosmetics.com/search?q={q}")),
+        (r"(?i)\bestee lauder\b",              ("estee lauder",   "https://www.esteelauder.com/search?Ntt={q}")),
+        (r"(?i)\bcredobeauty\b",               ("credo",          "https://credobeauty.com/search?q={q}")),
+
+        # Department / Designer
+        (r"(?i)\bnordstrom rack\b",            ("nordstrom rack", "https://www.nordstromrack.com/sr?keyword={q}")),
+        (r"(?i)\bbloomingdale'?s\b",           ("bloomingdale's", "https://www.bloomingdales.com/shop/keyword/{q}")),
+        (r"(?i)\bneiman marcus\b",             ("neiman marcus",  "https://www.neimanmarcus.com/search.jsp?Ntt={q}")),
+        (r"(?i)\bsaks off 5th\b",              ("saks off 5th",   "https://www.saksoff5th.com/search?q={q}")),
+        (r"(?i)\bsaks\b",                      ("saks fifth avenue","https://www.saksfifthavenue.com/search?q={q}")),
+        (r"(?i)\brevolve\b",                   ("revolve",        "https://www.revolve.com/r/search/?q={q}")),
+        (r"(?i)\bssense\b",                    ("ssense",         "https://www.ssense.com/en-us/women/search?q={q}")),
+
+        # Fashion – contemporary & mall
+        (r"(?i)\banthropologie\b|\banthro\b",  ("anthropologie",  "https://www.anthropologie.com/search?q={q}")),
+        (r"(?i)\bfree\s*people\b|\bfreepeople\b", ("freepeople",   "https://www.freepeople.com/s?query={q}")),
+        (r"(?i)\basos\b",                      ("asos",           "https://www.asos.com/search/?q={q}")),
+        (r"(?i)\babercrombie\b",               ("abercrombie & fitch","https://www.abercrombie.com/shop/us/search/{q}")),
+        (r"(?i)\bamerican eagle\b|\bae\b",     ("american eagle outfitters","https://www.ae.com/us/en/search/{q}")),
+        (r"(?i)\bh&m\b",                       ("h&m",            "https://www2.hm.com/en_us/search-results.html?q={q}")),
+        (r"(?i)\bmango\b",                     ("mango",          "https://shop.mango.com/us/search?q={q}")),
+        (r"(?i)\bj\.?crew\b",                  ("j.crew",         "https://www.jcrew.com/search2?N=&Nloc=en&Ntrm={q}")),
+        (r"(?i)\bmadenwell\b|\bmadewell\b",    ("madewell",       "https://www.madewell.com/search?q={q}")),
+        (r"(?i)\bgap factory\b",               ("gap factory",    "https://www.gapfactory.com/search?q={q}")),
+        (r"(?i)\bgap\b(?!\s*factory)",         ("gap",            "https://www.gap.com/search?q={q}")),
+        (r"(?i)\bold navy\b",                  ("old navy",       "https://oldnavy.gap.com/search?q={q}")),
+        (r"(?i)\buniqlo\b",                    ("uniqlo",         "https://www.uniqlo.com/us/en/search/?q={q}")),
+        (r"(?i)\burban outfitters\b",          ("urban outfitters","https://www.urbanoutfitters.com/search?q={q}")),
+        (r"(?i)\blulus\b",                     ("lulus",          "https://www.lulus.com/search?q={q}")),
+        (r"(?i)\bprincess polly\b",            ("princess polly", "https://us.princesspolly.com/search?q={q}")),
+        (r"(?i)\bprettylittlething\b",         ("prettylittlething","https://www.prettylittlething.us/search/?q={q}")),
+        (r"(?i)\bsteve madden\b",              ("steve madden",   "https://www.stevemadden.com/search?q={q}")),
+        (r"(?i)\bsam edelman\b",               ("sam edelman",    "https://www.samedelman.com/search?q={q}")),
+
+        # Sneakers & athleisure
+        (r"(?i)\bnike\b",                      ("nike",           "https://www.nike.com/w?q={q}&vst={q}")),
+        (r"(?i)\badidas\b",                    ("adidas",         "https://www.adidas.com/us/search?q={q}")),
+        (r"(?i)\bnew balance\b",               ("new balance",    "https://www.newbalance.com/search?q={q}")),
+        (r"(?i)\bhoka\b",                      ("hoka one",       "https://www.hoka.com/en/us/search?q={q}")),
+        (r"(?i)\bconverse\b",                  ("converse",       "https://www.converse.com/search?q={q}")),
+        (r"(?i)\bugg\b",                       ("ugg",            "https://www.ugg.com/search?q={q}")),
+        (r"(?i)\bvans\b",                      ("vans",           "https://www.vans.com/search?q={q}")),
+        (r"(?i)\bzappos\b",                    ("zappos",         "https://www.zappos.com/search?q={q}")),
+
+        # Outdoor & gear
+        (r"(?i)\brei\b",                       ("rei",            "https://www.rei.com/search?q={q}")),
+        (r"(?i)\bbackcountry\b",               ("backcountry",    "https://www.backcountry.com/store/search?q={q}")),
+        (r"(?i)\bdick'?s\b|\bdick.s\b",        ("dick's sporting goods","https://www.dickssportinggoods.com/search/SearchResults.jsp?searchTerm={q}")),
+
+        # Home + big box
+        (r"(?i)\btarget\b",                    ("target",         "https://www.target.com/s?searchTerm={q}")),
+        (r"(?i)\bwalmart\b",                   ("walmart",        "https://www.walmart.com/search?q={q}")),
+        (r"(?i)\bwayfair\b",                   ("wayfair",        "https://www.wayfair.com/keyword.php?keyword={q}")),
+        (r"(?i)\bhome depot\b|\bhomedepot\b",  ("home depot",     "https://www.homedepot.com/s/{q}")),
+        (r"(?i)\bcb2\b",                       ("cb2",            "https://www.cb2.com/search?query={q}")),
+        (r"(?i)\bcontainer store\b",           ("the container store","https://www.containerstore.com/s/{q}")),
+        (r"(?i)\bsur la table\b",              ("sur la table",   "https://www.surlatable.com/s?query={q}")),
+        (r"(?i)\bruggable\b",                  ("ruggable",       "https://my.ruggable.com/search?q={q}")),
+
+        # Tech / photo
+        (r"(?i)\bb&h\b|\bbh photo\b",          ("b&h photo video","https://www.bhphotovideo.com/c/search?Ntt={q}")),
     ]
 
     if re.search(r"(?i)\bamazon\b", user_text or ""):
@@ -298,7 +364,7 @@ def _syl_search_url(name: str, user_text: str) -> str:
     retailer_url = ""
     for pat, (merchant_key, fmt) in _RETAILER_ROUTES:
         if re.search(pat, user_text or ""):
-            if merchant_key in SYL_MERCHANTS:
+            if _syl_allowed(merchant_key):
                 retailer_url = fmt.format(q=q)
             break
 
@@ -658,24 +724,56 @@ def _store_and_send(
     text_val = _maybe_add_email_offer(text_val, per, maxp)
 
     # ==== Segment after shaping (URL-safe) ====
-    parts = _segments_for_sms(text_val,
-                              per=int(os.getenv("SMS_PER_PART", "320")),
-                              max_parts=int(os.getenv("SMS_MAX_PARTS", "3")),
-                              prefix_reserve=8)
+    import time  # ensure this is at top of the file
+
+    # ---- Segment after shaping (URL-safe) ----
+    parts = _segments_for_sms(
+        text_val,
+        per=int(os.getenv("SMS_PER_PART", "320")),
+        max_parts=int(os.getenv("SMS_MAX_PARTS", "3")),
+        prefix_reserve=8
+    )
 
     if not parts:
         return
 
     total_parts = len(parts)
     GHL_WEBHOOK_URL = os.getenv("GHL_OUTBOUND_WEBHOOK_URL")
-    delay_ms = int(os.getenv("SMS_PART_DELAY_MS", "3500"))
+    delay_ms = int(os.getenv("SMS_PART_DELAY_MS", "1600"))  # 1600–2000 helps ordering
 
     for idx, part in enumerate(parts, 1):
         # prefix only when multipart
-        # Add a zero-width timestamp to help carrier ordering without changing what users see
         prefix = f"[{idx}/{total_parts}] " if total_parts > 1 else ""
         full_text = prefix + part
         message_id = str(uuid.uuid4())
+
+        # DB store each part
+        try:
+            with db.session() as s:
+                models.insert_message(s, convo_id, "out", message_id, full_text)
+                s.commit()
+        except Exception:
+            logger.exception("[Worker][DB] Failed to insert outbound part")
+
+        # Primary send to GHL
+        if GHL_WEBHOOK_URL:
+            try:
+                ghl_payload = {
+                    "phone": send_phone,
+                    "message": full_text,
+                    "user_id": user_id,
+                    "convo_id": convo_id,
+                }
+                resp = requests.post(GHL_WEBHOOK_URL, json=ghl_payload, timeout=8)
+                logger.info("[GHL_SEND] status=%s body=%s",
+                            getattr(resp, "status_code", None),
+                            (getattr(resp, "text", "") or "")[:200])
+            except Exception as e:
+                logger.warning("[GHL_SEND] Failed to POST to GHL: %s", e)
+
+        # brief pause so carriers keep ordering
+        if total_parts > 1 and idx < total_parts:
+            time.sleep(delay_ms / 1000.0)
 
         # DB store each part
         try:
@@ -972,7 +1070,6 @@ def generate_reply_job(
             return
     # image URL in text? fall through to chat (no early describe)
 
-
     # 2) Rename flow -------------------------------------------------------------
     rename_reply = try_handle_bestie_rename(user_id, convo_id, user_text)
     if rename_reply:
@@ -1049,11 +1146,20 @@ def generate_reply_job(
                 cut = (reply or "")[:CLAMP]
                 sp = cut.rfind(" ")
                 reply = (cut[:sp] if sp != -1 else cut).rstrip()
+        _STYLE_INTENT_RE = re.compile(
+            r"(?i)\b(haircut|hair cut|hair style|hairstyle|bob|lob|bangs|fringe|layers|part|makeup|outfit|wardrobe|look|photo)\b"
+        )
+
+        def _looks_like_style_intent(text: str) -> bool:
+            return bool(_STYLE_INTENT_RE.search(text or ""))
 
         # GPT pass-through links:
         # If user asked for links (or we auto-link product asks) AND GPT didn't include any URL,
         # add a minimal Amazon fallback; otherwise do nothing (we'll just wrap).
-        make_links_now = link_request or (auto_link_flag and _looks_like_product_intent(user_text))
+        make_links_now = (
+            link_request or
+            (auto_link_flag and _looks_like_product_intent(user_text) and not _looks_like_style_intent(user_text))
+        )
         if make_links_now and not _URL_RE.search(reply or ""):
             names = _extract_pick_names(reply, maxn=3)           
             if not names:
