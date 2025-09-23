@@ -16,7 +16,8 @@ from __future__ import annotations
 import os
 import re
 from urllib.parse import urlparse, urlunparse, parse_qs, urlencode, quote
-from urllib.parse import quote_plus, quote
+from urllib.parse import quote, quote_plus
+
 
 
 # =========================
@@ -62,6 +63,11 @@ _AMAZON_HOST  = re.compile(r"(^|\.)(amazon\.[^/]+)$", re.I)
 # =========================
 # HELPERS
 # =========================
+def _amz_search_url(name: str) -> str:
+    base = re.sub(r"[:|–—•\[\]\(\)]+", " ", (name or "").strip())
+    base = re.sub(r"\s{2,}", " ", base).strip()
+    # Amazon prefers %20 spaces (not '+')
+    return f"https://www.amazon.com/s?k={quote(base, safe='')}"
 
 def _is_denied(url: str) -> bool:
     low = (url or "").lower()

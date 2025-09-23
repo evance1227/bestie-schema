@@ -33,6 +33,8 @@ from typing import Optional, List, Dict, Tuple
 from datetime import datetime, timezone, timedelta
 from urllib.parse import quote_plus
 from app.linkwrap import wrap_all_affiliates, ensure_not_link_ending
+from app.linkwrap import _amz_search_url, _syl_search_url
+
 
 
 # ----------------------------- Third party ----------------------------- #
@@ -166,23 +168,22 @@ def _maybe_add_email_offer(text_val: str, per: int, maxp: int) -> str:
     return (text_val + extra).strip()
 
 # --- SMS segmentation (URL-safe) ---------------------------------------------
-def _segments_for_sms(body: str,
-                      per: int = int(os.getenv("SMS_PER_PART", "320")),
-                      max_parts: int = int(os.getenv("SMS_MAX_PARTS", "3")),
-                      prefix_reserve: int = 8) -> list[str]:
-    """
-    Split `body` into <= per-char chunks, up to `max_parts`.
-    - avoids splitting inside URLs
-    - prefers whitespace boundaries
-    - prefixes like "[1/3] " need space; we reserve `prefix_reserve` chars per part
-    - last part may be longer if we must avoid breaking a URL; never exceeds per
-    """
-    text = (body or "").strip()
-    if not text:
-        return []
-    parts: list[str] = []
+_URL_RE   = re.compile(r"https?://\S+", re.I)
 
-    # precompute URL spans so we don't cut in the middle
+def _segments_for_sms(
+    text: str,
+    *,
+    per: int = 320,
+    max_parts: int = 3,
+    prefix_reserve: int = 8,   # room for "[1/3] "
+) -> list[str]:
+    """
+    Split `text` into <= max_parts SMS chunks of <= per chars.
+    Preserve URLs (we never break a URL across parts).
+    """
+    text = (text or "").rstrip()
+
+    # collect url spans once
     url_spans = [(m.start(), m.end()) for m in _URL_RE.finditer(text)]
 
     def _in_url(ix: int) -> tuple[int, int] | None:
@@ -191,8 +192,8 @@ def _segments_for_sms(body: str,
                 return (a, b)
         return None
 
+    parts: list[str] = []
     i, n = 0, len(text)
-    # leave room for "[i/n] "
     limit_per = max(10, per - prefix_reserve)
 
     while i < n and len(parts) < max_parts - 1:
@@ -201,46 +202,24 @@ def _segments_for_sms(body: str,
             break
 
         cut = i + limit_per
-        # back up to last whitespace
+
+        # never break inside a URL
+        span = _in_url(cut)
+        if span:
+            cut = span[0]             # back up to URL start
+
+        # otherwise back up to last space
         ws = text.rfind(" ", i, cut)
         if ws != -1 and ws > i:
             cut = ws
 
-        # if cut is inside a URL, snap to URL start
-        span = _in_url(cut)
-        if span:
-            a, b = span
-            # if the url started after the segment start, cut before the URL
-            if a > i:
-                cut = a - 1
-            else:
-                # URL started at the beginning of the segment; try after the URL if it fits
-                if b - i <= limit_per:
-                    cut = b
-                else:
-                    # fallback hard split
-                    cut = i + limit_per
-
-        chunk = text[i:cut].strip()
-        if chunk:
-            parts.append(chunk)
+        parts.append(text[i:cut].rstrip())
         i = cut
-        # skip a single space if present
-        if i < n and text[i].isspace():
+        while i < n and text[i] == " ":
             i += 1
 
-    # tail
-    tail = text[i:].strip()
-    if tail:
-        parts.append(tail)
-
-    # clamp to max_parts (merge overflow into last)
-    if len(parts) > max_parts:
-        head = parts[:max_parts - 1]
-        tail = " ".join(parts[max_parts - 1:]).strip()
-        parts = head + [tail]
-
-    return parts
+    parts.append(text[i:].rstrip())
+    return [p for p in parts if p]  # no empty segments
 
 from urllib.parse import quote_plus
 
@@ -486,25 +465,6 @@ def _pick_names_to_link(names: list[str], user_text: str) -> list[str]:
                 return [n]
     return names[:3]
 
-def _append_links_for_picks(reply: str, convo_id: Optional[int] = None) -> str:
-    """
-    Append search links for 2–3 pick names. If none found in reply, look back.
-    If still none, derive from user context keywords as a last resort.
-    """
-    names = _extract_pick_names(reply, maxn=3)
-
-    if not names:
-        # last-resort keyword guesses
-        # keep this tiny so we don't invent a catalog
-        kw = re.search(r"(?i)\b(minoxidil|ketoconazole|peptide serum|nutrafol|viviscal)\b", reply or "")
-        base = kw.group(1) if kw else "5% minoxidil foam"
-        names = [base]
-
-    lines = [reply.rstrip(), ""]
-    for n in names[:3]:
-        lines.append(f"{n}: {_amz_search_url(n)}")
-    return "\n".join(lines).strip()
-
 def _maybe_append_ai_closer(reply: str, user_text: str, category: str | None, convo_id: int) -> str:
     """
     If reply ends abruptly or on a URL, ask AI for a closer.
@@ -677,16 +637,18 @@ def _store_and_send(
     Store once, send once. No manual segmentation or [1/3] prefixes.
     Carriers will stitch if the payload segments on their side.
     """
-    # --- outbound dedupe (whole body) ----------------------------------------
+    # --- outbound dedupe: skip if we just sent the exact same text in this convo ---
     try:
         from hashlib import sha1
         sig = sha1((str(convo_id) + "::" + str(text_val)).encode("utf-8")).hexdigest()
         k   = f"sent:{convo_id}:{sig}"
-        if _rds and not _rds.set(k, "1", ex=30, nx=True):
+        # 60s is plenty; prevents GHL/queue retries from double-sending
+        if _rds and not _rds.set(k, "1", ex=60, nx=True):
             logger.info("[Send][Dedup] Skipping duplicate send for convo %s", convo_id)
             return
     except Exception:
         pass
+
 
     text_val = (text_val or "").strip()
     if not text_val:
@@ -726,95 +688,39 @@ def _store_and_send(
     # ==== Segment after shaping (URL-safe) ====
     import time  # ensure this is at top of the file
 
-    # ---- Segment after shaping (URL-safe) ----
+   # --- Segment after shaping (URL-safe) ---
     parts = _segments_for_sms(
         text_val,
         per=int(os.getenv("SMS_PER_PART", "320")),
         max_parts=int(os.getenv("SMS_MAX_PARTS", "3")),
-        prefix_reserve=8
+        prefix_reserve=8,     # we reserve "[1/2] " etc
     )
 
     if not parts:
         return
 
-    total_parts = len(parts)
     GHL_WEBHOOK_URL = os.getenv("GHL_OUTBOUND_WEBHOOK_URL")
-    delay_ms = int(os.getenv("SMS_PART_DELAY_MS", "1600"))  # 1600–2000 helps ordering
+    delay_ms = int(os.getenv("SMS_PART_DELAY_MS", "2000"))   # 1600–2200 is a good sweet spot
 
     for idx, part in enumerate(parts, 1):
-        # prefix only when multipart
-        prefix = f"[{idx}/{total_parts}] " if total_parts > 1 else ""
+        prefix = f"[{idx}/{len(parts)}] " if len(parts) > 1 else ""
         full_text = prefix + part
         message_id = str(uuid.uuid4())
 
         # DB store each part
-        try:
-            with db.session() as s:
-                models.insert_message(s, convo_id, "out", message_id, full_text)
-                s.commit()
-        except Exception:
-            logger.exception("[Worker][DB] Failed to insert outbound part")
+        with db.session() as s:
+            models.insert_message(s, convo_id, "out", message_id, full_text)
+            s.commit()
+        logger.info("[Worker][DB] Outbound stored: convo_id=%s user_id=%s msg_id=%s", convo_id, user_id, message_id)
 
-        # Primary send to GHL
+        # send this part
         if GHL_WEBHOOK_URL:
-            try:
-                ghl_payload = {
-                    "phone": send_phone,
-                    "message": full_text,
-                    "user_id": user_id,
-                    "convo_id": convo_id,
-                }
-                resp = requests.post(GHL_WEBHOOK_URL, json=ghl_payload, timeout=8)
-                logger.info("[GHL_SEND] status=%s body=%s",
-                            getattr(resp, "status_code", None),
-                            (getattr(resp, "text", "") or "")[:200])
-            except Exception as e:
-                logger.warning("[GHL_SEND] Failed to POST to GHL: %s", e)
+            _ = integrations.send_outbound(GHL_WEBHOOK_URL, send_phone, full_text, user_id, convo_id)
 
-        # brief pause so carriers keep ordering
-        if total_parts > 1 and idx < total_parts:
-            time.sleep(delay_ms / 1000.0)
+        # tiny pause so carriers keep order
+        time.sleep(delay_ms / 1000.0)
 
-        # DB store each part
-        try:
-            with db.session() as s:
-                models.insert_message(s, convo_id, "out", message_id, full_text)
-                s.commit()
-            logger.info("[Worker][DB] Outbound stored: convo_id={} user_id={} msg_id={}",
-                        convo_id, user_id, message_id)
-        except Exception:
-            logger.exception("[Worker][DB] Failed to insert outbound, will still attempt send")
-
-        # Primary send via GHL
-        if GHL_WEBHOOK_URL:
-            try:
-                ghl_payload = {
-                    "phone": send_phone,
-                    "message": full_text,
-                    "user_id": user_id,
-                    "convo_id": convo_id
-                }
-                resp = requests.post(GHL_WEBHOOK_URL, json=ghl_payload, timeout=8)
-                logger.info("[GHL_SEND] status={} body={}",
-                            getattr(resp, "status_code", None),
-                            (getattr(resp, "text", "") or "")[:200])
-            except Exception as e:
-                logger.warning("[GHL_SEND] Failed to POST to GHL: {}", e)
-
-        # Optional fallback (delivery safety while testing)
-        if not USE_GHL_ONLY:
-            try:
-                integrations.send_sms_reply(user_id, full_text)
-                logger.success("[Worker][Send] Fallback SMS send attempted for user_id={}", user_id)
-            except Exception:
-                logger.exception("[Worker][Send] Exception while calling send_sms_reply")
-
-        # tiny pause for ordering
-        try:
-            if total_parts > 1 and idx < total_parts and delay_ms > 0:
-                time.sleep(delay_ms / 1000.0)
-        except Exception:
-            pass
+    return
 
 # ---------------------------------------------------------------------- #
 # Rename flow
