@@ -31,7 +31,7 @@ SYL_PUBLISHER_ID  = (os.getenv("SYL_PUBLISHER_ID") or "").strip()
 # base, set SYL_WRAP_TEMPLATE in Render to that pattern; keep {pub} and {url}.
 SYL_WRAP_TEMPLATE = (
     os.getenv("SYL_WRAP_TEMPLATE")
-    or "https://go.sylikes.com/redirect?publisher_id={pub}&url={url}"
+    or "https://go.shopmy.us/p-{pub}?url={url}"
 ).strip()
 
 
@@ -160,7 +160,11 @@ def _syl_search_url(name: str, user_text: str) -> str:
         return ""  # nothing matched -> skip SYL alt
 
     # Produce the redirect using your ENV template (or default)
-    return base.format(pub=SYL_PUBLISHER_ID, url=quote(retailer_url, safe=''))
+    return SYL_WRAP_TEMPLATE.format(
+    pub=SYL_PUBLISHER_ID,
+    url=quote(retailer_url, safe="")  # encode once
+)
+
 
 def _wrap_amazon(url: str) -> str:
     """
