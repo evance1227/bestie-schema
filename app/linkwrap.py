@@ -17,6 +17,7 @@ import os
 import re
 import logging
 from urllib.parse import urlparse, urlunparse, parse_qs, urlencode, quote
+from urllib.parse import urlparse, parse_qs, unquote
 
 # =========================
 # ENV
@@ -67,6 +68,35 @@ _AMAZON_HOST  = re.compile(r"(^|\.)(amazon\.[^/]+)$", re.I)
 # =========================
 # HELPERS
 # =========================
+# --- Legacy SYL link normalizer (hotfix) ---
+# --- Legacy SYL link normalizer (hotfix) ---
+import re
+from urllib.parse import urlparse, parse_qs, unquote
+
+def normalize_syl_links(text: str) -> str:
+    """
+    Rewrite old-style SYL links to the canonical go.shopmy.us pattern.
+    Examples:
+      https://go.sylikes.com/redirect?publisher_id=729877&url=https%3A%2F%2Fwww.freepeople.com%2F...
+      https://go.sylikes.com/redirect?publisher_id=729877&url=https://www.freepeople.com/...
+    Output:
+      https://go.shopmy.us/p-<pub>?url=<raw retailer url>
+    """
+    pattern = re.compile(r"https?://go\.sylikes\.com/redirect\?publisher_id=(\d+)&url=([^\s\)\]]+)")
+    def _repl(m):
+        pub = m.group(1)
+        url_param = m.group(2)
+        try:
+            parsed = urlparse("http://x/x?" + "url=" + url_param)
+            q = parse_qs(parsed.query)
+            retailer_url = q.get("url", [url_param])[0]
+        except Exception:
+            retailer_url = url_param
+        retailer_url = unquote(retailer_url)
+        return f"https://go.shopmy.us/p-{pub}?url={retailer_url}"
+    return pattern.sub(_repl, text)
+
+
 def _amz_search_url(name: str) -> str:
     base = re.sub(r"[:|–—•\[\]\(\)]+", " ", (name or "").strip())
     base = re.sub(r"\s{2,}", " ", base).strip()
@@ -211,28 +241,24 @@ log = logging.getLogger("linkwrap")
 
 def _wrap_syl(url: str) -> str:
     """
-    Wrap a retailer URL with SYL redirect.
-    - Force the /redirect?publisher_id=...&url=... route
-    - Do NOT double-encode
+    Wrap a retailer URL with SYL redirect in canonical format:
+      https://go.shopmy.us/p-{pub}?url={retailer_url}
+    Do NOT pre-encode the retailer URL; SYL will encode it.
     """
     if not (SYL_ENABLED and SYL_PUBLISHER_ID):
         return url
 
-    # If someone pasted a legacy profile route (go.shopmy.us/p-...), override it.
-    tpl = SYL_WRAP_TEMPLATE
-    if "/p-" in tpl:
-        tpl = "https://go.sylikes.com/redirect?publisher_id={pub}&url={url}"
-
-    # keep reserved URL chars so we don't create %252F
-    safe = ":/?&=#%~"
-    wrapped = tpl.format(pub=SYL_PUBLISHER_ID, url=quote(url, safe=safe))
+    tpl = (SYL_WRAP_TEMPLATE or "").strip()
+    # If template is legacy or blank, force canonical
+    if "sylikes.com" in tpl or "redirect?publisher_id" in tpl or not tpl:
+        tpl = "https://go.shopmy.us/p-{pub}?url={url}"
 
     try:
-        log.info("[SYL] tpl=%s  dest=%s  ->  %s", tpl, url, wrapped)
+        wrapped = tpl.format(pub=SYL_PUBLISHER_ID, url=url)  # raw URL, no quote()
+        log.info("[SYL] tpl=%s  dest=%s  => %s", tpl, url, wrapped)
+        return wrapped
     except Exception:
-        pass
-
-    return wrapped
+        return url
 
 def _wrap_url(url: str) -> str:
     """

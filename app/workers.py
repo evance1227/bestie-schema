@@ -28,6 +28,7 @@ import random
 import time
 import requests
 import json
+from app.linkwrap import normalize_syl_links
 from app.ai import generate_contextual_closer
 from typing import Optional, List, Dict, Tuple
 from datetime import datetime, timezone, timedelta
@@ -38,19 +39,6 @@ import app.integrations as integrations
 import os, logging
 from redis import Redis
 from rq import Queue, Worker
-
-# --- keep SMS from ending on a bare URL (prevents weird previews/eating last line) ---
-_URL_END_RE = re.compile(r"(https?://[^\s)]+)\s*$", re.I)
-
-def ensure_not_link_ending(text: str) -> str:
-    """
-    If an SMS ends on a bare URL, append a newline. No AI call, no extra text.
-    """
-    if not text:
-        return text
-    if _URL_END_RE.search(text):
-        return text.rstrip() + "\n"
-    return text
 
 # ----------------------------- Third party ----------------------------- #
 import redis
@@ -111,7 +99,7 @@ def _fix_vip_links(text: str) -> str:
        
 # Geniuslink / Amazon wrap toggles (leave blank to disable)
 GENIUSLINK_DOMAIN = (os.getenv("GENIUSLINK_DOMAIN") or "").strip()
-GENIUSLINK_WRAP   = (os.getenv("GENIUSLINK_WRAP") or "").strip()  # e.g. https://geni.us/redirect?url={url}
+GENIUSLINK_WRAP   = (os.getenv("GENIUSLINK_WRAP") or "").strip() 
 GL_REWRITE        = os.getenv("GL_REWRITE", "1").lower() not in ("0", "false", "")
 _AMZN_RE          = re.compile(r"https?://(?:www\.)?amazon\.[^\s)\]]+", re.I)
 
@@ -184,6 +172,19 @@ def _maybe_add_email_offer(text_val: str, per: int, maxp: int) -> str:
 
 # --- SMS segmentation (URL-safe) ---------------------------------------------
 _URL_RE   = re.compile(r"https?://\S+", re.I)
+# --- keep SMS from ending on a bare URL (prevents weird previews/eating last line) ---
+_URL_END_RE = re.compile(r"(https?://[^\s)]+)\s*$", re.I)
+
+def ensure_not_link_ending(text: str) -> str:
+    """
+    If an SMS ends on a bare URL, append a newline. No extra text.
+    """
+    if not text:
+        return text
+    if _URL_END_RE.search(text):
+        return text.rstrip() + "\n"
+    return text
+
 
 def _segments_for_sms(
     text: str,
@@ -680,7 +681,7 @@ def _store_and_send(
     text_val = _strip_link_placeholders(text_val)
     if not _allow_amz:
         text_val = _strip_amazon_search_links(text_val)
-    text_val = wrap_all_affiliates(text_val)     # (adds Amazon ?tag= / SYL redirect)
+    text_val = wrap_all_affiliates(text_val)     
     text_val = ensure_not_link_ending(text_val)
 
     # Optional debug marker (visible once)
