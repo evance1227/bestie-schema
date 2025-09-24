@@ -1,12 +1,9 @@
-from __future__ import annotations
 # app/main.py
-import os, time, re
+from __future__ import annotations
+
+import os, re, time
 from typing import Any, List, Optional
-_URL_RE = re.compile(r"https?://[^\s)\]]+", re.I)
-_IMG_EXTS = (".jpg", ".jpeg", ".png", ".gif", ".webp")
-_AUD_EXTS = (".mp3", ".m4a", ".wav", ".ogg")
-CRON_SECRET = os.getenv("CRON_SECRET")
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
+
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -18,9 +15,14 @@ from sqlalchemy import text as sqltext
 from app import db
 from app.webhooks_gumroad import router as gumroad_router
 
-# Env
+# -------------------- Env -------------------- #
+CRON_SECRET    = os.getenv("CRON_SECRET")
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
 
-# URL + media helpers
+# -------------------- URL & media helpers -------------------- #
+_URL_RE     = re.compile(r"https?://[^\s)\]]+", re.I)
+_IMG_EXTS   = (".jpg", ".jpeg", ".png", ".gif", ".webp")
+_AUD_EXTS   = (".mp3", ".m4a", ".wav", ".ogg")
 
 def _collect_urls_anywhere(obj: Any, bucket: List[str]) -> None:
     """Recursively walk the inbound payload collecting any http(s) URLs."""
@@ -36,14 +38,14 @@ def _collect_urls_anywhere(obj: Any, bucket: List[str]) -> None:
                 if m.startswith("http"):
                     bucket.append(m.strip())
     except Exception:
-        # Be permissive; this is best-effort harvesting
+        # best-effort harvesting; never break the webhook
         pass
 
 def _extract_media_urls(body: dict) -> List[str]:
     """Try well-known locations first; fall back to recursive scan of payload."""
     urls: List[str] = []
 
-    # Known GHL shapes
+    # GHL attachment shapes
     top = body.get("attachments")
     if isinstance(top, list):
         for a in top:
@@ -58,20 +60,19 @@ def _extract_media_urls(body: dict) -> List[str]:
             if u.startswith("http"):
                 urls.append(u)
 
-    # If still empty, deep scan entire payload
+    # If still empty, deep scan the whole payload
     if not urls:
         _collect_urls_anywhere(body, urls)
 
     # Dedup while preserving order
-    seen = set()
-    out: List[str] = []
+    seen, out = set(), []
     for u in urls:
         if u not in seen:
             seen.add(u)
             out.append(u)
     return out
 
-# App + routes (single instance)
+# -------------------- App -------------------- #
 app = FastAPI(
     title="Bestie Backend",
     docs_url="/docs",
@@ -81,21 +82,26 @@ app = FastAPI(
 logger.info("[API][Boot] Using REDIS_URL={}", os.getenv("REDIS_URL"))
 app.include_router(gumroad_router)
 
+@app.get("/debug/enqueue-ping")
+def enqueue_ping():
+    from app.workers import _ping_job  # lazy import to avoid circulars
+    q.enqueue(_ping_job, job_timeout=30)
+    return {"enqueued": True, "queue": q.name}
+
 @app.get("/healthz")
 def healthz():
     return {"ok": True}
 
 # -------------------- Secure env snapshot -------------------- #
-
 SENSITIVE = re.compile(r"(secret|key|token|pwd|password|auth|api)", re.I)
 
 def _masked_env(snapshot: dict[str, str]) -> dict[str, str]:
-    masked = {}
+    masked: dict[str, str] = {}
     for k, v in snapshot.items():
         if v is None:
             masked[k] = None
-            continue
-        masked[k] = "***" if SENSITIVE.search(k) else (v if len(v) < 80 else v[:76] + "…")
+        else:
+            masked[k] = "***" if SENSITIVE.search(k) else (v if len(v) < 80 else v[:76] + "…")
     return masked
 
 @app.get("/debug/env")
@@ -117,7 +123,7 @@ def debug_env(secret: str):
         "GENIUSLINK_DOMAIN": os.getenv("GENIUSLINK_DOMAIN"),
         "ENFORCE_SIGNUP_BEFORE_CHAT": os.getenv("ENFORCE_SIGNUP_BEFORE_CHAT"),
         "FREE_TRIAL_DAYS": os.getenv("FREE_TRIAL_DAYS"),
-        "WEBHOOK_SECRET": os.getenv("WEBHOOK_SECRET"),  # will be masked by _masked_env
+        "WEBHOOK_SECRET": os.getenv("WEBHOOK_SECRET"),  # masked
     }
     return _masked_env(snap)
 
@@ -138,7 +144,7 @@ def plan_rollover(request: Request):
         s.commit()
     return {"ok": True}
 
-# -------------------- Debug: queue probe -------------------- #
+# -------------------- Queue probe -------------------- #
 from redis import Redis
 from rq import Queue
 
@@ -154,12 +160,48 @@ def debug_queue():
         "queued_count": len(jobs),
         "sample_job_ids": [j.id for j in jobs[:5]],
     }
+# -------------------- Debug: enqueue ping -------------------- #
+from app.task_queue import q  # same Queue object the API uses
 
-# ✅ Package-relative imports for worker helpers
+@app.get("/debug/enqueue-ping")
+def enqueue_ping():
+    from app.workers import _ping_job  # import lazily to avoid circular import at import-time
+    q.enqueue(_ping_job, job_timeout=30)
+    return {"enqueued": True, "queue": q.name}
+
+
+# -------------------- Worker helpers -------------------- #
 from . import models
 from .task_queue import enqueue_generate_reply
 from .workers import send_reengagement_job
 
+# -------------------- Webhook auth helper -------------------- #
+def _auth_ok(req: Request) -> bool:
+    """Accept multiple common secret formats so GHL/curl both work."""
+    secret = (WEBHOOK_SECRET or "").strip()
+    if not secret:
+        return True  # no secret set -> allow all
+    h = req.headers
+    qp = req.query_params
+    candidates = [
+        h.get("Authorization"),
+        h.get("X-Webhook-Secret"),
+        h.get("X-Hook-Secret"),
+        h.get("X-GHL-Secret"),
+        h.get("LeadConnector-Secret"),
+        qp.get("secret"),
+        qp.get("token"),
+    ]
+    for c in candidates:
+        if not c:
+            continue
+        if c == secret:
+            return True
+        if c.startswith("Bearer ") and c.split(" ", 1)[1] == secret:
+            return True
+    return False
+
+# -------------------- Process & Webhook -------------------- #
 def process_incoming(message_id: str, user_phone: str, text_val: str, raw_body: dict,
                      media_urls: Optional[List[str]] = None):
     """DB insert + enqueue; no recursion, no background task."""
@@ -182,15 +224,12 @@ def process_incoming(message_id: str, user_phone: str, text_val: str, raw_body: 
         logger.exception("💥 [API][Process] Exception: {}", e)
         return {"ok": True, "error": "process_incoming_failed"}
 
-    # -------------------- Inbound webhook -------------------- #
 @app.post("/webhook/incoming_message")
 async def incoming_message_any(req: Request):
-    # 🔐 Optional shared secret
-    if WEBHOOK_SECRET:
-        sec = req.headers.get("X-Webhook-Secret") or req.headers.get("x-webhook-secret")
-        if sec != WEBHOOK_SECRET:
-            logger.warning("[API][Webhook] Forbidden: bad or missing X-Webhook-Secret")
-            return JSONResponse(status_code=403, content={"ok": False, "error": "forbidden"})
+    # 🔐 shared secret
+    if not _auth_ok(req):
+        logger.warning("[API][Webhook] Forbidden: missing/invalid secret")
+        return JSONResponse(status_code=403, content={"ok": False, "error": "forbidden"})
 
     # Parse body
     try:
@@ -200,7 +239,7 @@ async def incoming_message_any(req: Request):
         logger.exception("[API][Webhook] Invalid JSON")
         return JSONResponse(status_code=200, content={"ok": True, "error": "invalid json"})
 
-    # Choose correct payload root
+    # Choose correct payload root (GHL sends customData sometimes)
     cd = body.get("customData") or body.get("custom_data")
     payload = cd if cd and isinstance(cd, dict) else body
 
@@ -209,7 +248,8 @@ async def incoming_message_any(req: Request):
     message_id = f"{base_id}-{int(time.time())}"
 
     user_phone = (
-        payload.get("user_phone") or body.get("user_phone") or body.get("phone") or body.get("contact", {}).get("phone")
+        payload.get("user_phone") or body.get("user_phone") or
+        body.get("phone") or body.get("contact", {}).get("phone")
     )
     if user_phone:
         digits = re.sub(r"\D", "", str(user_phone))
@@ -226,7 +266,7 @@ async def incoming_message_any(req: Request):
     text_val = str(text_val or "")
     media_urls: List[str] = _extract_media_urls(body)
 
-    # Guard: process if EITHER text or media is present
+    # Guard: require either text or media
     if not (text_val.strip() or media_urls):
         logger.warning("⚠️ [API][Webhook] Missing fields: phone=%s text='' media_cnt=0", user_phone)
         return {"ok": True}
@@ -240,8 +280,7 @@ async def incoming_message_any(req: Request):
     logger.info("[API][Webhook] ✅ Final ACK sent to GHL")
     return {"ok": True}
 
-
-# -------------------- Secure re-engagement for Cron -------------------- #
+# -------------------- Secure re-engagement (Cron) -------------------- #
 @app.post("/jobs/reengage")
 def jobs_reengage(request: Request):
     secret = request.headers.get("X-Cron-Secret") or request.query_params.get("secret")

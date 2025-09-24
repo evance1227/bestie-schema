@@ -35,6 +35,9 @@ from urllib.parse import quote_plus
 
 from app.linkwrap import _amz_search_url, _syl_search_url, wrap_all_affiliates, ensure_not_link_ending
 import app.integrations as integrations
+import os, logging
+from redis import Redis
+from rq import Queue, Worker
 
 # --- keep SMS from ending on a bare URL (prevents weird previews/eating last line) ---
 _URL_END_RE = re.compile(r"(https?://[^\s)]+)\s*$", re.I)
@@ -61,17 +64,17 @@ from app import db, models, ai, integrations, linkwrap
 # Environment and globals
 # ---------------------------------------------------------------------- #
 SMS_PART_DELAY_MS = int(os.getenv("SMS_PART_DELAY_MS", "1600"))
-REDIS_URL = os.getenv("REDIS_URL", "")
+REDIS_URL  = (os.getenv("REDIS_URL") or "").strip()
 _rds = redis.from_url(REDIS_URL, decode_responses=True) if REDIS_URL else None
 USE_GHL_ONLY = (os.getenv("USE_GHL_ONLY", "1").lower() not in ("0","false","no"))
 SEND_FALLBACK_ON_ERROR = True  # keep it True so we still send if GPT path hiccups
 SYL_ENABLED = (os.getenv("SYL_ENABLED") or "0").lower() in ("1","true","yes")
 SYL_PUBLISHER_ID = (os.getenv("SYL_PUBLISHER_ID") or "").strip()
 AMAZON_ASSOCIATE_TAG = (os.getenv("AMAZON_ASSOCIATE_TAG") or "").strip()
-SYL_MERCHANTS = {s.strip().lower() for s in (os.getenv("SYL_MERCHANTS", "").split(",")) if s.strip()}
+SYL_RETAILERS = {s.strip().lower() for s in (os.getenv("SYL_RETAILERS", "").split(",")) if s.strip()}
 def _syl_allowed(merchant_key: str) -> bool:
     # allow all if wildcard present or if list is empty (no list given)
-    return (not SYL_MERCHANTS) or ("*" in SYL_MERCHANTS) or (merchant_key in SYL_MERCHANTS)
+    return (not SYL_RETAILERS) or ("*" in SYL_RETAILERS) or (merchant_key in SYL_RETAILERS)
 
 logger.info("[Boot] USE_GHL_ONLY=%s  SEND_FALLBACK_ON_ERROR=%s", USE_GHL_ONLY, SEND_FALLBACK_ON_ERROR)
 
@@ -1143,6 +1146,11 @@ def generate_reply_job(
     logger.info("[FINISH] sending reply len=%d", len(reply or ""))    
     _store_and_send(user_id, convo_id, reply, send_phone=user_phone)
     return
+
+def _ping_job():
+    from loguru import logger
+    logger.info("[Worker] Executed ping job")
+    return "pong"
 
 # ---------------------------------------------------------------------- #
 # Debug and re-engagement jobs
