@@ -33,17 +33,16 @@ SYL_WRAP_TEMPLATE = (
     or "https://go.shopmy.us/p-{pub}?url={url}"
 ).strip()
 
-logging.info(
-    "[SYL] template=%s merchants=%s deny=%s",
-    SYL_WRAP_TEMPLATE, SYL_MERCHANTS, SYL_DENYLIST
-)
-
 # '*' means allow all retailers (except denylist & Amazon). Otherwise comma-separated list.
 SYL_RETAILERS     = [d.strip().lower() for d in (os.getenv("SYL_RETAILERS") or "*").split(",") if d.strip()]
 
 # Never SYL-wrap these (already-affiliate or our own assets)
 SYL_DENYLIST      = [d.strip().lower() for d in (os.getenv("SYL_DENYLIST") or
                      "geni.us,gumroad.com,bit.ly,tinyurl.com").split(",") if d.strip()]
+logging.info(
+    "[SYL] template=%s merchants=%s deny=%s",
+    SYL_WRAP_TEMPLATE, SYL_RETAILERS, SYL_DENYLIST
+)
 
 # --- Amazon / Geniuslink ---
 GENIUSLINK_WRAP   = (os.getenv("GENIUSLINK_WRAP") or "").strip()           # e.g. "https://geni.us/redirect?url={url}"
