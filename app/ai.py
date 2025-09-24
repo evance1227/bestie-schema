@@ -430,14 +430,14 @@ def generate_reply(
     Answer-first. No surveys. If it's a product ask, give real picks.
     """
     vision_guidance = """
-    If an image is provided, answer the user's question about the image directly.
-    If they ask "would this suit me" or "should I", give a clear verdict (Yes/No or Lean Yes/No)
-    and one next step (cut shape, length, parting, styling, density hack, etc.).
-    Keep description minimal—no scene painting.
-
-    Never list "Best/Mid/Budget" or shopping picks unless the user explicitly asks for products/links.
-    If multiple images are provided, assume the last one is the primary reference unless stated otherwise.
-    Keep replies within a single SMS (≤ 520 chars).
+    If an image is provided, answer the user's question **about the image** directly.
+    Be decisive: give a verdict and 1 clear next step; keep any description minimal.
+    **If the user asks “where to buy”, “find this”, or “send me the link”:
+    - Identify the item in 1 sentence (style + key features).
+    - Ask 3 fast qualifiers (size, budget cap, any preference).
+    - Offer: “Say YES and I’ll send 3 options — budget, mid, splurge — with links.”**
+    If multiple images appear, assume the last one is the primary reference unless the user says otherwise.
+    All replies must fit one SMS (<= 520 chars).
     """.strip()
 
     # Combine the persona/system prompt that workers.py already passes with our vision rules
@@ -459,7 +459,12 @@ def generate_reply(
     If the user asks for links/websites, put each link on the same line as the pick, e.g.:
     - Best: <Product> — <primary link> (alt: <alt link, optional>)
     Prefer reputable brand/retailer links; Amazon is fine. Avoid the literal word “URL”.
+
+    If the user says “find this”, “where to buy”, or “send me the link”, do the same:
+    identify the piece in one line, ask size/budget/preference only if it matters,
+    and promise 2–3 shoppable picks. Keep it decisive and concrete.
     """.strip()
+
 
     # combine persona (from workers) + both guidance blocks
     combined_system = "\n\n".join([
