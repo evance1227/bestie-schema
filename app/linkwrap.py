@@ -16,8 +16,7 @@ from __future__ import annotations
 import os
 import re
 import logging
-
-from urllib.parse import urlparse, urlunparse, parse_qs, urlencode, quote, quote_plus
+from urllib.parse import urlparse, urlunparse, parse_qs, urlencode, quote
 
 # =========================
 # ENV
@@ -34,6 +33,10 @@ SYL_WRAP_TEMPLATE = (
     or "https://go.shopmy.us/p-{pub}?url={url}"
 ).strip()
 
+logging.info(
+    "[SYL] template=%s merchants=%s deny=%s",
+    SYL_WRAP_TEMPLATE, SYL_MERCHANTS, SYL_DENYLIST
+)
 
 # '*' means allow all retailers (except denylist & Amazon). Otherwise comma-separated list.
 SYL_RETAILERS     = [d.strip().lower() for d in (os.getenv("SYL_RETAILERS") or "*").split(",") if d.strip()]
@@ -67,7 +70,7 @@ _AMAZON_HOST  = re.compile(r"(^|\.)(amazon\.[^/]+)$", re.I)
 # =========================
 def _amz_search_url(name: str) -> str:
     base = re.sub(r"[:|–—•\[\]\(\)]+", " ", (name or "").strip())
-    base = re.sub(r"\s{2,}", " ", base)
+    base = re.sub(r"\s{2,}", " ", base).strip()
     return f"https://www.amazon.com/s?k={quote(base, safe='')}"
 
 def _is_denied(url: str) -> bool:
@@ -161,9 +164,10 @@ def _syl_search_url(name: str, user_text: str) -> str:
 
     # Produce the redirect using your ENV template (or default)
     return SYL_WRAP_TEMPLATE.format(
-    pub=SYL_PUBLISHER_ID,
-    url=quote(retailer_url, safe="")  # encode once
-)
+        pub=SYL_PUBLISHER_ID,
+        url=quote(retailer_url, safe="")
+    )
+
 
 
 def _wrap_amazon(url: str) -> str:
