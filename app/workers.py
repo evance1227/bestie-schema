@@ -186,6 +186,32 @@ def ensure_not_link_ending(text: str) -> str:
         return text.rstrip() + "\n"
     return text
 
+# --- SMS/link sanitizers (to keep links clickable in SMS) ---
+_LINK_MD_RE = re.compile(r"\[([^\]]+)\]\((https?://[^\s)]+)\)")
+_TRAIL_PUNCT_RE = re.compile(r"([)\].,!?;:]+)$")
+
+def _unwrap_markdown_links(text: str) -> str:
+    # Convert [label](url) to "label — url"
+    return _LINK_MD_RE.sub(lambda m: f"{m.group(1)} — {m.group(2)}", text or "")
+
+def _strip_styling(text: str) -> str:
+    # Remove bullets/asterisks/emphasis chars that can cling to URLs
+    return (text or "").replace("*", "").replace("_", "")
+
+def _dedupe_spaces(text: str) -> str:
+    return re.sub(r"[ \t]+", " ", text or "")
+
+def _tidy_urls_per_line(text: str) -> str:
+    # Put each URL on its own line; strip trailing ) ] . , etc. from the token
+    lines = []
+    for raw in (text or "").splitlines():
+        parts = []
+        for tok in raw.split(" "):
+            if tok.startswith("http"):
+                tok = _TRAIL_PUNCT_RE.sub("", tok)
+            parts.append(tok)
+        lines.append(" ".join(parts).strip())
+    return "\n".join(lines)
 
 def _segments_for_sms(
     text: str,
@@ -683,6 +709,10 @@ def _store_and_send(
     text_val = _strip_link_placeholders(text_val)
     if not _allow_amz:
         text_val = _strip_amazon_search_links(text_val)
+        text_val = _unwrap_markdown_links(text_val)
+        text_val = _strip_styling(text_val)
+        text_val = _dedupe_spaces(text_val)
+        text_val = _tidy_urls_per_line(text_val)
         text_val = wrap_all_affiliates(text_val)     # (adds Amazon ?tag= / SYL redirect)
         text_val = normalize_syl_links(text_val)     # fix any legacy go.sylikes.com → go.shopmy.us/p-...
         text_val = ensure_not_link_ending(text_val)
@@ -719,11 +749,32 @@ def _store_and_send(
 
     # ==== Segment after shaping (URL-safe) ====
     import time  # ensure this is at top of the file
+        # If an image was attached, prepend 2–3 product links (Revolve preferred)
+    try:
+        if media_urls:
+            candidates = lens_products(media_urls[0], allowed_domains=None, topn=12)
+
+            # hard preference order
+            order = ["revolve.com", "shopbop.com", "nordstrom.com", "freepeople.com",
+                    "asos.com", "bloomingdales.com", "saksfifthavenue.com", "boohoo.com", "shein.com"]
+            rank = {h: i for i, h in enumerate(order)}
+
+            def _score(item):
+                host = item.get("host", "")
+                return rank.get(host, 999), len(item.get("title", ""))
+
+            candidates.sort(key=_score)
+            picks = candidates[:3]
+            if picks:
+                lines = [f"- {c['title']} — {c['url']}" for c in picks]
+                text_val = "Found close matches:\n" + "\n".join(lines) + "\n\n" + text_val
+    except Exception as e:
+        logger.warning("[Vision] lens_products error: {}", e)
 
    # --- Segment after shaping (URL-safe) ---
     parts = _segments_for_sms(
         text_val,
-        per=int(os.getenv("SMS_PER_PART", "320")),
+        per=int(os.getenv("SMS_PER_PART", "300")),
         max_parts=int(os.getenv("SMS_MAX_PARTS", "3")),
         prefix_reserve=8,     # we reserve "[1/2] " etc
     )
@@ -732,8 +783,9 @@ def _store_and_send(
         return
 
     GHL_WEBHOOK_URL = os.getenv("GHL_OUTBOUND_WEBHOOK_URL")
-    delay_ms = int(os.getenv("SMS_PART_DELAY_MS", "1600"))   # 1600–2200 is a good sweet spot
-
+    delay_ms = int(os.getenv("SMS_PART_DELAY_MS", "1800"))   # 1600–2200 is a good sweet spot
+    time.sleep(delay_ms / 1000.0)
+    
     for idx, part in enumerate(parts, 1):
         prefix = f"[{idx}/{len(parts)}] " if len(parts) > 1 else ""
         full_text = prefix + part
