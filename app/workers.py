@@ -749,27 +749,64 @@ def _store_and_send(
 
     # ==== Segment after shaping (URL-safe) ====
     import time  # ensure this is at top of the file
-        # If an image was attached, prepend 2–3 product links (Revolve preferred)
+    # === IMAGE MATCHES (weight by SYL_RETAILERS; Amazon smart-include; no single favorite) ===
     try:
         if media_urls:
+            # ---------- helper: hosts from SYL_RETAILERS (comma-separated) ----------
+            import os
+            def _hosts_from_env() -> set[str]:
+                raw = (os.getenv("SYL_RETAILERS") or "*").strip()
+                if not raw or raw == "*":
+                    return set()  # no weighting if wildcard
+                hosts = {h.strip().lower() for h in raw.split(",") if h.strip()}
+                # strip leading www.
+                return {h[4:] if h.startswith("www.") else h for h in hosts}
+
+            high_end_hosts = _hosts_from_env()   # <- THIS is the only “preference”: the whole set
+
+            # ---------- first pass: exclude Amazon (default behavior inside lens_products) ----------
             candidates = lens_products(media_urls[0], allowed_domains=None, topn=12)
 
-            # hard preference order
-            order = ["revolve.com", "shopbop.com", "nordstrom.com", "freepeople.com",
-                    "asos.com", "bloomingdales.com", "saksfifthavenue.com", "boohoo.com", "shein.com"]
-            rank = {h: i for i, h in enumerate(order)}
+            # decide if Amazon could add value (scarce/weak results)
+            need_amazon = False
+            if not candidates:
+                need_amazon = True
+            else:
+                top = candidates[:3]
+                have_high_end = (len(high_end_hosts) == 0) or any(c.get("host") in high_end_hosts for c in top)
+                too_few = len(candidates) < 2
+                weak = (len(high_end_hosts) > 0) and all(c.get("host") not in high_end_hosts for c in top)
+                if too_few or (not have_high_end and weak):
+                    need_amazon = True
 
+            # ---------- second pass: allow Amazon ONLY if it helps; still exclude low-quality sites ----------
+            if need_amazon:
+                # keep shein blocked even when we allow Amazon
+                extra = lens_products(media_urls[0], allowed_domains=None, topn=6, exclude_domains={"shein.com"})
+                by_url = {c["url"]: c for c in candidates}
+                for c in extra:
+                    if c["url"] not in by_url:
+                        by_url[c["url"]] = c
+                candidates = list(by_url.values())
+
+            # ---------- final sort: items from SYL_RETAILERS first (as a group), then title length ----------
             def _score(item):
-                host = item.get("host", "")
-                return rank.get(host, 999), len(item.get("title", ""))
+                host = (item.get("host") or "").lower()
+                in_high = (len(high_end_hosts) == 0) or (host in high_end_hosts)
+                # True sorts after False, so invert
+                return (0 if in_high else 1, len(item.get("title") or ""))
 
             candidates.sort(key=_score)
-            picks = candidates[:3]
+
+            # keep it tight so we fit in 2 SMS parts (helps GHL delivery)
+            picks = candidates[:2]
             if picks:
                 lines = [f"- {c['title']} — {c['url']}" for c in picks]
                 text_val = "Found close matches:\n" + "\n".join(lines) + "\n\n" + text_val
+
     except Exception as e:
         logger.warning("[Vision] lens_products error: {}", e)
+    # === END IMAGE MATCHES ===
 
    # --- Segment after shaping (URL-safe) ---
     parts = _segments_for_sms(
@@ -785,7 +822,7 @@ def _store_and_send(
     GHL_WEBHOOK_URL = os.getenv("GHL_OUTBOUND_WEBHOOK_URL")
     delay_ms = int(os.getenv("SMS_PART_DELAY_MS", "1800"))   # 1600–2200 is a good sweet spot
     time.sleep(delay_ms / 1000.0)
-    
+
     for idx, part in enumerate(parts, 1):
         prefix = f"[{idx}/{len(parts)}] " if len(parts) > 1 else ""
         full_text = prefix + part
