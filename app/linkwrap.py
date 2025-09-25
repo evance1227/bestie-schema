@@ -96,7 +96,6 @@ def normalize_syl_links(text: str) -> str:
         return f"https://go.shopmy.us/p-{pub}?url={retailer_url}"
     return pattern.sub(_repl, text)
 
-
 def _amz_search_url(name: str) -> str:
     base = re.sub(r"[:|–—•\[\]\(\)]+", " ", (name or "").strip())
     base = re.sub(r"\s{2,}", " ", base).strip()
