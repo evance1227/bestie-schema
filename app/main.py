@@ -169,6 +169,21 @@ def enqueue_ping():
     q.enqueue(_ping_job, job_timeout=30)
     return {"enqueued": True, "queue": q.name}
 
+# ---------- RQ snapshot (debug) ----------
+from app.task_queue import q
+
+@app.get("/debug/rq")
+def rq_snapshot():
+    # Show the queue name, visible count, and raw job ids present in the queue list
+    conn = q.connection
+    raw = conn.lrange(q.key, 0, -1)
+    return {
+        "queue": q.name,
+        "key": q.key,            # e.g., "rq:queue:bestie_queue"
+        "count": q.count,
+        "job_ids": [rid.decode() if isinstance(rid, bytes) else rid for rid in raw][:20],
+        "redis_url_note": "DB index forced via REDIS_URL .../0 in env",
+    }
 
 # -------------------- Worker helpers -------------------- #
 from . import models
