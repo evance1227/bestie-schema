@@ -5,22 +5,44 @@ import os
 import requests
 from urllib.parse import urlparse, urlunparse, parse_qs, urlencode
 from loguru import logger
+from typing import List, Dict, Set
 
 SERPAPI_KEY = os.getenv("SERPAPI_KEY", "")
 LENS_ENDPOINT = "https://serpapi.com/search.json"
 
-# Preferred retailers first
-PREFERRED_ORDER = [
-    "revolve.com", "shopbop.com", "nordstrom.com", "freepeople.com",
-    "asos.com", "bloomingdales.com", "saksfifthavenue.com", "boohoo.com",
-    "shein.com",
+# Retailers we prefer to show first
+PREFERRED_ORDER: List[str] = [
+    "anthropologie.com",  # NEW: high-priority
+    "revolve.com",
+    "shopbop.com",
+    "nordstrom.com",
+    "freepeople.com",
+    "asos.com",
+    "bloomingdales.com",
+    "saksfifthavenue.com",
+    "boohoo.com",
 ]
 
-# Domains to exclude entirely (prevents random Amazon links)
-EXCLUDE_DOMAINS_DEFAULT = {
+# Keep Amazon out of IMAGE results unless explicitly allowed upstream
+EXCLUDE_DOMAINS_DEFAULT: Set[str] = {
     "amazon.com", "amzn.to", "amazon.co.uk", "amazon.ca", "amazon.de",
     "amazon.co", "amazon.com.au"
 }
+
+# Only check “sold out” for these hosts (fast, safe subset)
+CHECK_STOCK_HOSTS: Set[str] = {
+    "anthropologie.com", "revolve.com", "shopbop.com", "nordstrom.com",
+    "freepeople.com", "asos.com", "bloomingdales.com", "saksfifthavenue.com",
+}
+
+_STOCK_TOKENS = (
+    "sold out", "sold-out", "out of stock", "out-of-stock",
+    "no longer available", "unavailable", "currently unavailable"
+)
+
+_UA = "BestieBot/1.0 (+https://bestie)"
+_TIMEOUT = 3.5   # seconds
+_MAX_STOCK_CHECKS = 6  # cap network calls for speed
 
 
 def _host(url: str) -> str:
@@ -32,8 +54,12 @@ def _host(url: str) -> str:
 
 
 def _clean_url(url: str) -> str:
-    """Strip common tracking params; keep canonical path/query."""
+    """Normalize retailer URLs and strip tracking params."""
     try:
+        # normalize some mobile URLs
+        if "revolve.com/mobile/" in url:
+            url = url.replace("revolve.com/mobile/", "revolve.com/")
+
         u = urlparse(url)
         disallowed = {
             "utm_source", "utm_medium", "utm_campaign", "utm_content", "utm_term",
@@ -42,7 +68,7 @@ def _clean_url(url: str) -> str:
         q = parse_qs(u.query, keep_blank_values=True)
         q = {k: v for k, v in q.items() if k not in disallowed}
         new_q = urlencode([(k, vv) for k, vals in q.items() for vv in vals])
-        return urlunparse((u.scheme, u.netloc, u.path, "", new_q, ""))
+        return urlunparse((u.scheme, u.netloc, u.path, "", new_q, ""))  # drop fragment
     except Exception:
         return url
 
@@ -54,14 +80,39 @@ def _score_host(host: str) -> int:
         return 999
 
 
+def _is_probably_sold_out(url: str, host: str) -> bool:
+    """
+    Cheap “sold out” detector:
+    - Only run for known hosts (CHECK_STOCK_HOSTS)
+    - Fetch small HTML and look for common phrases
+    - Hard timeout + short read
+    """
+    if host not in CHECK_STOCK_HOSTS:
+        return False
+    try:
+        r = requests.get(url, headers={"User-Agent": _UA}, timeout=_TIMEOUT, stream=True)
+        # read up to ~80KB
+        chunk = b""
+        for i, part in enumerate(r.iter_content(8192)):
+            chunk += part
+            if len(chunk) > 80_000 or i > 9:
+                break
+        text = (chunk or b"").decode("utf-8", errors="ignore").lower()
+        return any(tok in text for tok in _STOCK_TOKENS)
+    except Exception:
+        # if we can't tell, don't exclude
+        return False
+
+
 def lens_products(
     image_url: str,
-    allowed_domains: list[str] | None = None,
+    allowed_domains: List[str] | None = None,
     topn: int = 8,
-    exclude_domains: set[str] | None = None,
-) -> list[dict]:
+    exclude_domains: Set[str] | None = None,
+    filter_sold_out: bool = True,
+) -> List[Dict]:
     """
-    Use SerpAPI's Google Lens to fetch visually similar shopping links.
+    Use SerpAPI Google Lens to fetch visually similar shopping links.
     Returns: [{ "title": str, "url": str, "host": str, "thumbnail": str }]
     """
     if not SERPAPI_KEY or not image_url:
@@ -79,7 +130,6 @@ def lens_products(
         logger.warning("SerpAPI error: {}", e)
         return []
 
-    # Different payloads use different keys; try the common ones
     items = (
         data.get("visual_matches")
         or data.get("image_results")
@@ -87,8 +137,8 @@ def lens_products(
         or []
     )
 
-    results: list[dict] = []
-    seen: set[str] = set()
+    results: List[Dict] = []
+    seen: Set[str] = set()
 
     for it in items:
         url = it.get("link") or it.get("source") or it.get("original") or it.get("thumbnail")
@@ -115,6 +165,24 @@ def lens_products(
             "thumbnail": it.get("thumbnail") or "",
         })
 
-    # Prefer known retailers, then shorter titles (usually cleaner matches)
+    # Sort by retailer preference, then shorter title (usually cleaner)
     results.sort(key=lambda d: (_score_host(d["host"]), len(d["title"])))
+
+    # Optional: remove "sold out" items (quick sniff, limited checks)
+    if filter_sold_out and results:
+        kept: List[Dict] = []
+        checks = 0
+        for c in results:
+            if checks < _MAX_STOCK_CHECKS:
+                if _is_probably_sold_out(c["url"], c["host"]):
+                    checks += 1
+                    continue
+                checks += 1
+            kept.append(c)
+            if len(kept) >= topn:
+                break
+        # If filtering nuked everything, fall back to original
+        if kept:
+            results = kept
+
     return results[:max(1, topn)]
