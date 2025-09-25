@@ -33,8 +33,9 @@ from app.ai import generate_contextual_closer
 from typing import Optional, List, Dict, Tuple
 from datetime import datetime, timezone, timedelta
 from urllib.parse import quote_plus
+from app.integrations_serp import lens_products
 
-from app.linkwrap import _amz_search_url, _syl_search_url, wrap_all_affiliates, ensure_not_link_ending
+from app.linkwrap import _amz_search_url, _syl_search_url, wrap_all_affiliates, ensure_not_link_ending, normalize_syl_links
 import app.integrations as integrations
 import os, logging
 from redis import Redis
@@ -648,6 +649,7 @@ def _store_and_send(
     convo_id: int,
     text_val: str,
     send_phone: Optional[str] = None,
+    media_urls: list[str] | None = None,
 ) -> None:
     """
     Store once, send once. No manual segmentation or [1/3] prefixes.
@@ -681,8 +683,22 @@ def _store_and_send(
     text_val = _strip_link_placeholders(text_val)
     if not _allow_amz:
         text_val = _strip_amazon_search_links(text_val)
-    text_val = wrap_all_affiliates(text_val)     
-    text_val = ensure_not_link_ending(text_val)
+        text_val = wrap_all_affiliates(text_val)     # (adds Amazon ?tag= / SYL redirect)
+        text_val = normalize_syl_links(text_val)     # fix any legacy go.sylikes.com → go.shopmy.us/p-...
+        text_val = ensure_not_link_ending(text_val)
+    # If an image was attached, prepend 2–3 product links from Google Lens (via SerpAPI)
+    try:
+        if media_urls:
+            candidates = lens_products(media_urls[0], allowed_domains=None, topn=8)
+            # Prefer Revolve/Shopbop/Nordstrom if present
+            prio = {"revolve.com", "shopbop.com", "nordstrom.com", "freepeople.com", "asos.com", "bloomingdales.com", "saksfifthavenue.com"}
+            preferred = [c for c in candidates if c["host"] in prio]
+            picks = (preferred or candidates)[:3]
+            if picks:
+                lines = [f"- {c['title']} — {c['url']}" for c in picks]
+                text_val = "Found close matches:\n" + "\n".join(lines) + "\n\n" + text_val
+    except Exception as e:
+        logger.warning("[Vision] lens_products error: {}", e)
 
     # Optional debug marker (visible once)
     DEBUG_MARKER = os.getenv("DEBUG_MARKER", "")
@@ -716,7 +732,7 @@ def _store_and_send(
         return
 
     GHL_WEBHOOK_URL = os.getenv("GHL_OUTBOUND_WEBHOOK_URL")
-    delay_ms = int(os.getenv("SMS_PART_DELAY_MS", "2000"))   # 1600–2200 is a good sweet spot
+    delay_ms = int(os.getenv("SMS_PART_DELAY_MS", "1600"))   # 1600–2200 is a good sweet spot
 
     for idx, part in enumerate(parts, 1):
         prefix = f"[{idx}/{len(parts)}] " if len(parts) > 1 else ""
@@ -1145,7 +1161,7 @@ def generate_reply_job(
         reply = "Babe, I glitched. Say it again and I’ll do better. 💅"
 
     logger.info("[FINISH] sending reply len=%d", len(reply or ""))    
-    _store_and_send(user_id, convo_id, reply, send_phone=user_phone)
+    _store_and_send(user_id, convo_id, reply, user_phone, media_urls=media_urls)
     return
 
 def _ping_job():

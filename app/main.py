@@ -11,6 +11,8 @@ from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
 from loguru import logger
 from sqlalchemy import text as sqltext
+from fastapi import Query
+from app.integrations_serp import lens_products
 
 from app import db
 from app.webhooks_gumroad import router as gumroad_router
@@ -169,6 +171,9 @@ def enqueue_ping():
     q.enqueue(_ping_job, job_timeout=30)
     return {"enqueued": True, "queue": q.name}
 
+@app.get("/debug/visual-search-serp")
+def debug_visual_search_serp(url: str = Query(..., description="Image URL")):
+    return lens_products(url, topn=5)
 # ---------- RQ snapshot (debug) ----------
 from app.task_queue import q
 
