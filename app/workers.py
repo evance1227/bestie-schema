@@ -747,13 +747,11 @@ def _store_and_send(
     maxp = int(os.getenv("SMS_MAX_PARTS", "3"))
     text_val = _maybe_add_email_offer(text_val, per, maxp)
 
-    # ==== Segment after shaping (URL-safe) ====
-    import time  # ensure this is at top of the file
+
     # === IMAGE MATCHES (weight by SYL_RETAILERS; Amazon smart-include; no single favorite) ===
     try:
         if media_urls:
-            # ---------- helper: hosts from SYL_RETAILERS (comma-separated) ----------
-            import os
+            
             def _hosts_from_env() -> set[str]:
                 raw = (os.getenv("SYL_RETAILERS") or "*").strip()
                 if not raw or raw == "*":
