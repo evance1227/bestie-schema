@@ -213,10 +213,8 @@ def _tidy_urls_per_line(text: str) -> str:
         lines.append(" ".join(parts).strip())
     return "\n".join(lines)
 # --- Bulleted lines → ensure they have a link ---
-# --- Bulleted lines → ensure they have a link ---
-import re
-
-# allow: 1) numbering  2) label  3) any dash (hyphen/en/em)  4) retailer  5) optional trailing dash
+# --- Bulleted lines → ensure they have a link (robust matcher) ---
+# allow: numbering, any dash (hyphen/en/em), optional trailing dash
 _BULLET_LINE_RE = re.compile(
     r'^\s*(?:\d+[.)]\s*|\-\s*)?(?P<label>.+?)\s+[—–-]\s+(?P<retailer>[A-Za-z0-9&.\' ]+?)(?:\s*[—–-]\s*)?$',
     re.UNICODE,
@@ -224,14 +222,14 @@ _BULLET_LINE_RE = re.compile(
 
 def _ensure_links_on_bullets(text: str, user_text: str) -> str:
     """
-    For lines like: '1. Mikoh Bali Bikini Set — Mikoh —'
-    append a retailer link if there's no http/https present.
-    - Non-Amazon → SYL search link
-    - Amazon     → clean Amazon search link
+    For lines like:
+      '1. Mikoh Bali Bikini Set — Mikoh —'
+    append a retailer link if missing.
+      - Non-Amazon → SYL search link
+      - Amazon     → clean Amazon search link
     """
     out: list[str] = []
     for ln in (text or "").splitlines():
-        # already has a link → leave it
         if "http://" in ln or "https://" in ln:
             out.append(ln)
             continue
@@ -244,7 +242,6 @@ def _ensure_links_on_bullets(text: str, user_text: str) -> str:
         item = m.group("label").strip()
         retailer = (m.group("retailer") or "").strip().lower()
 
-        # defensive: ignore obvious commentary bullets
         low = item.lower()
         if low.startswith(("these styles", "these pieces", "happy shopping", "enjoy your")):
             out.append(ln)
@@ -254,18 +251,15 @@ def _ensure_links_on_bullets(text: str, user_text: str) -> str:
             if retailer.startswith("amazon"):
                 url = _amz_search_url(item)
             else:
-                # feed the retailer token to improve routing
                 url = _syl_search_url(item, f"{user_text} {retailer}")
-            out.append(f"{ln} {url}")
+            out.append(f"{ln} — {url}")         # ensures reorder detects " — http"
         except Exception:
             out.append(ln)
 
     return "\n".join(out)
 
-def _shorten_bullet_labels(text: str, max_len: int = 48) -> str:
-    """
-    If a line looks like 'Label — https://...', clamp the label so links fit in 2 parts.
-    """
+def _shorten_bullet_labels(text: str, max_len: int = 42) -> str:
+    """Clamp labels so two links fit into 2 parts and leave room for voice."""
     out = []
     for ln in (text or "").splitlines():
         if " — http" in ln:
@@ -278,27 +272,22 @@ def _shorten_bullet_labels(text: str, max_len: int = 48) -> str:
             out.append(ln)
     return "\n".join(out)
 
-def _segments_for_sms(
-    text: str,
-    *,
-    per: int = 320,
-    max_parts: int = 3,
-    prefix_reserve: int = 8,   # room for "[1/3] "
-) -> list[str]:
+def _shorten_bullet_labels(text: str, max_len: int = 42) -> str:
     """
-    Split `text` into <= max_parts SMS chunks of <= per chars.
-    Preserve URLs (we never break a URL across parts).
+    Clamp long labels so two links fit in 2 parts and leave room for voice.
+    Works on lines like: 'Label — https://...'
     """
-    text = (text or "").rstrip()
-
-    # collect url spans once
-    url_spans = [(m.start(), m.end()) for m in _URL_RE.finditer(text)]
-
-    def _in_url(ix: int) -> tuple[int, int] | None:
-        for a, b in url_spans:
-            if a <= ix < b:
-                return (a, b)
-        return None
+    out = []
+    for ln in (text or "").splitlines():
+        if " — http" in ln:
+            label, rest = ln.split(" — http", 1)
+            label = label.strip()
+            if len(label) > max_len:
+                label = label[:max_len - 1].rstrip() + "…"
+            out.append(f"{label} — http{rest}")
+        else:
+            out.append(ln)
+    return "\n".join(out)
 
     parts: list[str] = []
     i, n = 0, len(text)
@@ -734,12 +723,69 @@ def _add_personality_if_flat(text: str) -> str:
         text = opener + "\n" + text
     return text
 
+def _segments_for_sms(
+    text: str,
+    *,
+    per: int = 360,
+    max_parts: int = 2,
+    prefix_reserve: int = 8,
+) -> list[str]:
+    """
+    Split text into <= max_parts SMS chunks of size <= per, never splitting inside a URL.
+    Reserves 'prefix_reserve' chars for the '[i/n] ' prefix.
+    """
+    text = (text or "").rstrip()
+    if not text:
+        return []
+
+    if len(text) <= per:
+        return [text]
+
+    out: list[str] = []
+    i, n = 0, len(text)
+    limit_per = max(10, per - prefix_reserve)
+
+    def _in_url(pos: int) -> tuple[int, int] | None:
+        for m in _URL_RE.finditer(text):
+            s, e = m.span()
+            if s <= pos < e:
+                return (s, e)
+            if s > pos:
+                break
+        return None
+
+    while i < n and len(out) < max_parts - 1:
+        remaining = n - i
+        if remaining <= limit_per:
+            break
+
+        cut = i + limit_per
+
+        # never break inside a URL
+        span = _in_url(cut)
+        if span:
+            cut = span[0]                 # back up to URL start
+        else:
+            # otherwise back up to last space
+            ws = text.rfind(" ", i, cut)
+            if ws != -1 and ws > i:
+                cut = ws
+
+        out.append(text[i:cut].rstrip())
+        i = cut
+        while i < n and text[i] == " ":
+            i += 1
+
+    out.append(text[i:].rstrip())
+    return [p for p in out if p]
+
 # after
 def _store_and_send(
     user_id: int,
     convo_id: int,
     text_val: str,
     send_phone: Optional[str] = None,
+    user_text: Optional[str] = None,   
     media_urls: list[str] | None = None,
 ) -> None:
     """
@@ -770,17 +816,23 @@ def _store_and_send(
         text_val = text_val.replace(_ALLOW_AMZ_SEARCH_TOKEN, "", 1).lstrip()
 
     # ==== Final shaping (single body) ====
+# ==== Final shaping (single body) ====
     text_val = _add_personality_if_flat(text_val)
     text_val = _strip_link_placeholders(text_val)
     if not _allow_amz:
         text_val = _strip_amazon_search_links(text_val)
-        text_val = _unwrap_markdown_links(text_val)
-        text_val = _strip_styling(text_val)
-        text_val = _dedupe_spaces(text_val)
-        text_val = _tidy_urls_per_line(text_val)
-        text_val = wrap_all_affiliates(text_val)     # (adds Amazon ?tag= / SYL redirect)
-        text_val = normalize_syl_links(text_val)     # fix any legacy go.sylikes.com → go.shopmy.us/p-...
-        text_val = ensure_not_link_ending(text_val)
+
+    # sanitizers
+    text_val = _unwrap_markdown_links(text_val)
+    text_val = _strip_styling(text_val)
+    text_val = _dedupe_spaces(text_val)
+    text_val = _tidy_urls_per_line(text_val)
+
+    # wrappers
+    text_val = wrap_all_affiliates(text_val)     # adds Amazon ?tag= / SYL redirect
+    text_val = normalize_syl_links(text_val)     # legacy sylikes → shopmy.us
+    text_val = ensure_not_link_ending(text_val)  # don't end the body on a bare URL
+
     # If an image was attached, prepend 2–3 product links from Google Lens (via SerpAPI)
     try:
         if media_urls:
@@ -848,8 +900,25 @@ def _store_and_send(
     except Exception as e:
         logger.warning("[Vision] lens_products error: {}", e)
     # === END IMAGE MATCHES ===
+    # Final safety: ensure bullets have links, then shorten labels
+    text_val = _ensure_links_on_bullets(text_val, user_text or "")
+    text_val = _shorten_bullet_labels(text_val)
 
-   # --- Segment after shaping (URL-safe) ---
+    # Push commentary to the end so parts 1–2 are link-first
+    lines = [ln for ln in (text_val or "").splitlines()]
+    link_lines = [ln for ln in lines if ln.strip().startswith("http") or " — http" in ln or ln.strip().startswith("- ")]
+    other_lines = [ln for ln in lines if ln not in link_lines]
+    text_val = "\n".join(link_lines + ([""] if (link_lines and other_lines) else []) + other_lines).strip()
+    text_val = ensure_not_link_ending(text_val)
+    # --- Segment after shaping (URL-safe) ---
+    parts = _segments_for_sms(
+        text_val,
+        per=int(os.getenv("SMS_PER_PART", "360")),    # 360 (your choice)
+        max_parts=int(os.getenv("SMS_MAX_PARTS", "2")),  # 2 parts
+        prefix_reserve=8,                                # "[i/n] "
+)
+
+    # --- Segment after shaping (URL-safe) ---
     parts = _segments_for_sms(
         text_val,
         per=int(os.getenv("SMS_PER_PART", "360")),
@@ -1292,9 +1361,8 @@ def generate_reply_job(
 
     logger.info("[FINISH] sending reply len=%d", len(reply or ""))
     reply = _shorten_bullet_labels(_ensure_links_on_bullets(reply, user_text))
-    _store_and_send(user_id, convo_id, reply, user_phone, media_urls=media_urls)
+    _store_and_send(user_id, convo_id, reply, user_phone, user_text=user_text, media_urls=media_urls)
     return
-
 
 def _ping_job():
     from loguru import logger
