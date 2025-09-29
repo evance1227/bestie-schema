@@ -212,6 +212,62 @@ def _tidy_urls_per_line(text: str) -> str:
             parts.append(tok)
         lines.append(" ".join(parts).strip())
     return "\n".join(lines)
+# --- Bulleted lines → ensure they have a link ---
+import re
+
+_BULLET_LINE_RE = re.compile(
+    r'^\s*(?:\d+\.\s*|\-\s*)?(.+?)\s+[—-]\s+([A-Za-z0-9&.\' ]+)\s*$',
+    re.UNICODE,
+)
+
+def _ensure_links_on_bullets(text: str, user_text: str) -> str:
+    """
+    For lines like: '1. Mikoh Bali Bikini Set — Mikoh'
+    append a retailer link if there's no http/https present.
+    - Non-Amazon → SYL search link
+    - Amazon     → clean Amazon search link
+    """
+    out: list[str] = []
+    for ln in (text or "").splitlines():
+        if "http://" in ln or "https://" in ln:
+            out.append(ln)
+            continue
+
+        m = _BULLET_LINE_RE.match(ln)
+        if not m:
+            out.append(ln)
+            continue
+
+        item = m.group(1).strip()
+        retailer = (m.group(2) or "").strip().lower()
+
+        try:
+            if retailer.startswith("amazon"):
+                url = _amz_search_url(item)
+            else:
+                # include the retailer token in user_text so _syl_search_url can route
+                url = _syl_search_url(item, f"{user_text} {retailer}")
+            out.append(f"{ln} {url}")
+        except Exception:
+            out.append(ln)
+
+    return "\n".join(out)
+
+def _shorten_bullet_labels(text: str, max_len: int = 48) -> str:
+    """
+    If a line looks like 'Label — https://...', clamp the label so links fit in 2 parts.
+    """
+    out = []
+    for ln in (text or "").splitlines():
+        if " — http" in ln:
+            label, rest = ln.split(" — http", 1)
+            label = label.strip()
+            if len(label) > max_len:
+                label = label[:max_len - 1].rstrip() + "…"
+            out.append(f"{label} — http{rest}")
+        else:
+            out.append(ln)
+    return "\n".join(out)
 
 def _segments_for_sms(
     text: str,
@@ -1225,9 +1281,11 @@ def generate_reply_job(
     if not (reply or "").strip():
         reply = "Babe, I glitched. Say it again and I’ll do better. 💅"
 
-    logger.info("[FINISH] sending reply len=%d", len(reply or ""))    
+    logger.info("[FINISH] sending reply len=%d", len(reply or ""))
+    reply = _shorten_bullet_labels(_ensure_links_on_bullets(reply, user_text))
     _store_and_send(user_id, convo_id, reply, user_phone, media_urls=media_urls)
     return
+
 
 def _ping_job():
     from loguru import logger
