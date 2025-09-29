@@ -174,6 +174,22 @@ def enqueue_ping():
 @app.get("/debug/visual-search-serp")
 def debug_visual_search_serp(url: str = Query(..., description="Image URL")):
     return lens_products(url, topn=5)
+
+from fastapi import Response
+from fastapi.responses import PlainTextResponse
+
+@app.get("/", include_in_schema=False)
+def root():
+    return {"ok": True, "service": "bestie-backend"}
+
+@app.head("/", include_in_schema=False)
+def root_head():
+    return Response(status_code=200)
+
+@app.get("/health", include_in_schema=False)
+def health():
+    return PlainTextResponse("ok", status_code=200)
+
 # ---------- RQ snapshot (debug) ----------
 from app.task_queue import q
 
