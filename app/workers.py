@@ -212,84 +212,113 @@ def _tidy_urls_per_line(text: str) -> str:
         lines.append(" ".join(parts).strip())
     return "\n".join(lines)
 
-# --- Bulleted lines → ensure they have a link (robust matcher) ---
+# --- Bulleted lines → ensure they have a link (multi-line robust) ---
 import re
 
-# dash set (hyphen, en, em)
-_D = r"[—–-]"
-# pattern A: simple "Label — Retailer —" (optional trailing dash)
-_PAT_SIMPLE = re.compile(
-    r'^\s*(?:\d+[.)]\s*|\-\s*)?(?P<label>.+?)\s+' + _D + r'\s+(?P<retailer>[A-Za-z0-9&.\' ]+?)(?:\s*' + _D + r'\s*)?$',
-    re.UNICODE,
-)
+_DASH = r"[—–-]"  # em, en, hyphen
+_BULLET_START = re.compile(r'^\s*(?:\d+[.)]\s*|\-\s+)')  # "1. " or "- "
+
+def _normalize_spaces(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "").strip())
+
+def _looks_like_retailer(s: str) -> bool:
+    # 1–40 chars, letters (incl. accents), spaces, &, ., '
+    return bool(re.match(r"^[A-Za-zÀ-ÖØ-öø-ÿ][A-Za-zÀ-ÖØ-öø-ÿ&.' ]{1,40}$", s or ""))
+
+def _extract_label_and_retailer(chunk: str) -> tuple[str, str]:
+    """
+    Accepts a whole bullet 'chunk' (first bullet line + any following lines until the next bullet).
+    Tries to parse:
+      'Label — Retailer —'
+      'Label - description. Retailer -'
+      'Label' (no retailer; we'll still build a search link)
+    """
+    # join lines to a single string but also keep first line for label
+    lines = [ln.rstrip() for ln in (chunk or "").splitlines() if ln.strip()]
+    if not lines:
+        return "", ""
+    first = _BULLET_START.sub("", lines[0]).strip()
+    joined = _normalize_spaces(" ".join(lines))
+
+    # Try "Label — Retailer" on a single line
+    m = re.match(r'^(?P<label>.+?)\s+' + _DASH + r'\s+(?P<ret>[^-—–].+?)\s*(?:' + _DASH + r'\s*)?$', first)
+    if m:
+        label = m.group("label").strip()
+        retailer = m.group("ret").strip()
+        if _looks_like_retailer(retailer):
+            return label, retailer
+
+    # Fallback: split "Label - description. Retailer -"
+    #   - label = first line before first dash
+    #   - retailer = last dash segment or last sentence tail
+    lab = first
+    mdash = re.search(r'\s' + _DASH + r'\s', first)
+    if mdash:
+        lab = first[:mdash.start()].strip()
+
+    # candidate retailer: last dash or last sentence fragment from the whole chunk
+    tail = re.split(r'\s' + _DASH + r'\s|\.', joined)[-1].strip(" -—–")
+    if _looks_like_retailer(tail):
+        return lab, tail
+
+    # Still nothing—try the last non-empty line if it’s just a name
+    last_line = lines[-1].strip(" -—–")
+    if _looks_like_retailer(last_line):
+        return lab, last_line
+
+    # No retailer; return label only (we can still search retailer-agnostic)
+    return lab, ""
 
 def _ensure_links_on_bullets(text: str, user_text: str) -> str:
     """
-    Convert bullets into "Label — https://..." if they don't already contain a link.
-
-      1. Label — Retailer —
-      2. Label - some descriptor. Retailer -
-      - Label — Retailer
-
+    Convert bullets to 'Label — https://...' if they don't already contain a link.
     Non-Amazon → SYL search link; Amazon → clean Amazon search link.
+    Works across multiple physical lines per bullet.
     """
+    lines = (text or "").splitlines()
     out: list[str] = []
-    for raw in (text or "").splitlines():
-        ln = raw.rstrip()
-        if "http://" in ln or "https://" in ln:
-            out.append(ln)
+
+    i, n = 0, len(lines)
+    while i < n:
+        ln = lines[i]
+
+        # If this line already has a link or isn't a bullet, just copy and move on
+        if ("http://" in ln or "https://" in ln) or not _BULLET_START.match(ln):
+            out.append(ln.rstrip())
+            i += 1
             continue
 
-        m = _PAT_SIMPLE.match(ln.strip())
-        label, retailer = None, None
-        if m:
-            label = (m.group("label") or "").strip()
-            retailer = (m.group("retailer") or "").strip().lower()
-        else:
-            # Fallback: "Label - description. Retailer -"  (take last dash segment as retailer)
-            s = ln.strip()
-            # strip bullet numbering/prefix
-            s = re.sub(r'^(?:\d+[.)]\s*|\-\s*)', '', s)
-            # drop trailing dashes
-            s = re.sub(r'\s*' + _D + r'\s*$', '', s)
-            # first dash splits label vs the rest
-            first = re.search(r'\s' + _D + r'\s', s)
-            if first:
-                label = s[:first.start()].strip()
-                rest = s[first.end():].strip()
-                # take last token as retailer
-                last_seg = re.split(r'\s' + _D + r'\s|\.$', rest)[-1].strip()
-                # accept 1–3 words, letters/&/.' only
-                if re.match(r"^[A-Za-z][A-Za-z&.' ]{1,40}$", last_seg):
-                    retailer = last_seg.lower()
+        # Collect this bullet chunk (lines until the next bullet start or blank line)
+        chunk_lines = [ln]
+        j = i + 1
+        while j < n and lines[j].strip() and not _BULLET_START.match(lines[j]) and ("http://" not in lines[j] and "https://" not in lines[j]):
+            chunk_lines.append(lines[j])
+            j += 1
+
+        label, retailer = _extract_label_and_retailer("\n".join(chunk_lines))
+        # If original bullet already had a link, nothing to do
+        if any("http://" in cl or "https://" in cl for cl in chunk_lines):
+            out.extend(cl.rstrip() for cl in chunk_lines)
+        elif label:
+            try:
+                if retailer.lower().startswith("amazon"):
+                    url = _amz_search_url(label)
                 else:
-                    retailer = ""
-            else:
-                label = s
-                retailer = ""
+                    hint = f"{user_text} {retailer}".strip()
+                    url = _syl_search_url(label, hint)
+                # Append link to the **first** bullet line in a form the reorder block understands
+                first_line = chunk_lines[0].rstrip()
+                out.append(f"{first_line} — {url}")
+                # Copy the rest of the chunk (if any), as-is
+                for k in range(1, len(chunk_lines)):
+                    out.append(chunk_lines[k].rstrip())
+            except Exception:
+                out.extend(cl.rstrip() for cl in chunk_lines)
+        else:
+            # couldn't parse; keep original chunk
+            out.extend(cl.rstrip() for cl in chunk_lines)
 
-        # If we still don't have a sensible label, keep the line as-is
-        if not label or len(label) < 2:
-            out.append(ln)
-            continue
-
-        # Ignore obvious commentary bullets
-        low = label.lower()
-        if low.startswith(("these styles", "these pieces", "happy shopping", "enjoy your")):
-            out.append(ln)
-            continue
-
-        try:
-            if retailer.startswith("amazon"):
-                url = _amz_search_url(label)
-            else:
-                # hint with retailer if we have it
-                hint = f"{user_text} {retailer}" if retailer else user_text
-                url = _syl_search_url(label, hint)
-            # Append in a form the reorder block recognizes (" — http...")
-            out.append(f"{ln} — {url}")
-        except Exception:
-            out.append(ln)
+        i = j  # advance to the next bullet (or end)
 
     return "\n".join(out)
 
@@ -896,19 +925,19 @@ def _store_and_send(
     text_val = _ensure_links_on_bullets(text_val, user_text or "")
     text_val = _shorten_bullet_labels(text_val)
 
+    # Push commentary to the end so parts 1–2 are link-first
     lines = [ln for ln in (text_val or "").splitlines()]
     link_lines = [ln for ln in lines if ln.strip().startswith("http") or " — http" in ln or ln.strip().startswith("- ")]
     other_lines = [ln for ln in lines if ln not in link_lines]
     text_val = "\n".join(link_lines + ([""] if (link_lines and other_lines) else []) + other_lines).strip()
+
     text_val = ensure_not_link_ending(text_val)
 
-
-    # --- Segment after shaping (URL-safe) ---
     parts = _segments_for_sms(
         text_val,
         per=int(os.getenv("SMS_PER_PART", "360")),
         max_parts=int(os.getenv("SMS_MAX_PARTS", "2")),
-        prefix_reserve=8,     # we reserve "[1/2] " etc
+        prefix_reserve=8,
     )
 
     if not parts:
@@ -1348,6 +1377,7 @@ def generate_reply_job(
     reply = _shorten_bullet_labels(_ensure_links_on_bullets(reply, user_text))
     _store_and_send(user_id, convo_id, reply, user_phone, user_text=user_text, media_urls=media_urls)
     return
+
 
 def _ping_job():
     from loguru import logger

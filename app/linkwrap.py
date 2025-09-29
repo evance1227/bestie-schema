@@ -80,7 +80,6 @@ _AMAZON_HOST  = re.compile(r"(^|\.)(amazon\.[^/]+)$", re.I)
 # --- Legacy SYL link normalizer (hotfix) ---
 # --- Legacy SYL link normalizer (hotfix) ---
 import re
-from urllib.parse import urlparse, parse_qs, unquote
 
 def normalize_syl_links(text: str) -> str:
     """
@@ -104,8 +103,6 @@ def normalize_syl_links(text: str) -> str:
         retailer_url = unquote(retailer_url)
         return f"https://go.shopmy.us/p-{pub}?url={retailer_url}"
     return pattern.sub(_repl, text)
-
-from urllib.parse import urlparse, urlunparse, parse_qs, urlencode
 
 _AFFIL_PARAMS = {
     # generic
@@ -270,24 +267,6 @@ def _should_syl(domain: str) -> bool:
 
 log = logging.getLogger("linkwrap")
 
-_AFFIL_PARAMS = {
-    "utm_source","utm_medium","utm_campaign","utm_content","utm_term","utm_id",
-    "_ga","_gid","_gl","gclid","fbclid","mc_cid","mc_eid",
-    "utm_channel","cm_mmc","cm_mmc1","cm_mmc2","rfsn","irgwc","aff","affid",
-    "ranMID","ranEAID","cjevent","epik","mbid","ncid"
-}
-
-def _strip_affiliate_params(retailer_url: str) -> str:
-    """Remove tracking/query junk that can break SYL redirects (e.g., Nordstrom)."""
-    try:
-        u = urlparse(retailer_url)
-        q = parse_qs(u.query, keep_blank_values=True)
-        q = {k: v for k, v in q.items() if k.lower() not in _AFFIL_PARAMS}
-        new_q = urlencode([(k, vv) for k, vals in q.items() for vv in vals])
-        return urlunparse((u.scheme, u.netloc, u.path, "", new_q, ""))
-    except Exception:
-        return retailer_url
-
 def _wrap_syl(url: str) -> str:
     """
     Wrap a retailer URL with SYL redirect in canonical format:
@@ -297,7 +276,7 @@ def _wrap_syl(url: str) -> str:
     if not (SYL_ENABLED and SYL_PUBLISHER_ID):
         return url
     url = _strip_affiliate_params(url)
-    
+
     tpl = (SYL_WRAP_TEMPLATE or "").strip()
     # If template is legacy or blank, force canonical
     if "sylikes.com" in tpl or "redirect?publisher_id" in tpl or not tpl:
@@ -309,13 +288,6 @@ def _wrap_syl(url: str) -> str:
         return wrapped
     except Exception:
         return url
-    
-def _wrap_syl(url: str) -> str:
-    if not (SYL_ENABLED and SYL_PUBLISHER_ID):
-        return url
-
-    # NEW: normalize/strip affiliate params (prevents Nordstrom/SYL bounce)
-    url = _strip_affiliate_params(url)
 
 def _wrap_url(url: str) -> str:
     """
