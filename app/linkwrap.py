@@ -19,6 +19,7 @@ import logging
 from urllib.parse import urlparse, urlunparse, parse_qs, urlencode, quote
 from urllib.parse import urlparse, parse_qs, unquote
 
+
 # =========================
 # ENV
 # =========================
@@ -34,12 +35,22 @@ SYL_WRAP_TEMPLATE = (
     or "https://go.shopmy.us/p-{pub}?url={url}"
 ).strip()
 
-# '*' means allow all retailers (except denylist & Amazon). Otherwise comma-separated list.
-SYL_RETAILERS     = [d.strip().lower() for d in (os.getenv("SYL_RETAILERS") or "*").split(",") if d.strip()]
+SYL_RETAILERS = [
+    d.strip().lower()
+    for d in (os.getenv("SYL_RETAILERS") or "*").split(",")
+    if d.strip()
+]
 
-# Never SYL-wrap these (already-affiliate or our own assets)
-SYL_DENYLIST      = [d.strip().lower() for d in (os.getenv("SYL_DENYLIST") or
-                     "geni.us,gumroad.com,bit.ly,tinyurl.com").split(",") if d.strip()]
+SYL_DENYLIST = [
+    d.strip().lower()
+    for d in (
+        os.getenv("SYL_DENYLIST")
+        or "geni.us,gumroad.com,bit.ly,tinyurl.com,rstyle.me,ltk.app.link,like2know.it"
+    ).split(",")
+    if d.strip()
+]
+
+
 logging.info(
     "[SYL] template=%s merchants=%s deny=%s",
     SYL_WRAP_TEMPLATE, SYL_RETAILERS, SYL_DENYLIST
@@ -52,7 +63,6 @@ AMAZON_ASSOCIATE_TAG = (os.getenv("AMAZON_ASSOCIATE_TAG") or "").strip()   # e.g
 
 # --- Optional static closer ---
 CLOSER_MODE       = (os.getenv("CLOSER_MODE") or "off").strip().lower()    # 'ai' | 'static' | 'off'
-
 
 # =========================
 # REGEX
@@ -95,6 +105,29 @@ def normalize_syl_links(text: str) -> str:
         retailer_url = unquote(retailer_url)
         return f"https://go.shopmy.us/p-{pub}?url={retailer_url}"
     return pattern.sub(_repl, text)
+
+from urllib.parse import urlparse, urlunparse, parse_qs, urlencode
+
+_AFFIL_PARAMS = {
+    # generic
+    "utm_source","utm_medium","utm_campaign","utm_content","utm_term","utm_id",
+    "_ga","_gid","_gl","gclid","fbclid","mc_cid","mc_eid",
+    # retailer/affiliate networks frequently seen in the wild
+    "utm_channel","cm_mmc","cm_mmc1","cm_mmc2","rfsn","irgwc","aff","affid",
+    "ranMID","ranEAID","cjevent","epik","mbid","ncid"
+}
+
+def _strip_affiliate_params(retailer_url: str) -> str:
+    try:
+        u = urlparse(retailer_url)
+        q = parse_qs(u.query, keep_blank_values=True)
+        q = {k: v for k, v in q.items() if k.lower() not in _AFFIL_PARAMS}
+        new_q = urlencode([(k, vv) for k, vals in q.items() for vv in vals])
+        # drop fragments; keep normalized path (handles Nordstrom /s/... nicely)
+        return urlunparse((u.scheme, u.netloc, u.path, "", new_q, ""))
+    except Exception:
+        return retailer_url
+
 
 def _amz_search_url(name: str) -> str:
     base = re.sub(r"[:|–—•\[\]\(\)]+", " ", (name or "").strip())
@@ -258,6 +291,13 @@ def _wrap_syl(url: str) -> str:
         return wrapped
     except Exception:
         return url
+    
+def _wrap_syl(url: str) -> str:
+    if not (SYL_ENABLED and SYL_PUBLISHER_ID):
+        return url
+
+    # NEW: normalize/strip affiliate params (prevents Nordstrom/SYL bounce)
+    url = _strip_affiliate_params(url)
 
 def _wrap_url(url: str) -> str:
     """

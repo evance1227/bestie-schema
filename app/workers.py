@@ -787,8 +787,8 @@ def _store_and_send(
    # --- Segment after shaping (URL-safe) ---
     parts = _segments_for_sms(
         text_val,
-        per=int(os.getenv("SMS_PER_PART", "300")),
-        max_parts=int(os.getenv("SMS_MAX_PARTS", "3")),
+        per=int(os.getenv("SMS_PER_PART", "360")),
+        max_parts=int(os.getenv("SMS_MAX_PARTS", "2")),
         prefix_reserve=8,     # we reserve "[1/2] " etc
     )
 
