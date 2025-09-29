@@ -28,14 +28,13 @@ import random
 import time
 import requests
 import json
-from app.linkwrap import normalize_syl_links
 from app.ai import generate_contextual_closer
 from typing import Optional, List, Dict, Tuple
 from datetime import datetime, timezone, timedelta
 from urllib.parse import quote_plus
 from app.integrations_serp import lens_products
 
-from app.linkwrap import _amz_search_url, _syl_search_url, wrap_all_affiliates, ensure_not_link_ending, normalize_syl_links
+from app.linkwrap import normalize_syl_links, _amz_search_url, _syl_search_url, wrap_all_affiliates, ensure_not_link_ending, normalize_syl_links
 import app.integrations as integrations
 import os, logging
 from redis import Redis
@@ -212,47 +211,83 @@ def _tidy_urls_per_line(text: str) -> str:
             parts.append(tok)
         lines.append(" ".join(parts).strip())
     return "\n".join(lines)
-# --- Bulleted lines → ensure they have a link ---
+
 # --- Bulleted lines → ensure they have a link (robust matcher) ---
-# allow: numbering, any dash (hyphen/en/em), optional trailing dash
-_BULLET_LINE_RE = re.compile(
-    r'^\s*(?:\d+[.)]\s*|\-\s*)?(?P<label>.+?)\s+[—–-]\s+(?P<retailer>[A-Za-z0-9&.\' ]+?)(?:\s*[—–-]\s*)?$',
+import re
+
+# dash set (hyphen, en, em)
+_D = r"[—–-]"
+# pattern A: simple "Label — Retailer —" (optional trailing dash)
+_PAT_SIMPLE = re.compile(
+    r'^\s*(?:\d+[.)]\s*|\-\s*)?(?P<label>.+?)\s+' + _D + r'\s+(?P<retailer>[A-Za-z0-9&.\' ]+?)(?:\s*' + _D + r'\s*)?$',
     re.UNICODE,
 )
 
 def _ensure_links_on_bullets(text: str, user_text: str) -> str:
     """
-    For lines like:
-      '1. Mikoh Bali Bikini Set — Mikoh —'
-    append a retailer link if missing.
-      - Non-Amazon → SYL search link
-      - Amazon     → clean Amazon search link
+    Convert bullets into "Label — https://..." if they don't already contain a link.
+
+      1. Label — Retailer —
+      2. Label - some descriptor. Retailer -
+      - Label — Retailer
+
+    Non-Amazon → SYL search link; Amazon → clean Amazon search link.
     """
     out: list[str] = []
-    for ln in (text or "").splitlines():
+    for raw in (text or "").splitlines():
+        ln = raw.rstrip()
         if "http://" in ln or "https://" in ln:
             out.append(ln)
             continue
 
-        m = _BULLET_LINE_RE.match(ln.strip())
-        if not m:
+        m = _PAT_SIMPLE.match(ln.strip())
+        label, retailer = None, None
+        if m:
+            label = (m.group("label") or "").strip()
+            retailer = (m.group("retailer") or "").strip().lower()
+        else:
+            # Fallback: "Label - description. Retailer -"  (take last dash segment as retailer)
+            s = ln.strip()
+            # strip bullet numbering/prefix
+            s = re.sub(r'^(?:\d+[.)]\s*|\-\s*)', '', s)
+            # drop trailing dashes
+            s = re.sub(r'\s*' + _D + r'\s*$', '', s)
+            # first dash splits label vs the rest
+            first = re.search(r'\s' + _D + r'\s', s)
+            if first:
+                label = s[:first.start()].strip()
+                rest = s[first.end():].strip()
+                # take last token as retailer
+                last_seg = re.split(r'\s' + _D + r'\s|\.$', rest)[-1].strip()
+                # accept 1–3 words, letters/&/.' only
+                if re.match(r"^[A-Za-z][A-Za-z&.' ]{1,40}$", last_seg):
+                    retailer = last_seg.lower()
+                else:
+                    retailer = ""
+            else:
+                label = s
+                retailer = ""
+
+        # If we still don't have a sensible label, keep the line as-is
+        if not label or len(label) < 2:
             out.append(ln)
             continue
 
-        item = m.group("label").strip()
-        retailer = (m.group("retailer") or "").strip().lower()
-
-        low = item.lower()
+        # Ignore obvious commentary bullets
+        low = label.lower()
         if low.startswith(("these styles", "these pieces", "happy shopping", "enjoy your")):
             out.append(ln)
             continue
 
         try:
             if retailer.startswith("amazon"):
-                url = _amz_search_url(item)
+                url = _amz_search_url(label)
             else:
-                url = _syl_search_url(item, f"{user_text} {retailer}")
-            out.append(f"{ln} — {url}")         # ensures reorder detects " — http"
+                # hint with retailer if we have it
+                hint = f"{user_text} {retailer}" if retailer else user_text
+                url = _syl_search_url(label, hint)
+            # Append in a form the reorder block recognizes (" — http...")
+            out.append(f"{ln} — {url}")
         except Exception:
             out.append(ln)
 
@@ -288,35 +323,6 @@ def _shorten_bullet_labels(text: str, max_len: int = 42) -> str:
         else:
             out.append(ln)
     return "\n".join(out)
-
-    parts: list[str] = []
-    i, n = 0, len(text)
-    limit_per = max(10, per - prefix_reserve)
-
-    while i < n and len(parts) < max_parts - 1:
-        remaining = n - i
-        if remaining <= limit_per:
-            break
-
-        cut = i + limit_per
-
-        # never break inside a URL
-        span = _in_url(cut)
-        if span:
-            cut = span[0]             # back up to URL start
-
-        # otherwise back up to last space
-        ws = text.rfind(" ", i, cut)
-        if ws != -1 and ws > i:
-            cut = ws
-
-        parts.append(text[i:cut].rstrip())
-        i = cut
-        while i < n and text[i] == " ":
-            i += 1
-
-    parts.append(text[i:].rstrip())
-    return [p for p in parts if p]  # no empty segments
 
 from urllib.parse import quote_plus
 
@@ -831,29 +837,16 @@ def _store_and_send(
     # wrappers
     text_val = wrap_all_affiliates(text_val)     # adds Amazon ?tag= / SYL redirect
     text_val = normalize_syl_links(text_val)     # legacy sylikes → shopmy.us
-    text_val = ensure_not_link_ending(text_val)  # don't end the body on a bare URL
-
-    # If an image was attached, prepend 2–3 product links from Google Lens (via SerpAPI)
-    try:
-        if media_urls:
-            candidates = lens_products(media_urls[0], allowed_domains=None, topn=8)
-            # Prefer Revolve/Shopbop/Nordstrom if present
-            prio = {"revolve.com", "shopbop.com", "nordstrom.com", "freepeople.com", "asos.com", "bloomingdales.com", "saksfifthavenue.com"}
-            preferred = [c for c in candidates if c["host"] in prio]
-            picks = (preferred or candidates)[:3]
-            if picks:
-                lines = [f"- {c['title']} — {c['url']}" for c in picks]
-                text_val = "Found close matches:\n" + "\n".join(lines) + "\n\n" + text_val
-    except Exception as e:
-        logger.warning("[Vision] lens_products error: {}", e)
+    text_val = ensure_not_link_ending(text_val)  
 
     # Optional debug marker (visible once)
     DEBUG_MARKER = os.getenv("DEBUG_MARKER", "")
     if DEBUG_MARKER:
         text_val = text_val.rstrip() + f"\n{DEBUG_MARKER}"
     OFFER_EMAIL = (os.getenv("OFFER_EMAIL_ON_OVERFLOW") or "0").lower() in ("1","true","yes")
-    per  = int(os.getenv("SMS_PER_PART", "320"))
-    maxp = int(os.getenv("SMS_MAX_PARTS", "3"))
+    per  = int(os.getenv("SMS_PER_PART", "360"))
+    maxp = int(os.getenv("SMS_MAX_PARTS", "2"))
+
     if OFFER_EMAIL and len(text_val) > (per * maxp):
         text_val = (
             text_val[: (per * maxp) - 80].rstrip()
@@ -863,7 +856,6 @@ def _store_and_send(
     per  = int(os.getenv("SMS_PER_PART", "320"))
     maxp = int(os.getenv("SMS_MAX_PARTS", "3"))
     text_val = _maybe_add_email_offer(text_val, per, maxp)
-
 
     # === IMAGE MATCHES (neutral sort; Amazon only when helpful; links-only reply) ===
     try:
@@ -904,19 +896,12 @@ def _store_and_send(
     text_val = _ensure_links_on_bullets(text_val, user_text or "")
     text_val = _shorten_bullet_labels(text_val)
 
-    # Push commentary to the end so parts 1–2 are link-first
     lines = [ln for ln in (text_val or "").splitlines()]
     link_lines = [ln for ln in lines if ln.strip().startswith("http") or " — http" in ln or ln.strip().startswith("- ")]
     other_lines = [ln for ln in lines if ln not in link_lines]
     text_val = "\n".join(link_lines + ([""] if (link_lines and other_lines) else []) + other_lines).strip()
     text_val = ensure_not_link_ending(text_val)
-    # --- Segment after shaping (URL-safe) ---
-    parts = _segments_for_sms(
-        text_val,
-        per=int(os.getenv("SMS_PER_PART", "360")),    # 360 (your choice)
-        max_parts=int(os.getenv("SMS_MAX_PARTS", "2")),  # 2 parts
-        prefix_reserve=8,                                # "[i/n] "
-)
+
 
     # --- Segment after shaping (URL-safe) ---
     parts = _segments_for_sms(
