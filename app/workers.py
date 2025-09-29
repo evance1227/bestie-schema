@@ -213,39 +213,48 @@ def _tidy_urls_per_line(text: str) -> str:
         lines.append(" ".join(parts).strip())
     return "\n".join(lines)
 # --- Bulleted lines → ensure they have a link ---
+# --- Bulleted lines → ensure they have a link ---
 import re
 
+# allow: 1) numbering  2) label  3) any dash (hyphen/en/em)  4) retailer  5) optional trailing dash
 _BULLET_LINE_RE = re.compile(
-    r'^\s*(?:\d+\.\s*|\-\s*)?(.+?)\s+[—-]\s+([A-Za-z0-9&.\' ]+)\s*$',
+    r'^\s*(?:\d+[.)]\s*|\-\s*)?(?P<label>.+?)\s+[—–-]\s+(?P<retailer>[A-Za-z0-9&.\' ]+?)(?:\s*[—–-]\s*)?$',
     re.UNICODE,
 )
 
 def _ensure_links_on_bullets(text: str, user_text: str) -> str:
     """
-    For lines like: '1. Mikoh Bali Bikini Set — Mikoh'
+    For lines like: '1. Mikoh Bali Bikini Set — Mikoh —'
     append a retailer link if there's no http/https present.
     - Non-Amazon → SYL search link
     - Amazon     → clean Amazon search link
     """
     out: list[str] = []
     for ln in (text or "").splitlines():
+        # already has a link → leave it
         if "http://" in ln or "https://" in ln:
             out.append(ln)
             continue
 
-        m = _BULLET_LINE_RE.match(ln)
+        m = _BULLET_LINE_RE.match(ln.strip())
         if not m:
             out.append(ln)
             continue
 
-        item = m.group(1).strip()
-        retailer = (m.group(2) or "").strip().lower()
+        item = m.group("label").strip()
+        retailer = (m.group("retailer") or "").strip().lower()
+
+        # defensive: ignore obvious commentary bullets
+        low = item.lower()
+        if low.startswith(("these styles", "these pieces", "happy shopping", "enjoy your")):
+            out.append(ln)
+            continue
 
         try:
             if retailer.startswith("amazon"):
                 url = _amz_search_url(item)
             else:
-                # include the retailer token in user_text so _syl_search_url can route
+                # feed the retailer token to improve routing
                 url = _syl_search_url(item, f"{user_text} {retailer}")
             out.append(f"{ln} {url}")
         except Exception:
