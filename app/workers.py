@@ -956,63 +956,93 @@ def _store_and_send(
     maxp = int(os.getenv("SMS_MAX_PARTS", "3"))
     text_val = _maybe_add_email_offer(text_val, per, maxp)
 
-    # === IMAGE MATCHES (neutral, token-scored; synthesize URL if missing; intro + 2 links) ===
+    # === IMAGE MATCHES (token-scored; fall back to SYL search when no match) ===
     try:
         if media_urls:
-            # Get candidates (SerpAPI Lens)
-            candidates = lens_products(media_urls[0], allowed_domains=None, topn=12)
-
-            # Score by overlap with the user's literal request (no category hard-wiring)
-            scored = [(_score_image_candidate(user_text or "", c), c) for c in candidates]
-            # keep only those that match at least one token; if none, keep all (graceful fallback)
-            filtered = [c for s, c in scored if s > 0] or [c for _, c in scored]
-
-            # Deduplicate by host for variety
-            by_host = {}
-            for c in filtered:
-                h = (c.get("host") or "").lower()
-                if h and h not in by_host:
-                    by_host[h] = c
-            deduped = list(by_host.values())
-
-            # Ensure each line has a real URL (build one if missing)
-            fixed: list[dict] = []
             ut = (user_text or "").strip()
-            for c in deduped:
-                title = (c.get("title") or "").strip() or (c.get("host") or "").strip()
-                host  = (c.get("host") or "").lower()
-                url   = (c.get("url")  or "").strip()
 
-                if not (url.startswith("http://") or url.startswith("https://")):
-                    try:
-                        if "amazon." in host:
-                            url = _amz_search_url(title or ut or "best match")
-                        else:
-                            url = _syl_search_url(title or (ut or "best match"), f"{ut} {host}".strip())
-                    except Exception:
-                        url = ""
+            # 1) Lens candidates
+            cands = lens_products(media_urls[0], allowed_domains=None, topn=12)
 
-                if url:
-                    fixed.append({"title": title, "url": url, "host": host})
+            # 2) Score by user words (no hard-wiring). Keep >0; if none, we'll fall back.
+            scored = [( _score_image_candidate(ut, c), c ) for c in cands]
+            winners = [c for s, c in scored if s > 0]
 
-            # If nothing usable, fabricate one generic search so we never print '— —'
-            if not fixed:
+            # 3) If nothing matches the user's words → ignore image; build 2 SYL search links from user_text
+            if not winners:
+                # derive up to two search queries from user text tokens
+                toks = _tokenize_query(ut)
+                q1 = " ".join(toks[:4]) or (ut or "best match")
+                q2 = " ".join(toks[4:8]) or q1
+
                 try:
-                    url = _syl_search_url(ut or "best match", ut)
-                    fixed = [{"title": (ut or "Top picks"), "url": url, "host": "search"}]
+                    url1 = _syl_search_url(q1, ut)
                 except Exception:
-                    fixed = []
+                    url1 = ""
+                try:
+                    url2 = _syl_search_url(q2, ut) if q2 != q1 else ""
+                except Exception:
+                    url2 = ""
 
-            # Two links → fits 2 SMS parts
-            picks = fixed[:2]
+                links = [(" ".join([t.capitalize() for t in q1.split()]) or "Top picks", url1)]
+                if url2:
+                    links.append(("More picks", url2))
 
-            if picks:
-                intro = "Found close matches:"
-                lines = [f"- {p['title']} — {p['url']}" for p in picks]
-                text_val = intro + "\n" + "\n".join(lines)
+                # Build the text body (intro + up to 2 links)
+                lines = [f"- {title} — {url}" for title, url in links if url]
+                text_val = ("Found close matches:\n" + "\n".join(lines)).strip()
+
+            else:
+                # 4) Deduplicate by host for variety
+                by_host = {}
+                for c in winners:
+                    h = (c.get("host") or "").lower()
+                    if h and h not in by_host:
+                        by_host[h] = c
+                deduped = list(by_host.values())
+
+                # 5) Guarantee URL (synthesize if missing)
+                fixed = []
+                for c in deduped:
+                    title = (c.get("title") or "").strip() or (c.get("host") or "").strip()
+                    host  = (c.get("host") or "").lower()
+                    url   = (c.get("url")  or "").strip()
+                    if not (url.startswith("http://") or url.startswith("https://")):
+                        try:
+                            if "amazon." in host:
+                                url = _amz_search_url(title or ut or "best match")
+                            else:
+                                url = _syl_search_url(title or (ut or "best match"), f"{ut} {host}".strip())
+                        except Exception:
+                            url = ""
+                    if url:
+                        fixed.append({"title": title, "url": url})
+
+                if not fixed:
+                    # still nothing workable → same SYL-search fallback as above
+                    toks = _tokenize_query(ut)
+                    q1 = " ".join(toks[:4]) or (ut or "best match")
+                    q2 = " ".join(toks[4:8]) or q1
+                    try:
+                        url1 = _syl_search_url(q1, ut)
+                    except Exception:
+                        url1 = ""
+                    try:
+                        url2 = _syl_search_url(q2, ut) if q2 != q1 else ""
+                    except Exception:
+                        url2 = ""
+                    fixed = [{"title": (" ".join([t.capitalize() for t in q1.split()]) or "Top picks"), "url": url1}]
+                    if url2:
+                        fixed.append({"title": "More picks", "url": url2})
+
+                picks = fixed[:2]
+                if picks:
+                    lines = [f"- {p['title']} — {p['url']}" for p in picks]
+                    text_val = ("Found close matches:\n" + "\n".join(lines)).strip()
     except Exception as e:
         logger.warning("[Vision] image block error: {}", e)
     # === END IMAGE MATCHES ===
+
     
     # Final safety: ensure bullets have links, then shorten labels
     text_val = _ensure_links_on_bullets(text_val, user_text or "")
@@ -1059,7 +1089,6 @@ def _store_and_send(
         time.sleep(delay_ms / 1000.0)
 
     return
-
 # ---------------------------------------------------------------------- #
 # Rename flow
 #---------------------------------------------------------------------- #
