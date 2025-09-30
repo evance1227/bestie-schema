@@ -212,6 +212,38 @@ def _tidy_urls_per_line(text: str) -> str:
             parts.append(tok)
         lines.append(" ".join(parts).strip())
     return "\n".join(lines)
+# --- Neutral tokenization & scoring for image candidates (no category hard-wiring) ---
+import re
+from urllib.parse import urlparse
+
+_STOP_WORDS = {
+    "the","and","or","for","with","this","that","those","these","you","your",
+    "me","mine","a","an","to","in","at","on","of","by","it","its","my","our",
+    "size","sizes","xs","sm","small","medium","large","xl","xxl","xxx","fit",
+    "please","send","link","links","photo","picture","image","pic","find",
+    "want","need","like","some","any","budget","price","range","under","over"
+}
+
+def _tokenize_query(s: str) -> set[str]:
+    s = (s or "").lower()
+    toks = re.findall(r"[a-z0-9]+", s)
+    return {t for t in toks if len(t) >= 3 and t not in _STOP_WORDS}
+
+def _score_image_candidate(user_text: str, c: dict) -> int:
+    """Score a lens candidate by overlap with user_text tokens. No category hard-wiring."""
+    toks = _tokenize_query(user_text)
+    if not toks:
+        return 0
+    title = (c.get("title") or "").lower()
+    host  = (c.get("host")  or "").lower()
+    path  = urlparse(c.get("url") or "").path.lower()
+    hay   = " ".join((title, host, path))
+    score = 0
+    for t in toks:
+        if t in title: score += 3
+        if t in host:  score += 4
+        if t in path:  score += 2
+    return score
 
 # --- Intent extraction (brand + category) for image queries ---
 _BRAND_TOKENS = {
@@ -924,27 +956,32 @@ def _store_and_send(
     maxp = int(os.getenv("SMS_MAX_PARTS", "3"))
     text_val = _maybe_add_email_offer(text_val, per, maxp)
 
-    # === IMAGE MATCHES (neutral; synthesize URL if missing; intro + 2 links) ===
+    # === IMAGE MATCHES (neutral, token-scored; synthesize URL if missing; intro + 2 links) ===
     try:
         if media_urls:
-            # Get candidates (SerpAPI Lens already excludes social/blog)
+            # Get candidates (SerpAPI Lens)
             candidates = lens_products(media_urls[0], allowed_domains=None, topn=12)
+
+            # Score by overlap with the user's literal request (no category hard-wiring)
+            scored = [(_score_image_candidate(user_text or "", c), c) for c in candidates]
+            # keep only those that match at least one token; if none, keep all (graceful fallback)
+            filtered = [c for s, c in scored if s > 0] or [c for _, c in scored]
 
             # Deduplicate by host for variety
             by_host = {}
-            for c in candidates:
+            for c in filtered:
                 h = (c.get("host") or "").lower()
                 if h and h not in by_host:
                     by_host[h] = c
             deduped = list(by_host.values())
 
-            # Build/repair URLs: if candidate has no usable URL, synthesize one
+            # Ensure each line has a real URL (build one if missing)
             fixed: list[dict] = []
             ut = (user_text or "").strip()
             for c in deduped:
                 title = (c.get("title") or "").strip() or (c.get("host") or "").strip()
                 host  = (c.get("host") or "").lower()
-                url   = (c.get("url") or "").strip()
+                url   = (c.get("url")  or "").strip()
 
                 if not (url.startswith("http://") or url.startswith("https://")):
                     try:
@@ -958,7 +995,7 @@ def _store_and_send(
                 if url:
                     fixed.append({"title": title, "url": url, "host": host})
 
-            # If still nothing usable, fabricate one generic search so we never print "— —"
+            # If nothing usable, fabricate one generic search so we never print '— —'
             if not fixed:
                 try:
                     url = _syl_search_url(ut or "best match", ut)
@@ -966,7 +1003,8 @@ def _store_and_send(
                 except Exception:
                     fixed = []
 
-            picks = fixed[:2]   # two links → fits 2 SMS parts
+            # Two links → fits 2 SMS parts
+            picks = fixed[:2]
 
             if picks:
                 intro = "Found close matches:"
@@ -975,7 +1013,6 @@ def _store_and_send(
     except Exception as e:
         logger.warning("[Vision] image block error: {}", e)
     # === END IMAGE MATCHES ===
-
     
     # Final safety: ensure bullets have links, then shorten labels
     text_val = _ensure_links_on_bullets(text_val, user_text or "")
