@@ -211,6 +211,30 @@ def _tidy_urls_per_line(text: str) -> str:
             parts.append(tok)
         lines.append(" ".join(parts).strip())
     return "\n".join(lines)
+# --- Intent extraction (brand + category) for image queries ---
+_BRAND_TOKENS = {
+    "gucci","prada","celine","ray-ban","rayban","saint laurent","ysl",
+    "balenciaga","burberry","chanel","versace","tom ford","maui jim",
+    "oakley","dior","fendi","valentino"
+}
+_CATEGORY_SYNONYMS = {
+    "sunglasses": {"sunglasses","sunnies","shades","sunglass"},
+    "hat": {"hat","wide brim","sunhat","sun hat","bucket hat","visor","fedora"},
+    "coverup": {"cover-up","coverup","beach cover","kaftan","pareo","sarong"},
+    "sandals": {"sandal","sandals","slides","flip flops","flip-flops","pool shoes"},
+    "necklace": {"necklace","pendant","chain","choker"},
+    # add more categories here as you need
+}
+
+def _intent_from_text(t: str) -> tuple[str|None, str|None]:
+    t = (t or "").lower()
+    brand = next((b for b in _BRAND_TOKENS if b in t), None)
+    category = None
+    for cat, syns in _CATEGORY_SYNONYMS.items():
+        if any(s in t for s in syns):
+            category = cat
+            break
+    return brand, category
 
 # --- Bulleted lines → ensure they have a link (multi-line robust) ---
 import re
@@ -886,40 +910,59 @@ def _store_and_send(
     maxp = int(os.getenv("SMS_MAX_PARTS", "3"))
     text_val = _maybe_add_email_offer(text_val, per, maxp)
 
-    # === IMAGE MATCHES (neutral sort; Amazon only when helpful; links-only reply) ===
+    # === IMAGE MATCHES (intent-filtered; smart fallback; brief personality) ===
     try:
         if media_urls:
-            candidates = lens_products(media_urls[0], allowed_domains=None, topn=12)
+            brand, category = _intent_from_text(user_text or "")
+            # Pull more candidates; we’ll filter by intent
+            candidates = lens_products(media_urls[0], allowed_domains=None, topn=20)
 
-            # If we got fewer than 2, allow Amazon for extra coverage (still excludes social + shein in integrations)
-            if not candidates or len(candidates) < 2:
-                extra = lens_products(media_urls[0], allowed_domains=None, topn=6, exclude_domains=set())
-                by_url = {c["url"]: c for c in candidates}
-                for c in extra:
-                    if c["url"] not in by_url:
-                        by_url[c["url"]] = c
-                candidates = list(by_url.values())
+            def _ok(item: dict) -> bool:
+                title = (item.get("title") or "").lower()
+                url   = (item.get("url") or "").lower()
+                # must contain category if one was requested
+                if category:
+                    if (category not in title) and (category not in url):
+                        return False
+                # if a brand was requested, prefer brand matches
+                if brand:
+                    if (brand not in title) and (brand not in url):
+                        return False
+                return True
 
-            # One link per host for variety (take the first per host)
-            by_host = {}
-            for c in candidates:
-                if c["host"] not in by_host:
-                    by_host[c["host"]] = c
-            deduped = list(by_host.values())
+            filt = [c for c in candidates if _ok(c)]
 
-            picks = deduped[:2]   # keep it tight so we stay within 2 SMS parts reliably
+            lines: list[str] = []
+            if len(filt) >= 2:
+                picks = filt[:2]
+                lines = [f"- {(c['title'] or c['host']).strip()} — {c['url']}" for c in picks]
+            else:
+                # Fallback: build targeted retailer searches (SYL) using brand+category
+                q = " ".join(x for x in [(brand or ""), (category or "")] if x).strip() or (brand or category or "sunglasses")
+                # A small, neutral retailer set for eyewear
+                retailer_hints = ["sunglasshut", "nordstrom", "saksfifthavenue", "farfetch", "ssense", "shopbop"]
+                for rh in retailer_hints:
+                    try:
+                        url = _syl_search_url(q, rh)  # hint in user_text to route SYL search
+                        lines.append(f"- {rh.title()} — {url}")
+                        if len(lines) == 2:
+                            break
+                    except Exception:
+                        continue
 
-            if picks:
-                def _label(c):
-                    lab = (c.get("title") or "").strip()
-                    bad = lab.lower()
-                    if ("for your " in bad) or ("acting skin" in bad) or bad.startswith("home") or len(lab) < 5 or len(lab) > 120:
-                        return c["host"]
-                    return lab
-                lines = [f"- {_label(c)} — {c['url']}" for c in picks]
-                text_val = "Found close matches:\n" + "\n".join(lines)  # links-only; no AI chatter
+            if lines:
+                # tiny one-liner AFTER links (keeps part [1/2] link-first)
+                personality = ""
+                if category == "sunglasses":
+                    personality = "Tip: bold cat-eye and oversized squares flatter strong cheekbones. 😎"
+                elif category == "hat":
+                    personality = "Go wide-brim (3.5–4\") for sun + glam; pinch crowns slim the face. 👒"
+                elif category == "sandals":
+                    personality = "A slight platform keeps poolside chic without sinking into grass. 🌴"
+                text_val = "Found close matches:\n" + "\n".join(lines) + ("\n\n" + personality if personality else "")
+
     except Exception as e:
-        logger.warning("[Vision] lens_products error: {}", e)
+        logger.warning("[Vision] image intent flow error: {}", e)
     # === END IMAGE MATCHES ===
     # Final safety: ensure bullets have links, then shorten labels
     text_val = _ensure_links_on_bullets(text_val, user_text or "")
