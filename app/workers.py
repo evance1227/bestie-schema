@@ -213,6 +213,52 @@ def _tidy_urls_per_line(text: str) -> str:
         lines.append(" ".join(parts).strip())
     return "\n".join(lines)
 # --- Neutral tokenization & scoring for image candidates (no category hard-wiring) ---
+from urllib.parse import urlparse
+
+# Preferred affiliate-friendly hosts. This is only a hint for search;
+# we DO NOT hard-wire product categories or force a specific merchant.
+_AFFIL_HINT = "revolve shopbop nordstrom farfetch bloomingdales saks"
+
+def _is_affiliate_url(url: str) -> bool:
+    try:
+        h = urlparse(url).netloc.lower()
+        return h.endswith("shopmy.us") or ("amazon." in h)
+    except Exception:
+        return False
+
+def _affiliate_upgrade(picks: list[dict], user_text: str) -> list[dict]:
+    """
+    For each pick, if it's not already affiliate-friendly, try to replace the URL with:
+      1) a SYL search link biased by the user's wording + our affiliate hint
+      2) if that fails, an Amazon search link for the label
+    Never adds extra lines—just replaces the URL when we find a better monetizable target.
+    """
+    upgraded = []
+    ut = (user_text or "").strip()
+    for p in picks:
+        title = (p.get("title") or "").strip()
+        url   = (p.get("url")   or "").strip()
+
+        if _is_affiliate_url(url):
+            upgraded.append(p)
+            continue
+
+        alt = ""
+        try:
+            # let SYL route to a supported retailer using the user's own words
+            alt = _syl_search_url(title or ut or "best match", f"{ut} {_AFFIL_HINT}".strip())
+        except Exception:
+            pass
+
+        if not alt:
+            try:
+                alt = _amz_search_url(title or ut or "best match")
+            except Exception:
+                pass
+
+        upgraded.append({"title": title, "url": (alt or url), "host": p.get("host","")})
+    return upgraded
+
 import re
 from urllib.parse import urlparse
 
@@ -1035,10 +1081,61 @@ def _store_and_send(
                     if url2:
                         fixed.append({"title": "More picks", "url": url2})
 
-                picks = fixed[:2]
                 if picks:
+    # 1) upgrade to affiliate-friendly targets when possible (SYL first, Amazon second)
+                    picks = _affiliate_upgrade(picks, user_text or "")
+
+                    # 2) build the message body
+                    intro = "Found close matches:"
                     lines = [f"- {p['title']} — {p['url']}" for p in picks]
-                    text_val = ("Found close matches:\n" + "\n".join(lines)).strip()
+                    text_val = (intro + "\n" + "\n".join(lines)).strip()
+
+                    # 3) affiliate-wrap AFTER replacing the body so deep links become SYL/Amazon
+                    text_val = wrap_all_affiliates(text_val)
+                    text_val = normalize_syl_links(text_val)
+                    text_val = ensure_not_link_ending(text_val)
+
+                    # 4) validate each wrapped link; if it looks broken or lands on the wrong host → fallback to SYL search
+                    validated_lines = []
+                    for ln in text_val.splitlines():
+                        if (" — http" not in ln) and ("http" not in ln):
+                            validated_lines.append(ln)
+                            continue
+
+                        parts = ln.split(" — http", 1)
+                        if len(parts) != 2:
+                            validated_lines.append(ln)
+                            continue
+
+                        label = parts[0].strip()
+                        url   = "http" + parts[1].strip()
+
+                        # expected host from the picks (match by title snippet if possible)
+                        expect = ""
+                        for p in picks:
+                            if p["title"] and p["title"].split()[0] in label:
+                                expect = p.get("host","")
+                                break
+
+                        if not expect:
+                            try:
+                                from urllib.parse import urlparse
+                                expect = urlparse(url).netloc
+                            except Exception:
+                                pass
+
+                        if _looks_live_and_same_host(url, expect):
+                            validated_lines.append(f"{label} — {url}")
+                        else:
+                            # fallback: keep it monetizable with a SYL search for the label + user text
+                            try:
+                                alt = _syl_search_url(label or (user_text or "best match"), user_text or "")
+                                validated_lines.append(f"{label} — {alt}")
+                            except Exception:
+                                validated_lines.append(label)
+
+                    text_val = "\n".join(validated_lines).strip()
+
     except Exception as e:
         logger.warning("[Vision] image block error: {}", e)
     # === END IMAGE MATCHES ===
@@ -1499,6 +1596,29 @@ def generate_reply_job(
     reply = _shorten_bullet_labels(_ensure_links_on_bullets(reply, user_text))
     _store_and_send(user_id, convo_id, reply, user_phone, user_text=user_text, media_urls=media_urls)
     return
+
+def _looks_live_and_same_host(url: str, expect_host: str) -> bool:
+    try:
+        import requests
+        from urllib.parse import urlparse
+        def _norm(h: str) -> str:
+            h = (h or "").lower()
+            return h[4:] if h.startswith("www.") else h
+
+        r = requests.head(url, allow_redirects=True, timeout=3)
+        if r.status_code >= 400:
+            return False
+        final = _norm(urlparse(r.url).netloc)
+        if _norm(expect_host) == final:
+            return True
+        # Some sites don't love HEAD; try one GET
+        r2 = requests.get(url, allow_redirects=True, timeout=4)
+        if r2.status_code >= 400:
+            return False
+        final = _norm(urlparse(r2.url).netloc)
+        return _norm(expect_host) == final
+    except Exception:
+        return False
 
 
 def _ping_job():
