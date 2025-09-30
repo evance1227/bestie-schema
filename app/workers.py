@@ -331,16 +331,27 @@ def _ensure_links_on_bullets(text: str, user_text: str) -> str:
                     url = _amz_search_url(label)
                 else:
                     hint = f"{user_text} {retailer}".strip()
-                    url = _syl_search_url(label, hint)
+                    url = _syl_search_url(label or (user_text or "best match"), hint)
+            except Exception:
+                url = ""
+
+            # FINAL GUARANTEE: if url is still empty, synthesize a generic SYL search
+            if not url:
+                try:
+                    url = _syl_search_url(label or (user_text or "best match"), user_text)
+                except Exception:
+                    url = ""
+
+            if url:
                 # Append link to the **first** bullet line in a form the reorder block understands
                 first_line = chunk_lines[0].rstrip()
                 out.append(f"{first_line} — {url}")
                 # Copy the rest of the chunk (if any), as-is
                 for k in range(1, len(chunk_lines)):
                     out.append(chunk_lines[k].rstrip())
-            except Exception:
-                out.extend(cl.rstrip() for cl in chunk_lines)
-        
+            else:
+                # couldn’t build a URL → keep original chunk (but we won’t elevate it as a “link line” below)
+                out.extend(cl.rstrip() for cl in chunk_lines)      
         else:
             # couldn't parse; keep original chunk
             out.extend(cl.rstrip() for cl in chunk_lines)
@@ -972,7 +983,7 @@ def _store_and_send(
 
     # Push commentary to the end so parts 1–2 are link-first
     lines = [ln for ln in (text_val or "").splitlines()]
-    link_lines = [ln for ln in lines if ln.strip().startswith("http") or " — http" in ln or ln.strip().startswith("- ")]
+    link_lines = [ln for ln in lines if ("http://" in ln) or ("https://" in ln) or (" — http" in ln)]
     other_lines = [ln for ln in lines if ln not in link_lines]
     text_val = "\n".join(link_lines + ([""] if (link_lines and other_lines) else []) + other_lines).strip()
 
