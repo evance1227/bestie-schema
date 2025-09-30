@@ -32,6 +32,7 @@ from app.ai import generate_contextual_closer
 from typing import Optional, List, Dict, Tuple
 from datetime import datetime, timezone, timedelta
 from urllib.parse import quote_plus
+from urllib.parse import urlparse
 from app.integrations_serp import lens_products
 
 from app.linkwrap import normalize_syl_links, _amz_search_url, _syl_search_url, wrap_all_affiliates, ensure_not_link_ending, normalize_syl_links
@@ -211,6 +212,7 @@ def _tidy_urls_per_line(text: str) -> str:
             parts.append(tok)
         lines.append(" ".join(parts).strip())
     return "\n".join(lines)
+
 # --- Intent extraction (brand + category) for image queries ---
 _BRAND_TOKENS = {
     "gucci","prada","celine","ray-ban","rayban","saint laurent","ysl",
@@ -338,6 +340,7 @@ def _ensure_links_on_bullets(text: str, user_text: str) -> str:
                     out.append(chunk_lines[k].rstrip())
             except Exception:
                 out.extend(cl.rstrip() for cl in chunk_lines)
+        
         else:
             # couldn't parse; keep original chunk
             out.extend(cl.rstrip() for cl in chunk_lines)
@@ -910,60 +913,59 @@ def _store_and_send(
     maxp = int(os.getenv("SMS_MAX_PARTS", "3"))
     text_val = _maybe_add_email_offer(text_val, per, maxp)
 
-    # === IMAGE MATCHES (intent-filtered; smart fallback; brief personality) ===
+    # === IMAGE MATCHES (neutral; synthesize URL if missing; intro + 2 links) ===
     try:
         if media_urls:
-            brand, category = _intent_from_text(user_text or "")
-            # Pull more candidates; we’ll filter by intent
-            candidates = lens_products(media_urls[0], allowed_domains=None, topn=20)
+            # Get candidates (SerpAPI Lens already excludes social/blog)
+            candidates = lens_products(media_urls[0], allowed_domains=None, topn=12)
 
-            def _ok(item: dict) -> bool:
-                title = (item.get("title") or "").lower()
-                url   = (item.get("url") or "").lower()
-                # must contain category if one was requested
-                if category:
-                    if (category not in title) and (category not in url):
-                        return False
-                # if a brand was requested, prefer brand matches
-                if brand:
-                    if (brand not in title) and (brand not in url):
-                        return False
-                return True
+            # Deduplicate by host for variety
+            by_host = {}
+            for c in candidates:
+                h = (c.get("host") or "").lower()
+                if h and h not in by_host:
+                    by_host[h] = c
+            deduped = list(by_host.values())
 
-            filt = [c for c in candidates if _ok(c)]
+            # Build/repair URLs: if candidate has no usable URL, synthesize one
+            fixed: list[dict] = []
+            ut = (user_text or "").strip()
+            for c in deduped:
+                title = (c.get("title") or "").strip() or (c.get("host") or "").strip()
+                host  = (c.get("host") or "").lower()
+                url   = (c.get("url") or "").strip()
 
-            lines: list[str] = []
-            if len(filt) >= 2:
-                picks = filt[:2]
-                lines = [f"- {(c['title'] or c['host']).strip()} — {c['url']}" for c in picks]
-            else:
-                # Fallback: build targeted retailer searches (SYL) using brand+category
-                q = " ".join(x for x in [(brand or ""), (category or "")] if x).strip() or (brand or category or "sunglasses")
-                # A small, neutral retailer set for eyewear
-                retailer_hints = ["sunglasshut", "nordstrom", "saksfifthavenue", "farfetch", "ssense", "shopbop"]
-                for rh in retailer_hints:
+                if not (url.startswith("http://") or url.startswith("https://")):
                     try:
-                        url = _syl_search_url(q, rh)  # hint in user_text to route SYL search
-                        lines.append(f"- {rh.title()} — {url}")
-                        if len(lines) == 2:
-                            break
+                        if "amazon." in host:
+                            url = _amz_search_url(title or ut or "best match")
+                        else:
+                            url = _syl_search_url(title or (ut or "best match"), f"{ut} {host}".strip())
                     except Exception:
-                        continue
+                        url = ""
 
-            if lines:
-                # tiny one-liner AFTER links (keeps part [1/2] link-first)
-                personality = ""
-                if category == "sunglasses":
-                    personality = "Tip: bold cat-eye and oversized squares flatter strong cheekbones. 😎"
-                elif category == "hat":
-                    personality = "Go wide-brim (3.5–4\") for sun + glam; pinch crowns slim the face. 👒"
-                elif category == "sandals":
-                    personality = "A slight platform keeps poolside chic without sinking into grass. 🌴"
-                text_val = "Found close matches:\n" + "\n".join(lines) + ("\n\n" + personality if personality else "")
+                if url:
+                    fixed.append({"title": title, "url": url, "host": host})
 
+            # If still nothing usable, fabricate one generic search so we never print "— —"
+            if not fixed:
+                try:
+                    url = _syl_search_url(ut or "best match", ut)
+                    fixed = [{"title": (ut or "Top picks"), "url": url, "host": "search"}]
+                except Exception:
+                    fixed = []
+
+            picks = fixed[:2]   # two links → fits 2 SMS parts
+
+            if picks:
+                intro = "Found close matches:"
+                lines = [f"- {p['title']} — {p['url']}" for p in picks]
+                text_val = intro + "\n" + "\n".join(lines)
     except Exception as e:
-        logger.warning("[Vision] image intent flow error: {}", e)
+        logger.warning("[Vision] image block error: {}", e)
     # === END IMAGE MATCHES ===
+
+    
     # Final safety: ensure bullets have links, then shorten labels
     text_val = _ensure_links_on_bullets(text_val, user_text or "")
     text_val = _shorten_bullet_labels(text_val)
