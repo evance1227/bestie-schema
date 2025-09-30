@@ -50,6 +50,13 @@ SYL_DENYLIST = [
     if d.strip()
 ]
 
+# Hosts that we will NEVER wrap via SYL (send raw retailer URL instead)
+SYL_SKIP_HOSTS = {
+    d.strip().lower()
+    for d in (os.getenv("SYL_SKIP_HOSTS") or "").split(",")
+    if d.strip()
+}
+
 logging.info(
     "[SYL] template=%s merchants=%s deny=%s",
     SYL_WRAP_TEMPLATE, SYL_RETAILERS, SYL_DENYLIST
@@ -267,35 +274,100 @@ def _should_syl(domain: str) -> bool:
 
 log = logging.getLogger("linkwrap")
 
+def _syl_should_wrap_host(url: str) -> bool:
+    try:
+        host = urlparse(url).netloc.lower()
+        if host.startswith("www."):
+            host = host[4:]
+        if host in SYL_DENYLIST:
+            return False
+        if host in SYL_SKIP_HOSTS:
+            return False
+        return True
+    except Exception:
+        return True
+
 def _wrap_syl(url: str) -> str:
     """
-    Wrap a retailer URL with SYL redirect in canonical format:
-      https://go.shopmy.us/p-{pub}?url={retailer_url}
-    Do NOT pre-encode the retailer URL; SYL will encode it.
+    Wrap non-Amazon retailer URLs with SYL using the canonical template.
+    If wrapping appears unsafe (shortener/denylist, broken response, or the
+    wrapped link resolves to a different retailer host), fall back to the
+    raw retailer URL. Amazon is handled elsewhere (never SYL-wrapped here).
     """
     if not (SYL_ENABLED and SYL_PUBLISHER_ID):
         return url
+
+    # 1) Normalize the retailer URL first (strip UTM/affiliate junk)
     url = _strip_affiliate_params(url)
 
-    tpl = (SYL_WRAP_TEMPLATE or "").strip()
-    # If template is legacy or blank, force canonical
-    if "sylikes.com" in tpl or "redirect?publisher_id" in tpl or not tpl:
-        tpl = "https://go.shopmy.us/p-{pub}?url={url}"
-
+    # 2) Basic guards: empty host, Amazon, or denylisted shorteners → send raw
     try:
-        wrapped = tpl.format(pub=SYL_PUBLISHER_ID, url=url)  # raw URL, no quote()
-        log.info("[SYL] tpl=%s  dest=%s  => %s", tpl, url, wrapped)
-        return wrapped
+        host = urlparse(url).netloc.lower()
+        if host.startswith("www."):
+            host = host[4:]
     except Exception:
+        host = ""
+    if not host:
         return url
+    if "amazon." in host:               # Amazon is wrapped by the Amazon helper elsewhere
+        return url
+    if host in SYL_DENYLIST:            # e.g., geni.us, bit.ly, rstyle.me, ltk.app.link, like2know.it
+        return url
+
+    # 3) Canonical SYL template (fix any legacy/redirect templates)
+    tpl = (SYL_WRAP_TEMPLATE or "https://go.shopmy.us/p-{pub}?url={url}").strip()
+    if "sylikes.com" in tpl or "redirect?publisher_id" in tpl or "/p-" not in tpl:
+        tpl = "https://go.shopmy.us/p-{pub}?url={url}"
+    syl_url = tpl.format(pub=SYL_PUBLISHER_ID, url=url)   # raw url; SYL will encode
+
+    # 4) Fast validation (optional; default ON via SYL_VALIDATE=1):
+    #    accept SYL only if the wrapped link resolves to the same retailer host.
+    if (os.getenv("SYL_VALIDATE", "1").lower() in ("1", "true", "yes")):
+        def _norm(h: str) -> str:
+            h = (h or "").lower()
+            return h[4:] if h.startswith("www.") else h
+
+        try:
+            import requests  # local import to avoid a hard module dep at import time
+
+            # HEAD first (cheap); follow redirects
+            r = requests.head(syl_url, allow_redirects=True, timeout=3)
+            if r.status_code >= 400:
+                return url
+            final_host = _norm(urlparse(r.url).netloc)
+
+            if _norm(host) != final_host:
+                # Some retailers don’t implement HEAD well; try one GET as a fallback
+                r2 = requests.get(syl_url, allow_redirects=True, timeout=4)
+                if r2.status_code >= 400:
+                    return url
+                final_host = _norm(urlparse(r2.url).netloc)
+                if _norm(host) != final_host:
+                    return url  # mismatched retailer → send raw
+        except Exception:
+            return url  # any network hiccup → send raw
+
+    # 5) Looks good → use SYL
+    try:
+        log.info("[SYL] tpl=%s dest=%s => %s", tpl, url, syl_url)
+    except Exception:
+        pass
+    return syl_url
 
 def _wrap_url(url: str) -> str:
     """
     Choose the right wrapper for a single URL:
-      - denylist  -> original
-      - Amazon    -> _wrap_amazon
-      - Retailers -> _wrap_syl (if allowed)
-      - Google/Maps/YouTube -> original
+
+      - empty / denylist          -> raw
+      - Google/Maps/YouTube      -> raw
+      - Amazon                   -> _wrap_amazon (handled elsewhere)
+      - everything else          -> try _wrap_syl (it validates and falls back to raw)
+
+    The new _wrap_syl() will:
+      * strip affiliate/UTM params
+      * skip shorteners/denylist
+      * optionally validate the wrapped link (SYL_VALIDATE=1)
+      * return the raw retailer URL on any risk
     """
     if not url:
         return url
@@ -305,18 +377,24 @@ def _wrap_url(url: str) -> str:
     try:
         parsed = urlparse(url)
         host = (parsed.netloc or "").lower()
+        if host.startswith("www."):
+            host = host[4:]
 
-        # Skip common non-retail destinations
-        if "google." in host or "maps.google." in host or "youtu" in host:
+        # NEW: don't re-wrap links that are already SYL
+        if host.endswith("shopmy.us"):
             return url
 
+        # skip obvious non-retail destinations
+        if ("google." in host) or ("maps.google." in host) or ("youtu" in host):
+            return url
+
+        # Amazon uses its own wrapper (never SYL)
         if _AMAZON_HOST.search(host):
             return _wrap_amazon(url)
 
-        if _should_syl(host):
-            return _wrap_syl(url)
+        # Non-Amazon retailers: let _wrap_syl decide; it will fall back to raw if unsafe
+        return _wrap_syl(url)
 
-        return url
     except Exception:
         return url
 
