@@ -318,7 +318,7 @@ def _intent_from_text(t: str) -> tuple[str|None, str|None]:
             break
     return brand, category
 
-# --- Bulleted lines → ensure they have a link (multi-line robust) ---
+# --- Bulleted lines → ensure they have a link (multi-line, dash-robust) ---
 import re
 
 _DASH = r"[—–-]"  # em, en, hyphen
@@ -328,25 +328,16 @@ def _normalize_spaces(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "").strip())
 
 def _looks_like_retailer(s: str) -> bool:
-    # 1–40 chars, letters (incl. accents), spaces, &, ., '
     return bool(re.match(r"^[A-Za-zÀ-ÖØ-öø-ÿ][A-Za-zÀ-ÖØ-öø-ÿ&.' ]{1,40}$", s or ""))
 
 def _extract_label_and_retailer(chunk: str) -> tuple[str, str]:
-    """
-    Accepts a whole bullet 'chunk' (first bullet line + any following lines until the next bullet).
-    Tries to parse:
-      'Label — Retailer —'
-      'Label - description. Retailer -'
-      'Label' (no retailer; we'll still build a search link)
-    """
-    # join lines to a single string but also keep first line for label
     lines = [ln.rstrip() for ln in (chunk or "").splitlines() if ln.strip()]
     if not lines:
         return "", ""
     first = _BULLET_START.sub("", lines[0]).strip()
     joined = _normalize_spaces(" ".join(lines))
 
-    # Try "Label — Retailer" on a single line
+    # Simple: "Label — Retailer —"
     m = re.match(r'^(?P<label>.+?)\s+' + _DASH + r'\s+(?P<ret>[^-—–].+?)\s*(?:' + _DASH + r'\s*)?$', first)
     if m:
         label = m.group("label").strip()
@@ -354,55 +345,26 @@ def _extract_label_and_retailer(chunk: str) -> tuple[str, str]:
         if _looks_like_retailer(retailer):
             return label, retailer
 
-    # Fallback: split "Label - description. Retailer -"
-    #   - label = first line before first dash
-    #   - retailer = last dash segment or last sentence tail
+    # Fallback: "Label - description. Retailer -"
     lab = first
     mdash = re.search(r'\s' + _DASH + r'\s', first)
     if mdash:
         lab = first[:mdash.start()].strip()
 
-    # candidate retailer: last dash or last sentence fragment from the whole chunk
     tail = re.split(r'\s' + _DASH + r'\s|\.', joined)[-1].strip(" -—–")
     if _looks_like_retailer(tail):
         return lab, tail
 
-    # Still nothing—try the last non-empty line if it’s just a name
     last_line = lines[-1].strip(" -—–")
     if _looks_like_retailer(last_line):
         return lab, last_line
 
-    # No retailer; return label only (we can still search retailer-agnostic)
     return lab, ""
-
-def _looks_live_and_same_host(url: str, expect_host: str) -> bool:
-    try:
-        import requests
-        from urllib.parse import urlparse
-        def _norm(h: str) -> str:
-            h = (h or "").lower()
-            return h[4:] if h.startswith("www.") else h
-
-        r = requests.head(url, allow_redirects=True, timeout=3)
-        if r.status_code >= 400:
-            return False
-        final = _norm(urlparse(r.url).netloc)
-        if _norm(expect_host) == final:
-            return True
-        # Some sites don't love HEAD; try one GET
-        r2 = requests.get(url, allow_redirects=True, timeout=4)
-        if r2.status_code >= 400:
-            return False
-        final = _norm(urlparse(r2.url).netloc)
-        return _norm(expect_host) == final
-    except Exception:
-        return False
 
 def _ensure_links_on_bullets(text: str, user_text: str) -> str:
     """
-    Convert bullets to 'Label — https://...' if they don't already contain a link.
-    Non-Amazon → SYL search link; Amazon → clean Amazon search link.
-    Works across multiple physical lines per bullet.
+    Convert bullets to 'Label — http...' if they don't already contain a link.
+    Non-Amazon -> SYL; Amazon -> Amazon search. Never prints '— —'.
     """
     lines = (text or "").splitlines()
     out: list[str] = []
@@ -411,13 +373,13 @@ def _ensure_links_on_bullets(text: str, user_text: str) -> str:
     while i < n:
         ln = lines[i]
 
-        # If this line already has a link or isn't a bullet, just copy and move on
+        # Already a link or not a bullet → copy
         if ("http://" in ln or "https://" in ln) or not _BULLET_START.match(ln):
             out.append(ln.rstrip())
             i += 1
             continue
 
-        # Collect this bullet chunk (lines until the next bullet start or blank line)
+        # Collect the bullet chunk (this line + any following non-bullet, non-link lines)
         chunk_lines = [ln]
         j = i + 1
         while j < n and lines[j].strip() and not _BULLET_START.match(lines[j]) and ("http://" not in lines[j] and "https://" not in lines[j]):
@@ -425,10 +387,15 @@ def _ensure_links_on_bullets(text: str, user_text: str) -> str:
             j += 1
 
         label, retailer = _extract_label_and_retailer("\n".join(chunk_lines))
-        # If original bullet already had a link, nothing to do
+
+        # If a link already exists in the chunk, keep as-is
         if any("http://" in cl or "https://" in cl for cl in chunk_lines):
             out.extend(cl.rstrip() for cl in chunk_lines)
-        elif label:
+            i = j
+            continue
+
+        url = ""
+        if label:
             try:
                 if retailer.lower().startswith("amazon"):
                     url = _amz_search_url(label)
@@ -438,43 +405,23 @@ def _ensure_links_on_bullets(text: str, user_text: str) -> str:
             except Exception:
                 url = ""
 
-            # FINAL GUARANTEE: if url is still empty, synthesize a generic SYL search
+            # FINAL GUARANTEE: synthesize a generic SYL search if still blank
             if not url:
                 try:
                     url = _syl_search_url(label or (user_text or "best match"), user_text)
                 except Exception:
                     url = ""
 
-            if url:
-                # Append link to the **first** bullet line in a form the reorder block understands
-                first_line = chunk_lines[0].rstrip()
-                out.append(f"{first_line} — {url}")
-                # Copy the rest of the chunk (if any), as-is
-                for k in range(1, len(chunk_lines)):
-                    out.append(chunk_lines[k].rstrip())
-            else:
-                # couldn’t build a URL → keep original chunk (but we won’t elevate it as a “link line” below)
-                out.extend(cl.rstrip() for cl in chunk_lines)      
+        if url:
+            first_line = chunk_lines[0].rstrip()
+            out.append(f"{first_line} — {url}")     # only add dash when URL exists
+            for k in range(1, len(chunk_lines)):    # copy remaining lines
+                out.append(chunk_lines[k].rstrip())
         else:
-            # couldn't parse; keep original chunk
             out.extend(cl.rstrip() for cl in chunk_lines)
 
-        i = j  # advance to the next bullet (or end)
+        i = j
 
-    return "\n".join(out)
-
-def _shorten_bullet_labels(text: str, max_len: int = 42) -> str:
-    """Clamp labels so two links fit into 2 parts and leave room for voice."""
-    out = []
-    for ln in (text or "").splitlines():
-        if " — http" in ln:
-            label, rest = ln.split(" — http", 1)
-            label = label.strip()
-            if len(label) > max_len:
-                label = label[:max_len - 1].rstrip() + "…"
-            out.append(f"{label} — http{rest}")
-        else:
-            out.append(ln)
     return "\n".join(out)
 
 def _shorten_bullet_labels(text: str, max_len: int = 42) -> str:
