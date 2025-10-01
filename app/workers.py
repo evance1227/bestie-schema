@@ -270,10 +270,12 @@ _STOP_WORDS = {
     "want","need","like","some","any","budget","price","range","under","over"
 }
 
-def _tokenize_query(s: str) -> set[str]:
+def _tokenize_query(s: str) -> list[str]:
     s = (s or "").lower()
     toks = re.findall(r"[a-z0-9]+", s)
-    return {t for t in toks if len(t) >= 3 and t not in _STOP_WORDS}
+    # keep as LIST (order preserved) so we can slice; do not return a set
+    return [t for t in toks if len(t) >= 3 and t not in _STOP_WORDS]
+
 
 def _score_image_candidate(user_text: str, c: dict) -> int:
     """Score a lens candidate by overlap with user_text tokens. No category hard-wiring."""
@@ -1167,14 +1169,12 @@ def _store_and_send(
 
     text_val = ensure_not_link_ending(text_val)
 
-
     parts = _segments_for_sms(
     text_val,
     per=int(os.getenv("SMS_PER_PART", "380")),   # raise to 380 for more voice
     max_parts=int(os.getenv("SMS_MAX_PARTS", "2")),
     prefix_reserve=8,
 )
-
 
     if not parts:
         return
