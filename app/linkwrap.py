@@ -16,7 +16,7 @@ from __future__ import annotations
 import os
 import re
 import logging
-from urllib.parse import urlparse, urlunparse, parse_qs, urlencode, quote
+from urllib.parse import urlparse, urlunparse, parse_qs, urlencode, quote, quote_plus
 from urllib.parse import urlparse, parse_qs, unquote
 
 
@@ -143,7 +143,6 @@ def _amz_search_url(query: str) -> str:
     tag = (os.getenv("AMAZON_ASSOCIATE_TAG") or "").strip()
     base = f"https://www.amazon.com/s?k={q}"
     return f"{base}&tag={tag}" if tag else base
-
 
 def _is_denied(url: str) -> bool:
     low = (url or "").lower()

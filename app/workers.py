@@ -450,19 +450,6 @@ def _shorten_bullet_labels(text: str, max_len: int = 42) -> str:
 
 from urllib.parse import quote_plus
 
-def _amz_search_url(query: str) -> str:
-    """
-    Build a clean Amazon search link (not a dp/ASIN deep link).
-    Example: https://www.amazon.com/s?k=sea+salt+spray&tag=YOURTAG-20
-    """
-    q = quote_plus((query or "").strip())
-    if not q:
-        q = "best match"
-    tag = (os.getenv("AMAZON_ASSOCIATE_TAG") or "").strip()
-    base = f"https://www.amazon.com/s?k={q}"
-    return f"{base}&tag={tag}" if tag else base
-
-
 # --- Retailer search URLs for SYL wrapping -----------------------------------
 _RETAILER_SEARCH = {
     "sephora":  "https://www.sephora.com/search?keyword={q}",
