@@ -373,6 +373,29 @@ def _extract_label_and_retailer(chunk: str) -> tuple[str, str]:
     # No retailer; return label only (we can still search retailer-agnostic)
     return lab, ""
 
+def _looks_live_and_same_host(url: str, expect_host: str) -> bool:
+    try:
+        import requests
+        from urllib.parse import urlparse
+        def _norm(h: str) -> str:
+            h = (h or "").lower()
+            return h[4:] if h.startswith("www.") else h
+
+        r = requests.head(url, allow_redirects=True, timeout=3)
+        if r.status_code >= 400:
+            return False
+        final = _norm(urlparse(r.url).netloc)
+        if _norm(expect_host) == final:
+            return True
+        # Some sites don't love HEAD; try one GET
+        r2 = requests.get(url, allow_redirects=True, timeout=4)
+        if r2.status_code >= 400:
+            return False
+        final = _norm(urlparse(r2.url).netloc)
+        return _norm(expect_host) == final
+    except Exception:
+        return False
+
 def _ensure_links_on_bullets(text: str, user_text: str) -> str:
     """
     Convert bullets to 'Label — https://...' if they don't already contain a link.
@@ -955,7 +978,8 @@ def _store_and_send(
     except Exception:
         pass
 
-
+    image_mode = False
+        
     text_val = (text_val or "").strip()
     if not text_val:
         return
@@ -1002,44 +1026,37 @@ def _store_and_send(
     maxp = int(os.getenv("SMS_MAX_PARTS", "3"))
     text_val = _maybe_add_email_offer(text_val, per, maxp)
 
-    # === IMAGE MATCHES (token-scored; fall back to SYL search when no match) ===
+    # === IMAGE MATCHES (neutral, token-scored; affiliate upgrade; wrap + validate) ===
     try:
         if media_urls:
             ut = (user_text or "").strip()
 
-            # 1) Lens candidates
+            # Lens candidates
             cands = lens_products(media_urls[0], allowed_domains=None, topn=12)
 
-            # 2) Score by user words (no hard-wiring). Keep >0; if none, we'll fall back.
+            # Score by user words (no category rules). Keep >0; if none, we'll fall back.
             scored = [( _score_image_candidate(ut, c), c ) for c in cands]
             winners = [c for s, c in scored if s > 0]
 
-            # 3) If nothing matches the user's words → ignore image; build 2 SYL search links from user_text
             if not winners:
-                # derive up to two search queries from user text tokens
+                # Fall back to two SYL searches from user text
                 toks = _tokenize_query(ut)
                 q1 = " ".join(toks[:4]) or (ut or "best match")
                 q2 = " ".join(toks[4:8]) or q1
+                links = []
+                try: links.append((" ".join(t.capitalize() for t in q1.split()) or "Top picks", _syl_search_url(q1, ut)))
+                except Exception: pass
+                if q2 != q1:
+                    try: links.append(("More picks", _syl_search_url(q2, ut)))
+                    except Exception: pass
 
-                try:
-                    url1 = _syl_search_url(q1, ut)
-                except Exception:
-                    url1 = ""
-                try:
-                    url2 = _syl_search_url(q2, ut) if q2 != q1 else ""
-                except Exception:
-                    url2 = ""
-
-                links = [(" ".join([t.capitalize() for t in q1.split()]) or "Top picks", url1)]
-                if url2:
-                    links.append(("More picks", url2))
-
-                # Build the text body (intro + up to 2 links)
+                intro = "Found close matches from your photo & request:"
                 lines = [f"- {title} — {url}" for title, url in links if url]
-                text_val = ("Found close matches:\n" + "\n".join(lines)).strip()
+                text_val = (intro + "\n" + "\n".join(lines)).strip()
+                image_mode = True
 
             else:
-                # 4) Deduplicate by host for variety
+                # Deduplicate by host for variety
                 by_host = {}
                 for c in winners:
                     h = (c.get("host") or "").lower()
@@ -1047,7 +1064,7 @@ def _store_and_send(
                         by_host[h] = c
                 deduped = list(by_host.values())
 
-                # 5) Guarantee URL (synthesize if missing)
+                # Guarantee URL (synthesize if missing)
                 fixed = []
                 for c in deduped:
                     title = (c.get("title") or "").strip() or (c.get("host") or "").strip()
@@ -1062,61 +1079,55 @@ def _store_and_send(
                         except Exception:
                             url = ""
                     if url:
-                        fixed.append({"title": title, "url": url})
+                        fixed.append({"title": title, "url": url, "host": host})
 
                 if not fixed:
-                    # still nothing workable → same SYL-search fallback as above
+                    # same fallback as above
                     toks = _tokenize_query(ut)
                     q1 = " ".join(toks[:4]) or (ut or "best match")
                     q2 = " ".join(toks[4:8]) or q1
-                    try:
-                        url1 = _syl_search_url(q1, ut)
-                    except Exception:
-                        url1 = ""
-                    try:
-                        url2 = _syl_search_url(q2, ut) if q2 != q1 else ""
-                    except Exception:
-                        url2 = ""
-                    fixed = [{"title": (" ".join([t.capitalize() for t in q1.split()]) or "Top picks"), "url": url1}]
-                    if url2:
-                        fixed.append({"title": "More picks", "url": url2})
+                    fixed = []
+                    try: fixed.append({"title": (" ".join(t.capitalize() for t in q1.split()) or "Top picks"), "url": _syl_search_url(q1, ut), "host":"search"})
+                    except Exception: pass
+                    if q2 != q1:
+                        try: fixed.append({"title": "More picks", "url": _syl_search_url(q2, ut), "host":"search"})
+                        except Exception: pass
+
+                picks = fixed[:2]   # two links → fits 2 SMS parts
 
                 if picks:
-    # 1) upgrade to affiliate-friendly targets when possible (SYL first, Amazon second)
-                    picks = _affiliate_upgrade(picks, user_text or "")
+                    # affiliate upgrade (SYL preferred, Amazon next)
+                    picks = _affiliate_upgrade(picks, ut)
 
-                    # 2) build the message body
+                    # build body
                     intro = "Found close matches:"
                     lines = [f"- {p['title']} — {p['url']}" for p in picks]
                     text_val = (intro + "\n" + "\n".join(lines)).strip()
 
-                    # 3) affiliate-wrap AFTER replacing the body so deep links become SYL/Amazon
+                    # wrap AFTER building body (ensures deep links become SYL/Amazon)
                     text_val = wrap_all_affiliates(text_val)
                     text_val = normalize_syl_links(text_val)
                     text_val = ensure_not_link_ending(text_val)
 
-                    # 4) validate each wrapped link; if it looks broken or lands on the wrong host → fallback to SYL search
+                    # validate wrapped links; fallback to SYL search on mismatch
                     validated_lines = []
                     for ln in text_val.splitlines():
                         if (" — http" not in ln) and ("http" not in ln):
                             validated_lines.append(ln)
                             continue
-
                         parts = ln.split(" — http", 1)
                         if len(parts) != 2:
                             validated_lines.append(ln)
                             continue
-
                         label = parts[0].strip()
                         url   = "http" + parts[1].strip()
 
-                        # expected host from the picks (match by title snippet if possible)
+                        # expected host from the pick whose title prefix appears in label
                         expect = ""
                         for p in picks:
                             if p["title"] and p["title"].split()[0] in label:
                                 expect = p.get("host","")
                                 break
-
                         if not expect:
                             try:
                                 from urllib.parse import urlparse
@@ -1127,38 +1138,43 @@ def _store_and_send(
                         if _looks_live_and_same_host(url, expect):
                             validated_lines.append(f"{label} — {url}")
                         else:
-                            # fallback: keep it monetizable with a SYL search for the label + user text
                             try:
-                                alt = _syl_search_url(label or (user_text or "best match"), user_text or "")
+                                alt = _syl_search_url(label or (ut or "best match"), ut)
                                 validated_lines.append(f"{label} — {alt}")
                             except Exception:
                                 validated_lines.append(label)
 
                     text_val = "\n".join(validated_lines).strip()
-
+                    image_mode = True
     except Exception as e:
         logger.warning("[Vision] image block error: {}", e)
     # === END IMAGE MATCHES ===
-
     
     # Final safety: ensure bullets have links, then shorten labels
     text_val = _ensure_links_on_bullets(text_val, user_text or "")
     text_val = _shorten_bullet_labels(text_val)
 
-    # Push commentary to the end so parts 1–2 are link-first
+    # Link-first (only real URLs)
     lines = [ln for ln in (text_val or "").splitlines()]
-    link_lines = [ln for ln in lines if ("http://" in ln) or ("https://" in ln) or (" — http" in ln)]
+    link_lines  = [ln for ln in lines if ("http://" in ln) or ("https://" in ln) or (" — http" in ln)]
     other_lines = [ln for ln in lines if ln not in link_lines]
-    text_val = "\n".join(link_lines + ([""] if (link_lines and other_lines) else []) + other_lines).strip()
+
+    if image_mode:
+        # In image mode: keep only the link lines (drop any leftover LLM chatter)
+        text_val = "\n".join(link_lines).strip()
+    else:
+        text_val = "\n".join(link_lines + ([""] if (link_lines and other_lines) else []) + other_lines).strip()
 
     text_val = ensure_not_link_ending(text_val)
 
+
     parts = _segments_for_sms(
-        text_val,
-        per=int(os.getenv("SMS_PER_PART", "360")),
-        max_parts=int(os.getenv("SMS_MAX_PARTS", "2")),
-        prefix_reserve=8,
-    )
+    text_val,
+    per=int(os.getenv("SMS_PER_PART", "380")),   # raise to 380 for more voice
+    max_parts=int(os.getenv("SMS_MAX_PARTS", "2")),
+    prefix_reserve=8,
+)
+
 
     if not parts:
         return
