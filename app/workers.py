@@ -374,6 +374,13 @@ def _is_https_live(url: str) -> bool:
         return 200 <= r2.status_code < 400
     except Exception:
         return False
+    
+def _is_affiliate_hostname(host: str) -> bool:
+    """Return True if the host is an affiliate-friendly domain we control/monetize."""
+    h = (host or "").lower()
+    if h.startswith("www."):
+        h = h[4:]
+    return h.endswith("shopmy.us") or ("amazon." in h)
 
 def _ensure_links_on_bullets(text: str, user_text: str) -> str:
     """
@@ -403,84 +410,13 @@ def _ensure_links_on_bullets(text: str, user_text: str) -> str:
 
         label, retailer = _extract_label_and_retailer("\n".join(chunk_lines))
         
-        # If the chunk already has a link, upgrade it to an affiliate-friendly URL and validate
+       # If a link already exists in the chunk, keep as-is
         if any("http://" in cl or "https://" in cl for cl in chunk_lines):
-            # 1) pull the first URL we see in the chunk
-            orig_url = ""
-            for cl in chunk_lines:
-                m = re.search(r'(https?://\S+)', cl)
-                if m:
-                    orig_url = m.group(1)
-                    break
-
-            # 2) try to upgrade it (SYL first, then Amazon); if those fail, keep the brand URL
-            alt_url = _prefer_affiliate_url(label, user_text) or orig_url
-
-            # 3) validate; if unsafe (e.g., SSL/404), fall back to affiliate search
-            if not _is_https_live(alt_url):
-                alt_url = _prefer_affiliate_url(label, user_text) or ""
-
-            # 4) rewrite the first bullet line as "Label — http..." and drop raw link-only lines
-            first_line = chunk_lines[0].rstrip()
-            # remove any trailing " — http…" that might already be on the first line
-            first_line = re.sub(r'\s[—–-]\shttps?://\S+\s*$', '', first_line)
-            first_line = re.sub(r'\s[—–-]\s*$', '', first_line)
-
-            if alt_url:
-                out.append(f"{first_line} — {alt_url}")
-            else:
-                # nothing safe/affiliate found → keep just the label (no bad link)
-                out.append(first_line)
-
-            # copy any remaining non-link lines in the chunk (drop raw link-only lines)
-            for k in range(1, len(chunk_lines)):
-                if ("http://" in chunk_lines[k]) or ("https://" in chunk_lines[k]):
-                    continue
-                out.append(chunk_lines[k].rstrip())
-
+            out.extend(cl.rstrip() for cl in chunk_lines)
             i = j
             continue
-
-
-        url = ""
-        if label:
-            try:
-                if want_amazon:
-                    # FORCE Amazon search links when the user asked for Amazon
-                    url = _amz_search_url(label or (user_text or "best match"))
-                elif retailer.lower().startswith("amazon"):
-                    url = _amz_search_url(label or (user_text or "best match"))
-                else:
-                    # Prefer affiliates even if user didn't say "Amazon"
-                    url = _prefer_affiliate_url(label, user_text)
-                    if not url:
-                        hint = f"{user_text} {retailer}".strip()
-                        url = _syl_search_url(label or (user_text or "best match"), hint)
-            except Exception:
-                url = ""
-
-            # FINAL GUARANTEE: if still empty, prefer Amazon search when requested; else SYL search
-            if not url:
-                try:
-                    if want_amazon:
-                        url = _amz_search_url(label or (user_text or "best match"))
-                    else:
-                        url = _syl_search_url(label or (user_text or "best match"), user_text)
-                except Exception:
-                    url = ""
-
-        if url:
-            first_line = chunk_lines[0].rstrip()
-            out.append(f"{first_line} — {url}")     # only add dash when URL exists
-            for k in range(1, len(chunk_lines)):    # copy remaining lines
-                out.append(chunk_lines[k].rstrip())
-        else:
-            out.extend(cl.rstrip() for cl in chunk_lines)
-
-        i = j
-
-    return "\n".join(out)
-
+        return "\n".join(out)
+    
 # --- Prefer affiliate-friendly links for text bullets (no category rules) ---
 _AFFIL_HINT = "sephora ulta nordstrom revolve shopbop target anthropologie free people amazon"
 
