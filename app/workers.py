@@ -939,16 +939,17 @@ def _store_and_send(
     Carriers will stitch if the payload segments on their side.
     """
     # --- outbound dedupe: skip if we just sent the exact same text in this convo ---
+    # ---- dedupe (check now, set later after success) ----
+    dedupe_key = None
     try:
         from hashlib import sha1
-        sig = sha1((str(convo_id) + "::" + str(text_val)).encode("utf-8")).hexdigest()
-        k   = f"sent:{convo_id}:{sig}"
-        # 60s is plenty; prevents GHL/queue retries from double-sending
-        if _rds and not _rds.set(k, "1", ex=60, nx=True):
-            logger.info("[Send][Dedup] Skipping duplicate send for convo %s", convo_id)
+        sig = sha1(((str(convo_id) + ":" + (text_val or "")).encode("utf-8"))).hexdigest()
+        dedupe_key = f"sent:{convo_id}:{sig}"
+        if _rds and _rds.exists(dedupe_key):
+            logger.info("[Send][Dedupe] Skipping duplicate send for convo %s", convo_id)
             return
     except Exception:
-        pass
+        dedupe_key = None
 
     image_mode = False
         
@@ -1181,6 +1182,12 @@ def _store_and_send(
 
         # tiny pause so carriers keep order
         time.sleep(delay_ms / 1000.0)
+        
+    try:
+        if _rds and dedupe_key:
+            _rds.set(dedupe_key, "1", ex=60)
+    except Exception:
+        pass
 
     return
 # ---------------------------------------------------------------------- #
