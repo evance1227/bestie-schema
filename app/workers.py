@@ -1018,10 +1018,7 @@ def _store_and_send(
     text_val = normalize_syl_links(text_val)     # legacy sylikes → shopmy.us
     text_val = _clean_here_phrases(text_val)     # ← you put this here
     text_val = ensure_not_link_ending(text_val)
-    parts = _segments_for_sms(   # ← SEGMENTATION IS HERE (too early)
-        ...
-    )
-
+   
     # Optional debug marker (visible once)
     DEBUG_MARKER = os.getenv("DEBUG_MARKER", "")
     if DEBUG_MARKER:
