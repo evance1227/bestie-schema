@@ -389,11 +389,39 @@ def _ensure_links_on_bullets(text: str, user_text: str) -> str:
 
         label, retailer = _extract_label_and_retailer("\n".join(chunk_lines))
 
-        # If a link already exists in the chunk, keep as-is
+        # If the chunk already has a link, upgrade it to an affiliate-friendly URL
         if any("http://" in cl or "https://" in cl for cl in chunk_lines):
-            out.extend(cl.rstrip() for cl in chunk_lines)
+            # 1) pull the first URL we see in the chunk
+            orig_url = ""
+            for cl in chunk_lines:
+                m = re.search(r'(https?://\S+)', cl)
+                if m:
+                    orig_url = m.group(1)
+                    break
+
+            # 2) try to upgrade it (SYL first, then Amazon); fall back to the original
+            alt_url = _prefer_affiliate_url(label, user_text) or orig_url
+
+            # 3) rewrite the first bullet line as "Label — http..."
+            first_line = chunk_lines[0].rstrip()
+            # remove any url/dash that might already be tacked onto the first line
+            first_line = re.sub(r'\s[—–-]\shttps?://\S+\s*$', '', first_line)
+            first_line = re.sub(r'\s[—–-]\s*$', '', first_line)
+
+            if alt_url:
+                out.append(f"{first_line} — {alt_url}")
+            else:
+                out.append(first_line)
+
+            # 4) copy any remaining non-link lines in the chunk (drop raw link-only lines)
+            for k in range(1, len(chunk_lines)):
+                if ("http://" in chunk_lines[k]) or ("https://" in chunk_lines[k]):
+                    continue
+                out.append(chunk_lines[k].rstrip())
+
             i = j
             continue
+
 
         url = ""
         if label:
