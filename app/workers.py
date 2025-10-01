@@ -394,28 +394,7 @@ def _ensure_links_on_bullets(text: str, user_text: str) -> str:
     i, n = 0, len(lines)
     while i < n:
         ln = lines[i]
-
-        # Already a link or not a bullet → copy
-        if ("http://" in ln or "https://" in ln) or not _BULLET_START.match(ln):
-            out.append(ln.rstrip())
-            i += 1
-            continue
-
-        # Collect the bullet chunk (this line + any following non-bullet, non-link lines)
-        chunk_lines = [ln]
-        j = i + 1
-        while j < n and lines[j].strip() and not _BULLET_START.match(lines[j]) and ("http://" not in lines[j] and "https://" not in lines[j]):
-            chunk_lines.append(lines[j])
-            j += 1
-
-        label, retailer = _extract_label_and_retailer("\n".join(chunk_lines))
-        
-       # If a link already exists in the chunk, keep as-is
-        if any("http://" in cl or "https://" in cl for cl in chunk_lines):
-            out.extend(cl.rstrip() for cl in chunk_lines)
-            i = j
-            continue
-        return "\n".join(out)
+    return "\n".join(out)
     
 # --- Prefer affiliate-friendly links for text bullets (no category rules) ---
 _AFFIL_HINT = "sephora ulta nordstrom revolve shopbop target anthropologie free people amazon"
@@ -999,7 +978,6 @@ def _store_and_send(
     # wrappers
     text_val = wrap_all_affiliates(text_val)     # adds Amazon ?tag= / SYL redirect
     text_val = normalize_syl_links(text_val)     # legacy sylikes → shopmy.us
-    text_val = _clean_here_phrases(text_val)     # ← you put this here
     text_val = ensure_not_link_ending(text_val)
    
     # Optional debug marker (visible once)
@@ -1154,20 +1132,25 @@ def _store_and_send(
     other_lines = [ln for ln in lines if ln not in link_lines]
 
     if image_mode:
-        # In image mode: keep only the link lines (drop any leftover LLM chatter)
+        # PHOTO MODE: keep only the link lines (drops any stray narration)
         text_val = "\n".join(link_lines).strip()
     else:
-        text_val = "\n".join(link_lines + ([""] if (link_lines and other_lines) else []) + other_lines).strip()
+        # TEXT MODE: links first, then remaining copy
+        text_val = "\n".join(
+            link_lines + ([""] if (link_lines and other_lines) else []) + other_lines
+        ).strip()
 
+    # tidy phrasing now that links are at the top
+    text_val = _clean_here_phrases(text_val)
     text_val = ensure_not_link_ending(text_val)
 
+    # Split into SMS parts (2 × 380 or 360 if that’s your env)
     parts = _segments_for_sms(
-    text_val,
-    per=int(os.getenv("SMS_PER_PART", "380")),   # raise to 380 for more voice
-    max_parts=int(os.getenv("SMS_MAX_PARTS", "2")),
-    prefix_reserve=8,
-)
-
+        text_val,
+        per=int(os.getenv("SMS_PER_PART", "380")),
+        max_parts=int(os.getenv("SMS_MAX_PARTS", "2")),
+        prefix_reserve=8,   # room for "[1/2] "
+    )
     if not parts:
         return
 
