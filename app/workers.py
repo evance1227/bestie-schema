@@ -404,8 +404,11 @@ def _ensure_links_on_bullets(text: str, user_text: str) -> str:
                 elif retailer.lower().startswith("amazon"):
                     url = _amz_search_url(label or (user_text or "best match"))
                 else:
-                    hint = f"{user_text} {retailer}".strip()
-                    url = _syl_search_url(label or (user_text or "best match"), hint)
+                    # Prefer affiliates even if user didn't say "Amazon"
+                    url = _prefer_affiliate_url(label, user_text)
+                    if not url:
+                        hint = f"{user_text} {retailer}".strip()
+                        url = _syl_search_url(label or (user_text or "best match"), hint)
             except Exception:
                 url = ""
 
@@ -431,6 +434,36 @@ def _ensure_links_on_bullets(text: str, user_text: str) -> str:
 
     return "\n".join(out)
 
+# --- Prefer affiliate-friendly links for text bullets (no category rules) ---
+_AFFIL_HINT = "sephora ulta nordstrom revolve shopbop target anthropologie free people amazon"
+
+def _prefer_affiliate_url(label: str, user_text: str) -> str:
+    """
+    Try to return an affiliate-friendly URL for the given label:
+      1) SYL search with an affiliate hint (retailer-agnostic)
+      2) Amazon search
+      3) "" (caller falls back)
+    """
+    label = (label or "").strip()
+    ut = (user_text or "").strip()
+    # 1) SYL first — let SYL pick a supported merchant
+    try:
+        hint = f"{ut} {_AFFIL_HINT}".strip()
+        url = _syl_search_url(label or (ut or "best match"), hint)
+        if url:
+            return url
+    except Exception:
+        pass
+    # 2) Amazon next
+    try:
+        url = _amz_search_url(label or (ut or "best match"))
+        if url:
+            return url
+    except Exception:
+        pass
+    # 3) no suggestion
+    return ""
+
 def _shorten_bullet_labels(text: str, max_len: int = 42) -> str:
     """
     Clamp long labels so two links fit in 2 parts and leave room for voice.
@@ -447,6 +480,31 @@ def _shorten_bullet_labels(text: str, max_len: int = 42) -> str:
         else:
             out.append(ln)
     return "\n".join(out)
+
+# --- Copy tidy: remove dangling "here" phrasings when links are above ---
+_BAD_HERE = (
+    "you can find it here:",
+    "you can find it here",
+    "find it here:",
+    "find it here",
+    "here's the link:",
+    "here is the link:",
+    "here's a link:",
+    "here is a link:",
+)
+
+def _clean_here_phrases(text: str) -> str:
+    t = text or ""
+    low = t.lower()
+    changed = False
+    for p in _BAD_HERE:
+        if p in low:
+            idx = low.find(p)
+            # cut the phrase + any trailing spaces
+            t = t[:idx] + t[idx + len(p):]
+            low = t.lower()
+            changed = True
+    return t.strip()
 
 from urllib.parse import quote_plus
 
@@ -942,8 +1000,8 @@ def _store_and_send(
         _allow_amz = True
         text_val = text_val.replace(_ALLOW_AMZ_SEARCH_TOKEN, "", 1).lstrip()
 
+
     # ==== Final shaping (single body) ====
-# ==== Final shaping (single body) ====
     text_val = _add_personality_if_flat(text_val)
     text_val = _strip_link_placeholders(text_val)
     if not _allow_amz:
@@ -958,7 +1016,11 @@ def _store_and_send(
     # wrappers
     text_val = wrap_all_affiliates(text_val)     # adds Amazon ?tag= / SYL redirect
     text_val = normalize_syl_links(text_val)     # legacy sylikes → shopmy.us
-    text_val = ensure_not_link_ending(text_val)  
+    text_val = _clean_here_phrases(text_val)     # ← you put this here
+    text_val = ensure_not_link_ending(text_val)
+    parts = _segments_for_sms(   # ← SEGMENTATION IS HERE (too early)
+        ...
+    )
 
     # Optional debug marker (visible once)
     DEBUG_MARKER = os.getenv("DEBUG_MARKER", "")
