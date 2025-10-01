@@ -360,6 +360,20 @@ def _extract_label_and_retailer(chunk: str) -> tuple[str, str]:
         return lab, last_line
 
     return lab, ""
+def _is_https_live(url: str) -> bool:
+    """Return True if the URL resolves with 2xx/3xx; False on errors (SSL, 4xx/5xx, timeouts)."""
+    if not url or not (url.startswith("http://") or url.startswith("https://")):
+        return False
+    try:
+        import requests
+        r = requests.head(url, allow_redirects=True, timeout=3)
+        if 200 <= r.status_code < 400:
+            return True
+        # Some sites dislike HEAD; try one GET quickly
+        r2 = requests.get(url, allow_redirects=True, timeout=4)
+        return 200 <= r2.status_code < 400
+    except Exception:
+        return False
 
 def _ensure_links_on_bullets(text: str, user_text: str) -> str:
     """
@@ -388,8 +402,8 @@ def _ensure_links_on_bullets(text: str, user_text: str) -> str:
             j += 1
 
         label, retailer = _extract_label_and_retailer("\n".join(chunk_lines))
-
-        # If the chunk already has a link, upgrade it to an affiliate-friendly URL
+        
+        # If the chunk already has a link, upgrade it to an affiliate-friendly URL and validate
         if any("http://" in cl or "https://" in cl for cl in chunk_lines):
             # 1) pull the first URL we see in the chunk
             orig_url = ""
@@ -399,21 +413,26 @@ def _ensure_links_on_bullets(text: str, user_text: str) -> str:
                     orig_url = m.group(1)
                     break
 
-            # 2) try to upgrade it (SYL first, then Amazon); fall back to the original
+            # 2) try to upgrade it (SYL first, then Amazon); if those fail, keep the brand URL
             alt_url = _prefer_affiliate_url(label, user_text) or orig_url
 
-            # 3) rewrite the first bullet line as "Label — http..."
+            # 3) validate; if unsafe (e.g., SSL/404), fall back to affiliate search
+            if not _is_https_live(alt_url):
+                alt_url = _prefer_affiliate_url(label, user_text) or ""
+
+            # 4) rewrite the first bullet line as "Label — http..." and drop raw link-only lines
             first_line = chunk_lines[0].rstrip()
-            # remove any url/dash that might already be tacked onto the first line
+            # remove any trailing " — http…" that might already be on the first line
             first_line = re.sub(r'\s[—–-]\shttps?://\S+\s*$', '', first_line)
             first_line = re.sub(r'\s[—–-]\s*$', '', first_line)
 
             if alt_url:
                 out.append(f"{first_line} — {alt_url}")
             else:
+                # nothing safe/affiliate found → keep just the label (no bad link)
                 out.append(first_line)
 
-            # 4) copy any remaining non-link lines in the chunk (drop raw link-only lines)
+            # copy any remaining non-link lines in the chunk (drop raw link-only lines)
             for k in range(1, len(chunk_lines)):
                 if ("http://" in chunk_lines[k]) or ("https://" in chunk_lines[k]):
                     continue
