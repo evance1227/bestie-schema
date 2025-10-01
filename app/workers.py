@@ -954,6 +954,7 @@ def _store_and_send(
         
     text_val = (text_val or "").strip()
     if not text_val:
+        logger.warning("[Send] Empty text_val before shaping; aborting")
         return
 
     # ==== Preserve Amazon search links if allow-token is present ====
@@ -1151,8 +1152,12 @@ def _store_and_send(
         max_parts=int(os.getenv("SMS_MAX_PARTS", "2")),
         prefix_reserve=8,   # room for "[1/2] "
     )
+    # Guarantee at least one part; avoid silent return paths
     if not parts:
-        return
+        logger.warning("[Send] No parts produced; sending fallback single part")
+        per = int(os.getenv("SMS_PER_PART", "380"))
+        parts = [ (text_val or "").strip()[:per] ]
+
 
     GHL_WEBHOOK_URL = os.getenv("GHL_OUTBOUND_WEBHOOK_URL")
     delay_ms = int(os.getenv("SMS_PART_DELAY_MS", "1800"))   # 1600–2200 is a good sweet spot
@@ -1172,6 +1177,7 @@ def _store_and_send(
         # send this part
         if GHL_WEBHOOK_URL:
             integrations.send_sms_reply(user_id, full_text)
+        logger.info("[Send] part=%d/%d len=%d", idx, len(parts), len(full_text))
 
         # tiny pause so carriers keep order
         time.sleep(delay_ms / 1000.0)
