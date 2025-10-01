@@ -368,6 +368,7 @@ def _ensure_links_on_bullets(text: str, user_text: str) -> str:
     """
     lines = (text or "").splitlines()
     out: list[str] = []
+    want_amazon = "amazon" in (user_text or "").lower()
 
     i, n = 0, len(lines)
     while i < n:
@@ -397,18 +398,24 @@ def _ensure_links_on_bullets(text: str, user_text: str) -> str:
         url = ""
         if label:
             try:
-                if retailer.lower().startswith("amazon"):
-                    url = _amz_search_url(label)
+                if want_amazon:
+                    # FORCE Amazon search links when the user asked for Amazon
+                    url = _amz_search_url(label or (user_text or "best match"))
+                elif retailer.lower().startswith("amazon"):
+                    url = _amz_search_url(label or (user_text or "best match"))
                 else:
                     hint = f"{user_text} {retailer}".strip()
                     url = _syl_search_url(label or (user_text or "best match"), hint)
             except Exception:
                 url = ""
 
-            # FINAL GUARANTEE: synthesize a generic SYL search if still blank
+            # FINAL GUARANTEE: if still empty, prefer Amazon search when requested; else SYL search
             if not url:
                 try:
-                    url = _syl_search_url(label or (user_text or "best match"), user_text)
+                    if want_amazon:
+                        url = _amz_search_url(label or (user_text or "best match"))
+                    else:
+                        url = _syl_search_url(label or (user_text or "best match"), user_text)
                 except Exception:
                     url = ""
 
@@ -443,9 +450,18 @@ def _shorten_bullet_labels(text: str, max_len: int = 42) -> str:
 
 from urllib.parse import quote_plus
 
-def _amz_search_url(name: str) -> str:
-    q = quote_plus((name or "").strip())
-    return f"https://www.amazon.com/s?k={q}"
+def _amz_search_url(query: str) -> str:
+    """
+    Build a clean Amazon search link (not a dp/ASIN deep link).
+    Example: https://www.amazon.com/s?k=sea+salt+spray&tag=YOURTAG-20
+    """
+    q = quote_plus((query or "").strip())
+    if not q:
+        q = "best match"
+    tag = (os.getenv("AMAZON_ASSOCIATE_TAG") or "").strip()
+    base = f"https://www.amazon.com/s?k={q}"
+    return f"{base}&tag={tag}" if tag else base
+
 
 # --- Retailer search URLs for SYL wrapping -----------------------------------
 _RETAILER_SEARCH = {

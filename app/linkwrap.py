@@ -132,10 +132,18 @@ def _strip_affiliate_params(retailer_url: str) -> str:
         return retailer_url
 
 
-def _amz_search_url(name: str) -> str:
-    base = re.sub(r"[:|–—•\[\]\(\)]+", " ", (name or "").strip())
-    base = re.sub(r"\s{2,}", " ", base).strip()
-    return f"https://www.amazon.com/s?k={quote(base, safe='')}"
+def _amz_search_url(query: str) -> str:
+    """
+    Build a clean Amazon search link (not a dp/ASIN deep link).
+    Example: https://www.amazon.com/s?k=sea+salt+spray&tag=YOURTAG-20
+    """
+    q = quote_plus((query or "").strip())
+    if not q:
+        q = "best match"
+    tag = (os.getenv("AMAZON_ASSOCIATE_TAG") or "").strip()
+    base = f"https://www.amazon.com/s?k={q}"
+    return f"{base}&tag={tag}" if tag else base
+
 
 def _is_denied(url: str) -> bool:
     low = (url or "").lower()
