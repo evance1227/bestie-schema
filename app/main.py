@@ -13,7 +13,7 @@ from loguru import logger
 from sqlalchemy import text as sqltext
 from fastapi import Query
 from app.integrations_serp import lens_products
-
+from app.task_queue import enqueue_generate_reply, q as task_q
 from app import db
 from app.webhooks_gumroad import router as gumroad_router
 

@@ -384,8 +384,9 @@ def _is_affiliate_hostname(host: str) -> bool:
 
 def _ensure_links_on_bullets(text: str, user_text: str) -> str:
     """
-    Convert bullets to 'Label — http...' if they don't already contain a link.
-    Non-Amazon -> SYL; Amazon -> Amazon search. Never prints '— —'.
+    Make every bullet produce 'Label — http...' (never '— —').
+    - If the bullet chunk already has a link: upgrade to affiliate (SYL→Amazon), validate, rewrite first line, drop raw link lines.
+    - If the bullet has no link: build one (Amazon if explicitly asked; else prefer affiliates).
     """
     lines = (text or "").splitlines()
     out: list[str] = []
@@ -394,6 +395,99 @@ def _ensure_links_on_bullets(text: str, user_text: str) -> str:
     i, n = 0, len(lines)
     while i < n:
         ln = lines[i]
+
+        # Not a bullet OR already contains http → copy and advance
+        if ("http://" in ln or "https://" in ln) or not _BULLET_START.match(ln or ""):
+            out.append(ln.rstrip())
+            i += 1
+            continue
+
+        # Collect the bullet "chunk": this bullet line + following non-bullet, non-link lines
+        chunk_lines = [ln]
+        j = i + 1
+        while j < n and lines[j].strip() and not _BULLET_START.match(lines[j]) and ("http://" not in lines[j] and "https://" not in lines[j]):
+            chunk_lines.append(lines[j])
+            j += 1
+
+        label, retailer = _extract_label_and_retailer("\n".join(chunk_lines))
+
+        # CASE A: chunk already has a link → upgrade & validate, then rewrite
+        if any("http://" in cl or "https://" in cl for cl in chunk_lines):
+            # 1) first url in the chunk
+            orig_url = ""
+            for cl in chunk_lines:
+                m = re.search(r"(https?://\S+)", cl)
+                if m:
+                    orig_url = m.group(1)
+                    break
+
+            # 2) affiliate candidate (SYL→Amazon), else keep brand url
+            alt_url = _prefer_affiliate_url(label, user_text) or orig_url
+
+            # 3) if still not affiliate, try again to monetize
+            try:
+                host = urlparse(alt_url).netloc.lower()
+            except Exception:
+                host = ""
+            if not _is_affiliate_hostname(host):
+                improved = _prefer_affiliate_url(label, user_text)
+                if improved:
+                    alt_url = improved
+
+            # 4) validate; if unsafe, fall back to affiliate search again
+            if not _is_https_live(alt_url):
+                fallback = _prefer_affiliate_url(label, user_text)
+                if fallback:
+                    alt_url = fallback
+
+            # 5) rewrite first bullet line and drop raw link-only lines
+            first_line = chunk_lines[0].rstrip()
+            first_line = re.sub(r"\s[—–-]\shttps?://\S+\s*$", "", first_line)  # remove trailing existing link
+            first_line = re.sub(r"\s[—–-]\s*$", "", first_line)
+
+            if alt_url:
+                out.append(f"{first_line} — {alt_url}")
+            else:
+                out.append(first_line)
+
+            for k in range(1, len(chunk_lines)):
+                if ("http://" in chunk_lines[k]) or ("https://" in chunk_lines[k]):
+                    continue
+                out.append(chunk_lines[k].rstrip())
+
+            i = j
+            continue
+
+        # CASE B: no link in the chunk → build one
+        url = ""
+        if label:
+            try:
+                if want_amazon or retailer.lower().startswith("amazon"):
+                    url = _amz_search_url(label or (user_text or "best match"))
+                else:
+                    # prefer affiliates; if none, SYL with retailer hint
+                    url = _prefer_affiliate_url(label, user_text) or _syl_search_url(label or (user_text or "best match"), user_text)
+            except Exception:
+                url = ""
+
+            # FINAL GUARANTEE
+            if not url:
+                try:
+                    url = _syl_search_url(label or (user_text or "best match"), user_text) or _amz_search_url(label or (user_text or "best match"))
+                except Exception:
+                    url = ""
+
+        if url:
+            first_line = chunk_lines[0].rstrip()
+            first_line = re.sub(r"\s[—–-]\s*$", "", first_line)
+            out.append(f"{first_line} — {url}")
+            for k in range(1, len(chunk_lines)):
+                out.append(chunk_lines[k].rstrip())
+        else:
+            out.extend(cl.rstrip() for cl in chunk_lines)
+
+        i = j
+
     return "\n".join(out)
     
 # --- Prefer affiliate-friendly links for text bullets (no category rules) ---
@@ -1133,12 +1227,6 @@ def _store_and_send(
         logger.warning("[Vision] image block error: {}", e)
     # === END IMAGE MATCHES ===
 
-    # Guarantee at least one part; avoid silent drop on edge cases
-    if not parts:
-        logger.warning("[Send] No parts produced; sending fallback single part")
-        per = int(os.getenv("SMS_PER_PART", "380"))
-        parts = [ (text_val or "").strip()[:per] ]
-
     # Final safety: ensure bullets have links, then shorten labels
     text_val = _ensure_links_on_bullets(text_val, user_text or "")
     text_val = _shorten_bullet_labels(text_val)
@@ -1209,7 +1297,7 @@ def _store_and_send(
             _rds.set(dedupe_key, "1", ex=60)
     except Exception:
         pass   
-    
+
     return
 # --------------------------------------------------------------------- #
 # Rename flow
