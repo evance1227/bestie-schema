@@ -1196,8 +1196,7 @@ def _store_and_send(
     except Exception:
         pass
 
-    
-    # send this part
+        # send this part
     logger.info("[Send] part=%d/%d len=%d", idx, len(parts), len(full_text))
     if GHL_WEBHOOK_URL:
         integrations.send_sms_reply(user_id, full_text)
