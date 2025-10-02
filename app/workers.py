@@ -799,8 +799,7 @@ def _wall_trial_expired_message() -> str:
 
 def _ensure_profile_defaults(user_id: int) -> Dict[str, object]:
     """Normalize profile counters and return current entitlement snapshot."""
-    try:
-        # --- your existing code begins (indented once) ---
+    try:       
         with db.session() as s:
             s.execute(sqltext("""
                 UPDATE public.user_profiles
@@ -824,10 +823,6 @@ def _ensure_profile_defaults(user_id: int) -> Dict[str, object]:
         if not row:
             return {"allowed": False, "reason": "pending"}
 
-        # ... keep everything you already have here (reset counters if date rolled, etc.) ...
-        # ... and finally return whatever snapshot/dict you already return ...
-        return snapshot_or_dict_you_return_now
-        # --- your existing code ends ---
     except Exception as e:
         logger.warning("[Gate][DB] defaults skipped (db unavailable): %s", e)
         return {}
