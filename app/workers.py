@@ -830,14 +830,19 @@ def _ensure_profile_defaults(user_id: int) -> Dict[str, object]:
     _, _, plan_status, trial_start, _, _, daily_used, daily_date = row
 
     # reset daily counters if date rolled
+    # reset daily counters if date rolled
     if daily_date != datetime.now(timezone.utc).date():
-        with db.session() as s:
-            s.execute(sqltext("""
-                UPDATE public.user_profiles
-                SET daily_counter_date = CURRENT_DATE, daily_msgs_used = 0
-                WHERE user_id = :u
-            """), {"u": user_id})
-            s.commit()
+        try:
+            with db.session() as s:
+                s.execute(sqltext("""
+                    UPDATE public.user_profiles
+                    SET daily_counter_date = CURRENT_DATE, daily_msgs_used = 0
+                    WHERE user_id = :u
+                """), {"u": user_id})
+                s.commit()
+        except Exception as e:
+            logger.warning("[Gate][DB] counter reset skipped (db unavailable): %s", e)
+
 
     # plan gate
     if ENFORCE_SIGNUP and (not plan_status or plan_status in ("pending", "")):
