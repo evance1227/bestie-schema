@@ -799,17 +799,19 @@ def _wall_trial_expired_message() -> str:
 
 def _ensure_profile_defaults(user_id: int) -> Dict[str, object]:
     """Normalize profile counters and return current entitlement snapshot."""
-    with db.session() as s:
-        s.execute(sqltext("""
-            UPDATE public.user_profiles
-            SET plan_status        = COALESCE(plan_status, 'pending'),
-                daily_counter_date = COALESCE(daily_counter_date, CURRENT_DATE),
-                daily_msgs_used    = COALESCE(daily_msgs_used, 0),
-                trial_msgs_used    = COALESCE(trial_msgs_used, 0),
-                is_quiz_completed  = COALESCE(is_quiz_completed, false)
-            WHERE user_id = :u
-        """), {"u": user_id})
-        s.commit()
+    try:
+        # --- your existing code begins (indented once) ---
+        with db.session() as s:
+            s.execute(sqltext("""
+                UPDATE public.user_profiles
+                SET plan_status = COALESCE(plan_status, 'pending'),
+                    daily_counter_date = COALESCE(daily_counter_date, CURRENT_DATE),
+                    daily_msgs_used    = COALESCE(daily_msgs_used, 0),
+                    trial_msgs_used    = COALESCE(trial_msgs_used, 0),
+                    is_quiz_completed  = COALESCE(is_quiz_completed, false)
+                WHERE user_id = :u
+            """), {"u": user_id})
+            s.commit()
 
         row = s.execute(sqltext("""
             SELECT gumroad_customer_id, gumroad_email, plan_status,
@@ -819,8 +821,16 @@ def _ensure_profile_defaults(user_id: int) -> Dict[str, object]:
             WHERE user_id = :u
         """), {"u": user_id}).first()
 
-    if not row:
-        return {"allowed": False, "reason": "pending"}
+        if not row:
+            return {"allowed": False, "reason": "pending"}
+
+        # ... keep everything you already have here (reset counters if date rolled, etc.) ...
+        # ... and finally return whatever snapshot/dict you already return ...
+        return snapshot_or_dict_you_return_now
+        # --- your existing code ends ---
+    except Exception as e:
+        logger.warning("[Gate][DB] defaults skipped (db unavailable): %s", e)
+        return {}
 
     _, _, plan_status, trial_start, _, _, daily_used, daily_date = row
 
@@ -1123,7 +1133,19 @@ def _store_and_send(
     except Exception as e:
         logger.warning("[Vision] image block error: {}", e)
     # === END IMAGE MATCHES ===
-    
+
+    # --- segmentation debug + hard guard ---
+    try:
+        logger.info("[Send][Seg] parts=%d body_len=%d", len(parts or []), len(text_val or ""))
+    except Exception:
+        pass
+
+    # Guarantee at least one part; avoid silent drop on edge cases
+    if not parts:
+        logger.warning("[Send] No parts produced; sending fallback single part")
+        per = int(os.getenv("SMS_PER_PART", "380"))
+        parts = [ (text_val or "").strip()[:per] ]
+
     # Final safety: ensure bullets have links, then shorten labels
     text_val = _ensure_links_on_bullets(text_val, user_text or "")
     text_val = _shorten_bullet_labels(text_val)
@@ -1153,19 +1175,7 @@ def _store_and_send(
         max_parts=int(os.getenv("SMS_MAX_PARTS", "2")),
         prefix_reserve=8,   # room for "[1/2] "
     )
-
-    # --- segmentation debug + hard guard ---
-    try:
-        logger.info("[Send][Seg] parts=%d body_len=%d", len(parts or []), len(text_val or ""))
-    except Exception:
-        pass
-
-    # Guarantee at least one part; avoid silent drop on edge cases
-    if not parts:
-        logger.warning("[Send] No parts produced; sending fallback single part")
-        per = int(os.getenv("SMS_PER_PART", "380"))
-        parts = [ (text_val or "").strip()[:per] ]
-
+    
     GHL_WEBHOOK_URL = os.getenv("GHL_OUTBOUND_WEBHOOK_URL")
     delay_ms = int(os.getenv("SMS_PART_DELAY_MS", "1800"))   # 1600–2200 is a good sweet spot
     
@@ -1390,7 +1400,11 @@ def generate_reply_job(
 
     # 0) Plan gate ---------------------------------------------------------------
     try:
-        gate_snapshot = _ensure_profile_defaults(user_id)
+        try:
+            gate_snapshot = _ensure_profile_defaults(user_id)
+        except Exception as e:
+            logger.error("[Gate] snapshot/build error: %s", e)
+            gate_snapshot = {}
         logger.info("[Gate] user_id={} -> {}", user_id, gate_snapshot)
 
         # dev bypass (E.164 compare)
