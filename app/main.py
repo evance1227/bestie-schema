@@ -237,7 +237,6 @@ def _auth_ok(req: Request) -> bool:
             return True
     return False
 
-# -------------------- Process & Webhook -------------------- #
 # ================== Process & Webhook ================== #
 def process_incoming(
     message_id: str,
@@ -336,17 +335,18 @@ def process_incoming(
         convo_id = user_id
 
     # ---------- Always enqueue the worker job ----------
-    from app.task_queue import enqueue_generate_reply
+    # Always enqueue the worker job (even if DB write failed)
+    from app.task_queue import enqueue_generate_reply, q as task_q
     try:
-        job = enqueue_generate_reply(q, user_id, convo_id, text, media_urls or [])
+        job = enqueue_generate_reply(task_q, user_id, convo_id, text, (media_urls or []))
         logger.success(
             "[API][Queue] ✅ Enqueued job=%s convo_id=%s user_id=%s text_len=%d",
             getattr(job, "id", "n/a"), convo_id, user_id, len(text or "")
         )
-        return {"ok": True, "job_id": getattr(job, "id", "n/a")}
     except Exception as e:
         logger.error("[API][Queue] ❌ Failed to enqueue job: %s", e)
         return {"ok": True, "error": "process_incoming_failed"}
+
 
 @app.post("/webhook/incoming_message")
 async def incoming_message_any(req: Request):
