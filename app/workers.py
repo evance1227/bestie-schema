@@ -1153,17 +1153,22 @@ def _store_and_send(
         max_parts=int(os.getenv("SMS_MAX_PARTS", "2")),
         prefix_reserve=8,   # room for "[1/2] "
     )
-    # Guarantee at least one part; avoid silent return paths
+
+    # --- segmentation debug + hard guard ---
+    try:
+        logger.info("[Send][Seg] parts=%d body_len=%d", len(parts or []), len(text_val or ""))
+    except Exception:
+        pass
+
+    # Guarantee at least one part; avoid silent drop on edge cases
     if not parts:
         logger.warning("[Send] No parts produced; sending fallback single part")
         per = int(os.getenv("SMS_PER_PART", "380"))
         parts = [ (text_val or "").strip()[:per] ]
 
-
     GHL_WEBHOOK_URL = os.getenv("GHL_OUTBOUND_WEBHOOK_URL")
     delay_ms = int(os.getenv("SMS_PART_DELAY_MS", "1800"))   # 1600–2200 is a good sweet spot
-    time.sleep(delay_ms / 1000.0)
-
+    
     for idx, part in enumerate(parts, 1):
         prefix = f"[{idx}/{len(parts)}] " if len(parts) > 1 else ""
         full_text = prefix + part
@@ -1176,21 +1181,32 @@ def _store_and_send(
         logger.info("[Worker][DB] Outbound stored: convo_id=%s user_id=%s msg_id=%s", convo_id, user_id, message_id)
 
         # send this part
+        logger.info("[Send] part=%d/%d len=%d", idx, len(parts), len(full_text))
         if GHL_WEBHOOK_URL:
             integrations.send_sms_reply(user_id, full_text)
-        logger.info("[Send] part=%d/%d len=%d", idx, len(parts), len(full_text))
 
         # tiny pause so carriers keep order
         time.sleep(delay_ms / 1000.0)
-        
+    # ← loop ends here (dedent)
+
+    # mark this exact body as sent (for 60s) NOW that we succeeded
     try:
         if _rds and dedupe_key:
             _rds.set(dedupe_key, "1", ex=60)
     except Exception:
         pass
 
+    
+    # send this part
+    logger.info("[Send] part=%d/%d len=%d", idx, len(parts), len(full_text))
+    if GHL_WEBHOOK_URL:
+        integrations.send_sms_reply(user_id, full_text)
+
+    # tiny pause so carriers keep order
+    time.sleep(delay_ms / 1000.0)
+
     return
-# ---------------------------------------------------------------------- #
+# --------------------------------------------------------------------- #
 # Rename flow
 #---------------------------------------------------------------------- #
 RENAME_PATTERNS = [
