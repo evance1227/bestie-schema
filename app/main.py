@@ -238,26 +238,114 @@ def _auth_ok(req: Request) -> bool:
     return False
 
 # -------------------- Process & Webhook -------------------- #
-def process_incoming(message_id: str, user_phone: str, text_val: str, raw_body: dict,
-                     media_urls: Optional[List[str]] = None):
-    """DB insert + enqueue; no recursion, no background task."""
+# ================== Process & Webhook ================== #
+def process_incoming(
+    message_id: str,
+    user_phone: str,
+    text_val: str,
+    raw_body: dict,
+    media_urls: Optional[List[str]] = None,
+) -> dict:
+    """
+    DB insert + enqueue; no recursion. Always enqueues a worker job even if DB is down.
+    """
+    msg_id = raw_body.get("customData", {}).get("message_id") or message_id
+    phone  = user_phone
+    text   = text_val or (raw_body.get("customData", {}).get("text") or "")
+    logger.info("[API][Process] Starting DB insert for msg_id=%s phone=%s text=%s", msg_id, phone, text)
+
+    user_id: Optional[int] = None
+    convo_id: Optional[int] = None
+
+    # ---------- DB write / lookup (tolerant) ----------
     try:
-        logger.info("[API][Process] Starting DB insert for msg_id={} phone={} text={}",
-                    message_id, user_phone, text_val)
+        from sqlalchemy import text as sqltext
 
         with db.session() as s:
-            user = models.get_or_create_user_by_phone(s, user_phone)
-            convo = models.get_or_create_conversation(s, user.id)
-            models.insert_message(s, convo.id, "in", message_id, text_val)
+            # 1) store inbound message
+            s.execute(sqltext("""
+                INSERT INTO inbound_messages (message_id, user_phone, text, created_at)
+                VALUES (:mid, :phone, :txt, NOW())
+                ON CONFLICT (message_id) DO NOTHING
+            """), {"mid": msg_id, "phone": phone, "txt": text})
             s.commit()
-            logger.info("[API][Process] 💾 Stored inbound: convo_id={} user_id={}", convo.id, user.id)
 
-        job = enqueue_generate_reply(convo.id, user.id, text_val, user_phone=user_phone, media_urls=media_urls)
-        logger.success("[API][Queue] ✅ Enqueued job={} convo_id={} user_id={} text={}",
-                       getattr(job, "id", "n/a"), convo.id, user.id, text_val)
-        return {"ok": True, "job_id": getattr(job, "id", None), "convo_id": convo.id, "user_id": user.id}
+            # 2) look up (or create) the user by phone so we get stable ids
+            row = s.execute(sqltext("""
+                SELECT id
+                FROM users
+                WHERE phone = :phone
+                LIMIT 1
+            """), {"phone": phone}).first()
+
+            if row:
+                user_id = int(row[0])
+            else:
+                # create a lightweight user if not present
+                s.execute(sqltext("""
+                    INSERT INTO users (phone, created_at)
+                    VALUES (:phone, NOW())
+                    ON CONFLICT (phone) DO NOTHING
+                """), {"phone": phone})
+                s.commit()
+                row2 = s.execute(sqltext("""
+                    SELECT id FROM users WHERE phone = :phone LIMIT 1
+                """), {"phone": phone}).first()
+                if row2:
+                    user_id = int(row2[0])
+
+            # 3) find or create a conversation for this user
+            if user_id is not None:
+                row3 = s.execute(sqltext("""
+                    SELECT id
+                    FROM conversations
+                    WHERE user_id = :uid
+                    ORDER BY created_at DESC
+                    LIMIT 1
+                """), {"uid": user_id}).first()
+                if row3:
+                    convo_id = int(row3[0])
+                else:
+                    s.execute(sqltext("""
+                        INSERT INTO conversations (user_id, created_at)
+                        VALUES (:uid, NOW())
+                    """), {"uid": user_id})
+                    s.commit()
+                    row4 = s.execute(sqltext("""
+                        SELECT id FROM conversations
+                        WHERE user_id = :uid
+                        ORDER BY created_at DESC
+                        LIMIT 1
+                    """), {"uid": user_id}).first()
+                    if row4:
+                        convo_id = int(row4[0])
+
+        logger.info("[API][Process] 💾 Stored inbound: convo_id=%s user_id=%s", convo_id, user_id)
+
     except Exception as e:
-        logger.exception("💥 [API][Process] Exception: {}", e)
+        # DB unavailable → still send SMS using fallback ids
+        logger.warning("[API][Process] DB unavailable; skipping store and using fallback ids: %s", e)
+        fallback = int(os.getenv("DEV_USER_ID", "6"))
+        user_id  = user_id  or fallback
+        convo_id = convo_id or fallback
+
+    # If everything somehow is still None, choose deterministic fallbacks
+    if user_id is None:
+        user_id = int(os.getenv("DEV_USER_ID", "6"))
+    if convo_id is None:
+        convo_id = user_id
+
+    # ---------- Always enqueue the worker job ----------
+    from app.task_queue import enqueue_generate_reply
+    try:
+        job = enqueue_generate_reply(q, user_id, convo_id, text, media_urls or [])
+        logger.success(
+            "[API][Queue] ✅ Enqueued job=%s convo_id=%s user_id=%s text_len=%d",
+            getattr(job, "id", "n/a"), convo_id, user_id, len(text or "")
+        )
+        return {"ok": True, "job_id": getattr(job, "id", "n/a")}
+    except Exception as e:
+        logger.error("[API][Queue] ❌ Failed to enqueue job: %s", e)
         return {"ok": True, "error": "process_incoming_failed"}
 
 @app.post("/webhook/incoming_message")
