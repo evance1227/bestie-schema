@@ -346,6 +346,7 @@ def process_incoming(
             text_val=text,
             user_phone=phone,
             media_urls=(media_urls or []),
+            msg_id=msg_id,                       # ← NEW
         )
         logger.success(
             "[API][Queue] ✅ Enqueued job=%s convo_id=%s user_id=%s text_len=%d",
@@ -354,7 +355,6 @@ def process_incoming(
     except Exception as e:
         logger.exception("[API][Queue] ❌ Failed to enqueue job")
         return {"ok": True, "error": "process_incoming_failed"}
-
 
 @app.post("/webhook/incoming_message")
 async def incoming_message_any(req: Request):

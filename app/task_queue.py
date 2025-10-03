@@ -63,16 +63,19 @@ def _should_skip_enqueue(key: str) -> bool:
         return True
     except Exception:
         return False
-
+    
 # ---------- Public API ----------
 def enqueue_generate_reply(
+    q,
     convo_id: int,
     user_id: int,
     text_val: str,
     user_phone: Optional[str] = None,
     media_urls: Optional[List[str]] = None,
+    msg_id: Optional[str] = None,          # ← NEW
 ):
-    key = _enqueue_key(convo_id, user_id, text_val, user_phone)
+
+    key = msg_id or _enqueue_key(convo_id, user_id, text_val, user_phone)
     logging.info("[Queue] enqueue key=%s", key)
 
     if _should_skip_enqueue(key):
@@ -84,15 +87,16 @@ def enqueue_generate_reply(
         getattr(q, "name", "bestie_queue"), user_id, convo_id, len(media_urls or []),
     )
     job = q.enqueue(
-        workers.generate_reply_job,
-        convo_id,
-        user_id,
-        text_val,
-        user_phone=user_phone,
-        media_urls=media_urls,
-        job_timeout=JOB_TIMEOUT_SEC,
-        result_ttl=RESULT_TTL_SEC,
+    "app.workers.generate_reply_job",          
+    args=(user_id, convo_id, text_val),        
+    kwargs={
+        "media_urls": (media_urls or []),
+        "user_phone": user_phone,
+    },
+    job_timeout=JOB_TIMEOUT_SEC,
+    result_ttl=RESULT_TTL_SEC,
     )
+
 
     return job
 
