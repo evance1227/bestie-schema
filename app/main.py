@@ -338,24 +338,22 @@ def process_incoming(
     # Always enqueue the worker job (even if DB write failed)
  
     from app.task_queue import enqueue_generate_reply
-    from rq import Queue
-    from redis import Redis
 
     try:
-        # Build a fresh Queue here so we never depend on a missing module-level q
-        _conn = Redis.from_url(os.getenv("REDIS_URL"))
-        _queue = Queue(os.getenv("QUEUE_NAME", "bestie_queue"), connection=_conn)
-
-        job = enqueue_generate_reply(_queue, user_id, convo_id, text, (media_urls or []))
+        job = enqueue_generate_reply(
+            convo_id=convo_id,
+            user_id=user_id,
+            text_val=text,
+            user_phone=phone,
+            media_urls=(media_urls or []),
+        )
         logger.success(
             "[API][Queue] ✅ Enqueued job=%s convo_id=%s user_id=%s text_len=%d",
             getattr(job, "id", "n/a"), convo_id, user_id, len(text or "")
         )
     except Exception as e:
-        # print full stack so we see the real reason instead of a literal "%s"
         logger.exception("[API][Queue] ❌ Failed to enqueue job")
         return {"ok": True, "error": "process_incoming_failed"}
-
 
 
 @app.post("/webhook/incoming_message")
