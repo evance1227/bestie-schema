@@ -463,12 +463,23 @@ def _ensure_links_on_bullets(text: str, user_text: str) -> str:
         if label:
             try:
                 if want_amazon or retailer.lower().startswith("amazon"):
-                    url = _amz_search_url(label or (user_text or "best match"))
+                    # 1) try a conservative deep link first
+                    url = _amz_deep_link_if_obvious(label)
+                    # 2) if no deep link or not live, fall back to search
+                    if not url:
+                        url = _amz_search_url(label or (user_text or "best match"))
                 else:
-                    # prefer affiliates; if none, SYL with retailer hint
                     url = _prefer_affiliate_url(label, user_text) or _syl_search_url(label or (user_text or "best match"), user_text)
             except Exception:
                 url = ""
+
+    # FINAL GUARANTEE
+    if not url:
+        try:
+            url = _syl_search_url(label or (user_text or "best match"), user_text) or _amz_search_url(label or (user_text or "best match"))
+        except Exception:
+            url = ""
+
 
             # FINAL GUARANTEE
             if not url:
@@ -519,6 +530,33 @@ def _prefer_affiliate_url(label: str, user_text: str) -> str:
         pass
     # 3) no suggestion
     return ""
+
+def _amz_deep_link_if_obvious(label: str) -> str:
+    """
+    Try to form a known-good Amazon product deep link for very obvious labels.
+    Only return a URL if it resolves live; otherwise return "".
+    Keep this list tiny & conservative.
+    """
+    try:
+        s = (label or "").lower()
+        tag = (os.getenv("AMAZON_ASSOCIATE_TAG") or "").strip()
+
+        # Example ASINs — include only ones you're comfortable with
+        if "supergoop" in s and "scalp" in s and ("50" in s or "spf" in s):
+            url = "https://www.amazon.com/dp/B07NC1QF5M"  # Supergoop! Poof (example)
+            if tag:
+                url = f"{url}?tag={tag}"
+            return url if _is_https_live(url) else ""
+
+        if "neutrogena" in s and ("cool dry sport" in s or "sport scalp" in s):
+            url = "https://www.amazon.com/dp/B00NR1YQ1O"  # Neutrogena Sport (example)
+            if tag:
+                url = f"{url}?tag={tag}"
+            return url if _is_https_live(url) else ""
+
+        return ""
+    except Exception:
+        return ""
 
 def _shorten_bullet_labels(text: str, max_len: int = 42) -> str:
     """
