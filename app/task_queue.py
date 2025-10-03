@@ -66,15 +66,14 @@ def _should_skip_enqueue(key: str) -> bool:
     
 # ---------- Public API ----------
 def enqueue_generate_reply(
-    q,
+    q,                                  # ← expects a Queue instance
     convo_id: int,
     user_id: int,
     text_val: str,
     user_phone: Optional[str] = None,
     media_urls: Optional[List[str]] = None,
-    msg_id: Optional[str] = None,          # ← NEW
+    msg_id: Optional[str] = None,
 ):
-
     key = msg_id or _enqueue_key(convo_id, user_id, text_val, user_phone)
     logging.info("[Queue] enqueue key=%s", key)
 
@@ -84,21 +83,22 @@ def enqueue_generate_reply(
 
     logging.info(
         "[Queue] enqueue_generate_reply → q=%s user_id=%s convo_id=%s media_cnt=%d",
-        getattr(q, "name", "bestie_queue"), user_id, convo_id, len(media_urls or []),
+        getattr(q, "name", "bestie_queue"), user_id, convo_id, len(media_urls or [])
     )
+
+    # IMPORTANT: string task path + primitive args → RQ can pickle
     job = q.enqueue(
-    "app.workers.generate_reply_job",          
-    args=(user_id, convo_id, text_val),        
-    kwargs={
-        "media_urls": (media_urls or []),
-        "user_phone": user_phone,
-    },
-    job_timeout=JOB_TIMEOUT_SEC,
-    result_ttl=RESULT_TTL_SEC,
+        "app.workers.generate_reply_job",
+        args=(user_id, convo_id, text_val),
+        kwargs={
+            "media_urls": (media_urls or []),
+            "user_phone": user_phone,
+        },
+        job_timeout=JOB_TIMEOUT_SEC,
+        result_ttl=RESULT_TTL_SEC,
     )
-
-
     return job
+
 
 def enqueue_wrap_link(convo_id: int, raw_url: str, campaign: str = "default"):
     """

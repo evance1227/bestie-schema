@@ -335,18 +335,23 @@ def process_incoming(
         convo_id = user_id
 
     # ---------- Always enqueue the worker job ----------
-    # Always enqueue the worker job (even if DB write failed)
- 
+    from redis import Redis
+    from rq import Queue
     from app.task_queue import enqueue_generate_reply
 
     try:
+        # Build a Queue here; do not pass this Queue into job args, only to the helper.
+        _conn  = Redis.from_url(os.getenv("REDIS_URL"))
+        _queue = Queue(os.getenv("QUEUE_NAME", "bestie_queue"), connection=_conn)
+
         job = enqueue_generate_reply(
+            _queue,                           # ← first positional arg
             convo_id=convo_id,
             user_id=user_id,
             text_val=text,
             user_phone=phone,
             media_urls=(media_urls or []),
-            msg_id=msg_id,                       # ← NEW
+            msg_id=msg_id,                    # ← use webhook message id for dedupe
         )
         logger.success(
             "[API][Queue] ✅ Enqueued job=%s convo_id=%s user_id=%s text_len=%d",
@@ -355,6 +360,7 @@ def process_incoming(
     except Exception as e:
         logger.exception("[API][Queue] ❌ Failed to enqueue job")
         return {"ok": True, "error": "process_incoming_failed"}
+
 
 @app.post("/webhook/incoming_message")
 async def incoming_message_any(req: Request):
