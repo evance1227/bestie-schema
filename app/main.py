@@ -252,6 +252,19 @@ def process_incoming(
     phone  = user_phone
     text   = text_val or (raw_body.get("customData", {}).get("text") or "")
     logger.info("[API][Process] Starting DB insert for msg_id=%s phone=%s text=%s", msg_id, phone, text)
+    # Collect image/media URLs from the webhook payload
+    media_urls: list[str] = []
+    cd = body.get("customData", {}) if isinstance(body, dict) else {}
+    for k in (
+        "message.attachments[0].url",  # first attachment from GHL
+        "customData.media[0]",
+        "maybe_media_1",
+        "maybe_media_2",
+        "maybe_media_3",
+    ):
+        u = cd.get(k)
+        if u:
+            media_urls.append(u)
 
     user_id: Optional[int] = None
     convo_id: Optional[int] = None
