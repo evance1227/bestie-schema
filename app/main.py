@@ -252,7 +252,7 @@ def process_incoming(
     phone  = user_phone
     text   = text_val or (raw_body.get("customData", {}).get("text") or "")
     logger.info("[API][Process] Starting DB insert for msg_id=%s phone=%s text=%s", msg_id, phone, text)
-    # Collect image/media URLs from the webhook payload
+ 
     # Collect image/media URLs from the webhook payload (augment any provided)
     media_urls = list(media_urls or [])
     cd = raw_body.get("customData", {}) if isinstance(raw_body, dict) else {}
@@ -275,14 +275,20 @@ def process_incoming(
     try:
         from sqlalchemy import text as sqltext
 
-        with db.session() as s:
-            # 1) store inbound message
-            s.execute(sqltext("""
-                INSERT INTO inbound_messages (message_id, user_phone, text, created_at)
-                VALUES (:mid, :phone, :txt, NOW())
-                ON CONFLICT (message_id) DO NOTHING
-            """), {"mid": msg_id, "phone": phone, "txt": text})
-            s.commit()
+        try:
+            with db.session() as s:
+                models.insert_message(s, convo_id, "out", message_id, full_text)
+                s.commit()
+            logger.info(
+                "[Worker][DB] Outbound stored: convo_id=%s user_id=%s msg_id=%s",
+                convo_id, user_id, message_id
+            )
+        except Exception as e:
+            # Don’t block sending if the DB is down
+            logger.warning(
+                "[Worker][DB] Outbound store FAILED (db unavailable): %s",
+                e
+            )
 
             # 2) look up (or create) the user by phone so we get stable ids
             row = s.execute(sqltext("""

@@ -118,8 +118,9 @@ _URL_WORD_RE = re.compile(r"\bURL\b[: ]?", re.I)
 
 def _strip_link_placeholders(text: str) -> str:
     try:
-        t = _LINK_PLACEHOLDER_RE.sub("", text or "")
+        t = _LINK_PLACEHOLDER_RE.sub("", text or "")        
         t = _URL_WORD_RE.sub("", t)
+
         return t
     except Exception:
         return text
@@ -1311,17 +1312,20 @@ def _store_and_send(
         message_id = str(uuid.uuid4())
 
         # DB store each part
-        with db.session() as s:
-            models.insert_message(s, convo_id, "out", message_id, full_text)
-            s.commit()
-        logger.info("[Worker][DB] Outbound stored: convo_id=%s user_id=%s msg_id=%s", convo_id, user_id, message_id)
-
-        # send this part
-        logger.info("[Send] part=%d/%d len=%d", idx, len(parts), len(full_text))
         try:
-            integrations.send_sms_reply(user_id, full_text)   # no env guard
+            with db.session() as s:
+                models.insert_message(s, convo_id, "out", message_id, full_text)
+                s.commit()
+            logger.info(
+                "[Worker][DB] Outbound stored: convo_id=%s user_id=%s msg_id=%s",
+                convo_id, user_id, message_id
+            )
         except Exception as e:
-            logger.error("[Send][Error] part=%d/%d err=%s", idx, len(parts), e)
+            # Don’t block sending if the DB is down
+            logger.warning(
+                "[Worker][DB] Outbound store FAILED (db unavailable): %s",
+        e
+    )
 
         # tiny pause so carriers keep order
         time.sleep(delay_ms / 1000.0)
@@ -1450,6 +1454,21 @@ _GREETING_RE = re.compile(r"^\s*(hi|hey|hello|yo|hiya|sup|good (morning|afternoo
 
 def _is_greeting(text: str) -> bool:
     return bool(_GREETING_RE.match(text or ""))
+
+# --- simple shopping intent detector (retailer-agnostic) ---
+import re
+
+_SHOP_INTENT_RE = re.compile(
+    r"(?i)\b("
+    r"find this|where to buy|send.*link|buy.*(this|one)|"
+    r"need.*(link|options|picks)|recommend.*(dress|shoes|top|hat|sunscreen|serum|oil)|"
+    r"link.*please|can you link|shoot me the link|size\s?(xs|s|m|l|xl)"
+    r")\b"
+)
+
+def _has_shop_intent(text: str) -> bool:
+    return bool(_SHOP_INTENT_RE.search(text or ""))
+
 # --- Product-intent detector ---------------------------------------------------
 _PRODUCT_INTENT_RE = re.compile(
     r"(?i)\b("
@@ -1745,17 +1764,25 @@ def generate_reply_job(
         reply = "Babe, I glitched. Say it again and I’ll do better. 💅"
 
     logger.info("[FINISH] sending reply len=%d", len(reply or ""))
+
+    image_mode = bool(media_urls)
+
     # Only convert to shoppable bullets when it makes sense
     if (
-        image_mode                           # image present (and meant for picks)
-        or _has_shop_intent(user_text)       # user asked for link/options/buy
-        or _has_shop_intent(reply)           # model itself promised links/picks
-        or (_ALLOW_AMZ_SEARCH_TOKEN in (text_val or ""))  # your existing allow token
+        image_mode                               # image present (meant for picks)
+        or _has_shop_intent(user_text)           # user asked for link/options/buy
+        or _has_shop_intent(reply)               # model itself promised picks/links
+        or (_ALLOW_AMZ_SEARCH_TOKEN in (text_val or ""))  # your allow token
     ):
-        reply = _shorten_bullet_labels(_ensure_links_on_bullets(reply, user_text))
-    # else: leave reply purely conversational
+        reply = _shorten_bullet_labels(
+            _ensure_links_on_bullets(reply, user_text)
+        )
 
-    _store_and_send(user_id, convo_id, reply, user_phone, user_text=user_text, media_urls=media_urls)
+    # else: leave reply purely conversational
+    _store_and_send(
+        user_id, convo_id, reply, user_phone,
+        user_text=user_text, media_urls=media_urls
+    )
     return
 
 def _looks_live_and_same_host(url: str, expect_host: str) -> bool:
