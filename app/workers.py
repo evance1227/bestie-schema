@@ -1745,7 +1745,16 @@ def generate_reply_job(
         reply = "Babe, I glitched. Say it again and I’ll do better. 💅"
 
     logger.info("[FINISH] sending reply len=%d", len(reply or ""))
-    reply = _shorten_bullet_labels(_ensure_links_on_bullets(reply, user_text))
+    # Only convert to shoppable bullets when it makes sense
+    if (
+        image_mode                           # image present (and meant for picks)
+        or _has_shop_intent(user_text)       # user asked for link/options/buy
+        or _has_shop_intent(reply)           # model itself promised links/picks
+        or (_ALLOW_AMZ_SEARCH_TOKEN in (text_val or ""))  # your existing allow token
+    ):
+        reply = _shorten_bullet_labels(_ensure_links_on_bullets(reply, user_text))
+    # else: leave reply purely conversational
+
     _store_and_send(user_id, convo_id, reply, user_phone, user_text=user_text, media_urls=media_urls)
     return
 
