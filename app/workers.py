@@ -459,13 +459,14 @@ def _ensure_links_on_bullets(text: str, user_text: str) -> str:
             continue
 
         # CASE B: no link in the chunk → build one
-        url = ""
+        
+        url = ""       # ensure url is always defined in this branch
+
         if label:
             try:
                 if want_amazon or retailer.lower().startswith("amazon"):
-                    # 1) try a conservative deep link first
+                    # optional deep link if you added it
                     url = _amz_deep_link_if_obvious(label)
-                    # 2) if no deep link or not live, fall back to search
                     if not url:
                         url = _amz_search_url(label or (user_text or "best match"))
                 else:
@@ -473,20 +474,12 @@ def _ensure_links_on_bullets(text: str, user_text: str) -> str:
             except Exception:
                 url = ""
 
-    # FINAL GUARANTEE
-    if not url:
-        try:
-            url = _syl_search_url(label or (user_text or "best match"), user_text) or _amz_search_url(label or (user_text or "best match"))
-        except Exception:
-            url = ""
-
-
-            # FINAL GUARANTEE
-            if not url:
-                try:
-                    url = _syl_search_url(label or (user_text or "best match"), user_text) or _amz_search_url(label or (user_text or "best match"))
-                except Exception:
-                    url = ""
+        # FINAL GUARANTEE (this is where "if not url" was blowing up)
+        if not url:
+            try:
+                url = _syl_search_url(label or (user_text or "best match"), user_text) or _amz_search_url(label or (user_text or "best match"))
+            except Exception:
+                url = ""
 
         if url:
             first_line = chunk_lines[0].rstrip()
@@ -1092,7 +1085,7 @@ def _store_and_send(
     except Exception:
         dedupe_key = None
 
-    image_mode = False
+    image_mode = bool(media_urls)
         
     text_val = (text_val or "").strip()
     if not text_val:
