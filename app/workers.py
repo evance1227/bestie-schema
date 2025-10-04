@@ -1088,9 +1088,13 @@ def _store_and_send(
     image_mode = bool(media_urls)
         
     text_val = (text_val or "").strip()
-    if not text_val:
-        logger.warning("[Send] Empty text_val before shaping; aborting")
+
+    # Allow image-only messages: only abort when there's no text AND no media.
+    if not text_val and not media_urls:
+        logger.warning("[Send] Empty text_val and no media; aborting")
         return
+    # else: continue — lens block will add picks for images
+
 
     # ==== Preserve Amazon search links if allow-token is present ====
     _allow_amz = False
