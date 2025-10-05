@@ -1302,32 +1302,36 @@ def _store_and_send(
 
     if not parts:
         logger.warning("[Send] No parts produced; sending fallback single part")
-        per = int(os.getenv("SMS_PER_PART", "380"))
-        parts = [ (text_val or "").strip()[:per] ]
 
-    GHL_WEBHOOK_URL = os.getenv("GHL_OUTBOUND_WEBHOOK_URL")
-    delay_ms = int(os.getenv("SMS_PART_DELAY_MS", "1800"))   # 1600–2200 is a good sweet spot
-    
-    for idx, part in enumerate(parts, 1):
-        prefix = f"[{idx}/{len(parts)}] " if len(parts) > 1 else ""
-        full_text = prefix + part
+        # conversational fallback body (stay warm & friendly)
+        full_text = (text_val or "").strip()
+        if not full_text:
+            full_text = (
+                "I’m seeing the vibe 💫 Want exact matches or close twins? "
+                "Tell me budget + fit + any must-haves and I’ll curate tight. ✨"
+            )
+
         message_id = str(uuid.uuid4())
-        
-        # DB store each part (tolerant)
-        # DB store each part (tolerant — never block the send)
+
+        # DB store is tolerant — never block the send
         try:
             with db.session() as s:
                 models.insert_message(s, convo_id, "out", message_id, full_text)
                 s.commit()
-            logger.info("[Worker][DB] Outbound stored: convo_id=%s user_id=%s msg_id=%s",
-                        convo_id, user_id, message_id)
+            logger.info(
+                "[Worker][DB] Outbound stored: convo_id=%s user_id=%s msg_id=%s",
+                convo_id, user_id, message_id,
+            )
         except Exception as e:
             logger.warning("[Worker][DB] Outbound store FAILED (db unavailable): %s", e)
 
+        # actually SEND the SMS
+        try:
+            integrations.send_sms_reply(user_id, full_text)
+        except Exception as e:
+            logger.error("[Send][Error] fallback err=%s", e)
 
-
-        # tiny pause so carriers keep order
-        time.sleep(delay_ms / 1000.0)
+        return
 
     # mark this exact body as sent (for 60s) NOW that we succeeded
     try:
