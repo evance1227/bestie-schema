@@ -1087,15 +1087,20 @@ def _store_and_send(
         dedupe_key = None
 
     image_mode = bool(media_urls)
-        
+
     text_val = (text_val or "").strip()
+    if not text_val:
+        if image_mode:
+            # Friendly conversational fallback so image-only never silently drops
+            text_val = (
+                "Got your pic! Want me to find exact matches or similar options? "
+                "Tell me brand, vibe, and size and I’ll scout. ✨"
+            )
+        else:
+            logger.warning("[Send] Empty text_val and no media; aborting")
+            return
 
-    # Allow image-only messages: only abort when there's no text AND no media.
-    if not text_val and not media_urls:
-        logger.warning("[Send] Empty text_val and no media; aborting")
-        return
     # else: continue — lens block will add picks for images
-
 
     # ==== Preserve Amazon search links if allow-token is present ====
     _allow_amz = False
