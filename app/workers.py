@@ -1310,22 +1310,15 @@ def _store_and_send(
         prefix = f"[{idx}/{len(parts)}] " if len(parts) > 1 else ""
         full_text = prefix + part
         message_id = str(uuid.uuid4())
-
-        # DB store each part
+        
+        # DB store each part (tolerant)
         try:
             with db.session() as s:
                 models.insert_message(s, convo_id, "out", message_id, full_text)
                 s.commit()
-            logger.info(
-                "[Worker][DB] Outbound stored: convo_id=%s user_id=%s msg_id=%s",
-                convo_id, user_id, message_id
-            )
         except Exception as e:
-            # Don’t block sending if the DB is down
-            logger.warning(
-                "[Worker][DB] Outbound store FAILED (db unavailable): %s",
-        e
-    )
+            logger.warning("[Worker][DB] Outbound store FAILED (db unavailable): %s", e)
+
 
         # tiny pause so carriers keep order
         time.sleep(delay_ms / 1000.0)
