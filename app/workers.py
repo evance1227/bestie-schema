@@ -1090,15 +1090,12 @@ def _store_and_send(
 
     text_val = (text_val or "").strip()
     if not text_val:
-        if image_mode:
-            # Friendly conversational fallback so image-only never silently drops
-            text_val = (
-                "Got your pic! Want me to find exact matches or similar options? "
-                "Tell me brand, vibe, and size and I’ll scout. ✨"
-            )
+        if bool(media_urls):
+            text_val = _image_probe(user_text)     # add this helper once, see below
         else:
             logger.warning("[Send] Empty text_val and no media; aborting")
             return
+
 
     # else: continue — lens block will add picks for images
 
@@ -1317,12 +1314,16 @@ def _store_and_send(
         message_id = str(uuid.uuid4())
         
         # DB store each part (tolerant)
+        # DB store each part (tolerant — never block the send)
         try:
             with db.session() as s:
                 models.insert_message(s, convo_id, "out", message_id, full_text)
                 s.commit()
+            logger.info("[Worker][DB] Outbound stored: convo_id=%s user_id=%s msg_id=%s",
+                        convo_id, user_id, message_id)
         except Exception as e:
             logger.warning("[Worker][DB] Outbound store FAILED (db unavailable): %s", e)
+
 
 
         # tiny pause so carriers keep order
@@ -1452,6 +1453,38 @@ _GREETING_RE = re.compile(r"^\s*(hi|hey|hello|yo|hiya|sup|good (morning|afternoo
 
 def _is_greeting(text: str) -> bool:
     return bool(_GREETING_RE.match(text or ""))
+
+# --- conversational probe for image-only messages (relationship-first) ---
+def _image_probe(user_text: str) -> str:
+    """
+    Friendly, curious prompt that works for both fashion and beauty
+    without assuming a product ask. Keeps the convo human-first.
+    """
+    t = (user_text or "").lower()
+    # Lightweight heuristic: if the last text hints beauty/hair/skin words,
+    # nudge with a beauty-flavored probe; otherwise use a fashion/general probe.
+    beauty_words = (
+        "skin", "spf", "sunscreen", "serum", "retinol", "cleanser", "mask",
+        "foundation", "concealer", "lip", "blush", "mascara", "hair", "shampoo",
+        "conditioner", "toner", "oil", "scalp"
+    )
+    if any(w in t for w in beauty_words):
+        return (
+            "Okay, I see the vibe. 💫 Want me to match this exactly or find a few dupes? "
+            "Tell me your price comfort, any ingredients to avoid, and your finish goals "
+            "(glowy/matte/natural). I’ll whip up a set you’ll actually love. ✨"
+            "I’m into this. Want exact product or dupes? Drop your budget, skin goals "
+            "(glowy/matte/natural), and any ingredients you dodge, and I’ll shortlist winners. ✨"
+        )
+
+    # Fashion/general probe
+    return (
+        "Love this vibe. Want me to hunt the exact piece or close twins? "
+        "Give me size/fit, color flex, budget window, and any brands you ride for (or avoid). "
+        "I’ll curate fast and keep it tight. ✨"
+        "Obsessed. Should I find this exact piece or a couple killer dupes? "
+        "Tell me size/fit, color flex, budget, and fave brands. I’ll serve options. ✨"
+    )
 
 # --- simple shopping intent detector (retailer-agnostic) ---
 import re
