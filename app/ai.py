@@ -475,8 +475,7 @@ def generate_reply(
         user_text=user_text,
         session_goal=session_goal,
         product_candidates=product_candidates,
-        context=context,
-        session_goal=session_goal,
+        context=context,   
     )
 
     # --- Best-first shopping guidance (no surveys; allow links when asked) -------

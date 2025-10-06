@@ -1700,8 +1700,7 @@ def generate_reply_job(
             context={
                 "has_completed_quiz": has_quiz,
                 "media_urls": media_urls or [],
-            },
-            session_goal=goal,      # <-- NEW
+            },        
         )
 
 
