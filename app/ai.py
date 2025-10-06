@@ -394,6 +394,7 @@ def build_messages(
     recent: Optional[List[Dict]] = None,
     persona: Optional[str] = None,
     context: Optional[Dict] = None,
+    session_goal: str | None = None,
 ) -> List[Dict]:
     persona = persona or compose_persona(user_id, session_goal=session_goal)
     recent = recent or _load_recent_turns(user_id, limit=12)
@@ -424,6 +425,7 @@ def generate_reply(
     user_id: Optional[int] = None,
     system_prompt: Optional[str] = None,   # workers may override, but compose_persona is default
     context: Optional[Dict] = None,
+    session_goal: str | None = None, 
 ) -> str:
     """
     Single entrypoint used by workers.py. Returns one SMS-ready reply string.
@@ -451,6 +453,7 @@ def generate_reply(
         session_goal=session_goal,
         product_candidates=product_candidates,
         context=context,
+        session_goal=session_goal,
     )
 
     # --- Best-first shopping guidance (no surveys; allow links when asked) -------

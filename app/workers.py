@@ -1694,15 +1694,16 @@ def generate_reply_job(
 
         raw = ai.generate_reply(
             user_text=user_text,
+            product_candidates=[],
             user_id=user_id,
             system_prompt=persona,
-            product_candidates=[],              # keep it empty for organic talk
             context={
                 "has_completed_quiz": has_quiz,
                 "media_urls": media_urls or [],
             },
-            session_goal=goal,
+            session_goal=goal,      # <-- NEW
         )
+
 
           # keep it light — don't over-sanitize
         cleaned = _clean_reply(raw)
