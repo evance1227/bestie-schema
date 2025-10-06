@@ -866,30 +866,20 @@ def _norm_phone(p: Optional[str]) -> Optional[str]:
         return "+" + d
     return p if p.startswith("+") else ("+" + d if d else None)
 
-def _recent_outbound_texts(convo_id: int, limit: int = 12) -> List[str]:
-    """Fetch recent outbound texts for freshness checks without assuming a single column name."""
-    candidate_cols = ("text", "body", "message", "content")
-    with db.session() as s:
-        for col in candidate_cols:
-            try:
-                rows = s.execute(
-                    sqltext(f"""
-                        SELECT {col}
-                        FROM messages
-                        WHERE conversation_id = :cid AND direction = 'out'
-                        ORDER BY created_at DESC
-                        LIMIT :lim
-                    """),
-                    {"cid": convo_id, "lim": limit},
-                ).fetchall()
-                return [r[0] for r in rows]
-            except Exception as e:
-                if "UndefinedColumn" in str(e):
-                    continue
-                logger.warning("[Freshness] Failed using column '{}': {}", col, e)
-                return []
-    logger.warning("[Freshness] No known message column. Skipping.")
-    return []
+from sqlalchemy.exc import SQLAlchemyError, OperationalError
+
+def _recent_outbound_texts(user_id: int, limit: int = 5) -> list[str]:
+    """
+    Best-effort fetch of the user's recent outbound texts. If DB is unavailable,
+    return an empty list silently so we never block or spam logs.
+    """
+    try:
+        with db.session() as s:
+            rows = models.fetch_recent_outbound(s, user_id, limit=limit)  # whatever your helper is named
+            return [getattr(r, "text", "") for r in (rows or []) if getattr(r, "text", "")]
+    except (OperationalError, SQLAlchemyError, Exception) as e:
+        logger.warning("[Freshness] DB unavailable; skipping recent_outbound: %s", e)
+        return []
 
 # ---------------------------------------------------------------------- #
 # Paywall / plan state

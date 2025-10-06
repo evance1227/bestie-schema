@@ -271,6 +271,55 @@ def process_incoming(
 
     # Custom-data dict if present (GHL puts your “Custom Data” here)
     cd = raw_body.get("customData", {}) if isinstance(raw_body, dict) else {}
+    # --- BEGIN robust attachment harvesting ---
+    std_msg = raw_body.get("message") or {}
+    media_urls: list[str] = []
+
+    def _maybe_add(u: str | None):
+        if isinstance(u, str) and u and not u.strip().startswith("{{"):
+            media_urls.append(u.strip())
+
+    # 1) Standard arrays (preferred)
+    for att in (std_msg.get("attachments") or []):
+        _maybe_add((att or {}).get("url"))
+
+    for m in (std_msg.get("media") or []):
+        _maybe_add((m or {}).get("url"))
+
+    # 2) CustomData fields (handle both scalar and array/json)
+    for k, v in (cd or {}).items():
+        # direct url
+        if isinstance(v, str) and v.startswith("http"):
+            _maybe_add(v)
+        # json-ish list of attachments/media
+        elif isinstance(v, str) and (v.startswith("[") or v.startswith("{")):
+            try:
+                import json as _json
+                parsed = _json.loads(v)
+                if isinstance(parsed, list):
+                    for item in parsed:
+                        _maybe_add((item or {}).get("url"))
+                elif isinstance(parsed, dict):
+                    _maybe_add(parsed.get("url"))
+            except Exception:
+                pass
+
+    # 3) Known custom keys (defensive duplicates)
+    _maybe_add = _maybe_add  # (name alias to avoid shadowing)
+    for key in (
+        "message.attachments[0].url",
+        "message.media[0].url",
+        "message.file_url",
+        "message.attachments_url",
+    ):
+        val = cd.get(key)
+        if isinstance(val, str):
+            _maybe_add(val)
+
+    # de-dupe while preserving order
+    _seen = set()
+    media_urls = [u for u in media_urls if (u not in _seen and not _seen.add(u))]
+    # --- END robust attachment harvesting ---
 
     # Basic identifiers with safe fallbacks
     msg_id = (
