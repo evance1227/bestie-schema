@@ -1620,22 +1620,30 @@ def generate_reply_job(
 
     image_mode = bool(media_urls)
 
+    shop_intent = (
+        _has_shop_intent(user_text)
+        or _has_shop_intent(reply)
+        or (_ALLOW_AMZ_SEARCH_TOKEN in (text_val or ""))
+    )
+
     # Only convert to shoppable bullets when it makes sense
     if (
-        image_mode                               # image present (meant for picks)
-        or _has_shop_intent(user_text)           # user asked for link/options/buy
-        or _has_shop_intent(reply)               # model itself promised picks/links
-        or (_ALLOW_AMZ_SEARCH_TOKEN in (text_val or ""))  # your allow token
+        image_mode                      # image present (meant for picks)
+        or _has_shop_intent(user_text)  # user asked for link/options/buy
+        or _has_shop_intent(reply)      # model itself promised picks/links
+        or (_ALLOW_AMZ_SEARCH_TOKEN in (text_val or ""))  # explicit allow token
     ):
         reply = _shorten_bullet_labels(
             _ensure_links_on_bullets(reply, user_text)
         )
 
     # else: leave reply purely conversational
+
     _store_and_send(
         user_id, convo_id, reply, user_phone,
         user_text=user_text, media_urls=media_urls
     )
+
     return
 
 def _looks_live_and_same_host(url: str, expect_host: str) -> bool:

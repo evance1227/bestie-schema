@@ -395,34 +395,9 @@ def build_messages(
     context: Optional[Dict] = None,
     session_goal: str | None = None,
 ) -> List[Dict]:    
-    persona = persona or compose_persona(user_id, session_goal=session_goal)
-    # If the session is photo-driven without shopping intent,
-    # steer the model to a warm, specific observation + one useful question.
-    if session_goal == "image_engage":
-        persona += (
-            "\n\nPHOTO CHAT RULES:\n"
-            "- You can see the attached photo(s). Start with one specific, kind observation "
-            "(hair, glasses, makeup, outfit, or overall vibe)."
-            "- Ask exactly ONE helpful follow-up (match or riff? occasion? any no-gos?).\n"
-            "- Keep it breezy (<280 chars). No bullets or links unless they asked."
-        )
-        # extra nudge to avoid listy/picks
-        product_candidates = []    
-    recent = recent or _load_recent_turns(user_id, limit=12)
-    msgs: List[Dict] = [{"role": "system", "content": persona}]
-
-    # If the session is photo-driven without shopping intent,
-    # steer the model to a warm, specific observation + one useful question.
-    if session_goal == "image_engage":
-        persona += (
-            "\n\nPHOTO CHAT RULES:\n"
-            "- You can see the attached photo(s). Start with one specific, kind observation "
-            "(hair, glasses, makeup, outfit, or overall vibe)."
-            "- Make it personal and relevant to the photo; never say 'got your pic'.\n"
-            "- Ask exactly one helpful follow-up (match this look or riff? occasion? any no-gos?).\n"
-            "- Keep it breezy and under ~280 chars. No bullets or links unless they asked."
-        )
-
+    persona = persona or compose_persona(user_id)
+    persona += "\nYou’re free-flowing and intuitive. If they send a photo, talk naturally about it first—observe, react, and help them decide what to do next."
+    msgs = [{"role": "system", "content": persona}]
     if recent:
         msgs.extend(recent)
 
@@ -435,9 +410,21 @@ def build_messages(
     if product_candidates:
         product_block = build_product_block(product_candidates)
         user_payload += "\n\n" + product_block
+   
+    img_urls = []
+    if context:
+        img_urls = (context or {}).get("media_urls") or []
 
-    user_msg = {"role": "user", "content": user_payload}
-    msgs.append(user_msg)
+    if img_urls:
+        msgs.append({
+            "role": "user",
+            "content": [
+                {"type": "text", "text": user_text or user_payload or "What do you think?"},
+                {"type": "image_url", "image_url": img_urls[0]},
+            ],
+        })
+    else:
+        msgs.append({"role": "user", "content": user_text or user_payload})
 
     return msgs
   
