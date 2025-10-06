@@ -389,16 +389,39 @@ def _load_recent_turns(user_id: Optional[int], limit: int = 12) -> List[Dict]:
 def build_messages(
     user_text: str,
     user_id: int,
-    session_goal: Optional[str],
     product_candidates: Optional[List[Dict]] = None,
     recent: Optional[List[Dict]] = None,
     persona: Optional[str] = None,
     context: Optional[Dict] = None,
     session_goal: str | None = None,
-) -> List[Dict]:
+) -> List[Dict]:    
     persona = persona or compose_persona(user_id, session_goal=session_goal)
+    # If the session is photo-driven without shopping intent,
+    # steer the model to a warm, specific observation + one useful question.
+    if session_goal == "image_engage":
+        persona += (
+            "\n\nPHOTO CHAT RULES:\n"
+            "- You can see the attached photo(s). Start with one specific, kind observation "
+            "(hair, glasses, makeup, outfit, or overall vibe)."
+            "- Ask exactly ONE helpful follow-up (match or riff? occasion? any no-gos?).\n"
+            "- Keep it breezy (<280 chars). No bullets or links unless they asked."
+        )
+        # extra nudge to avoid listy/picks
+        product_candidates = []    
     recent = recent or _load_recent_turns(user_id, limit=12)
     msgs: List[Dict] = [{"role": "system", "content": persona}]
+
+    # If the session is photo-driven without shopping intent,
+    # steer the model to a warm, specific observation + one useful question.
+    if session_goal == "image_engage":
+        persona += (
+            "\n\nPHOTO CHAT RULES:\n"
+            "- You can see the attached photo(s). Start with one specific, kind observation "
+            "(hair, glasses, makeup, outfit, or overall vibe)."
+            "- Make it personal and relevant to the photo; never say 'got your pic'.\n"
+            "- Ask exactly one helpful follow-up (match this look or riff? occasion? any no-gos?).\n"
+            "- Keep it breezy and under ~280 chars. No bullets or links unless they asked."
+        )
 
     if recent:
         msgs.extend(recent)
