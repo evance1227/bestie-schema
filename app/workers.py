@@ -1327,7 +1327,7 @@ def _store_and_send(
 
         # actually SEND the SMS
         try:
-            integrations.send_sms_reply(user_id, full_text)
+            integrations.send_sms_reply(user_id, full_text, phone_override=send_phone)
         except Exception as e:
             logger.error("[Send][Error] fallback err=%s", e)
 
@@ -1338,9 +1338,19 @@ def _store_and_send(
         if _rds and dedupe_key:
             _rds.set(dedupe_key, "1", ex=60)
     except Exception:
-        pass   
+        pass
+
+    # ✅ SEND in the non-fallback path
+    full_text = "\n".join(parts).strip()
+    try:
+        integrations.send_sms_reply(user_id, full_text, phone_override=send_phone)
+    except Exception as e:
+        logger.error("[Send][Error] err=%s", e)
 
     return
+
+    # --- END INSERT ---
+
 # --------------------------------------------------------------------- #
 # Rename flow
 #---------------------------------------------------------------------- #

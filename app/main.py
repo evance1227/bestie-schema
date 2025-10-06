@@ -440,7 +440,7 @@ def process_incoming(
         convo_id,              # int
         text,                  # resolved text from the preamble above
         media_urls=media_urls, # <-- the list we just built
-        user_phone=phone,      # <-- pass phone so worker has it
+        user_phone=user_phone,     # <-- pass phone so worker has it
     )
 
         logger.success(

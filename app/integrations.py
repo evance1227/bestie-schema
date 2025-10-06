@@ -299,6 +299,27 @@ def _post_with_retry(url: str, payload: Dict[str, Any], headers: Dict[str, str],
             time.sleep(backoff + random.random() * 0.4)
             backoff *= 2
 
+# --- insert here (above _send_outbound) ---
+def send_sms_reply(user_id: int, text: str, phone_override: str | None = None):
+    """
+    Send outbound SMS via LeadConnector webhook.
+    Posts to the configured GHL webhook with {phone, message}.
+    Returns a small dict with ok/status so callers can log intelligently.
+    """
+    msg = _strip_bestie_prefix((text or "").strip())
+    if not msg:
+        logger.warning("[Integrations][Send] Empty message for user_id=%s, skipping", user_id)
+        return {"ok": False, "reason": "empty"}
+
+    # NEW: allow the worker to bypass DB when it already knows the phone
+    phone = _normalize_phone(phone_override) if phone_override else _resolve_phone(user_id)
+    if not phone:
+        logger.error("[Integrations][Send] ❌ No phone found for user_id=%s, aborting send", user_id)
+        return {"ok": False, "reason": "no_phone"}
+
+    return _send_outbound(phone, msg)
+
+# --- end insert ---
 
 def _send_outbound(phone: str, msg: str) -> Dict[str, Any]:
     """Core sender with de-dupe, retries, and masked logging."""
@@ -331,42 +352,3 @@ def _send_outbound(phone: str, msg: str) -> Dict[str, Any]:
         logger.exception("💥 [Integrations][Send] Exception while posting to LeadConnector")
         return {"ok": False, "exception": str(e)}
 
-
-# ---------- public API (called by worker) ----------
-
-def send_sms_reply(user_id: int, text: str):
-    """
-    Send outbound SMS via LeadConnector webhook.
-    Posts to the configured GHL webhook with {phone, message}.
-    Returns a small dict with ok/status so callers can log intelligently.
-    """
-    # Normalize + defensive cleanup
-    msg = _strip_bestie_prefix((text or "").strip())
-    if not msg:
-        logger.warning("[Integrations][Send] Empty message for user_id={}, skipping", user_id)
-        return {"ok": False, "reason": "empty"}
-
-    # Resolve phone: users.phone -> latest inbound across any convo
-    phone = _resolve_phone(user_id)
-    if not phone:
-        logger.error("[Integrations][Send] ❌ No phone found for user_id={}, aborting send", user_id)
-        return {"ok": False, "reason": "no_phone"}
-
-    return _send_outbound(phone, msg)
-
-
-# --- Compatibility adapter for legacy worker calls ---
-def send_sms(user_id: int, convo_id: int, text: str):
-    """
-    Legacy adapter used by older worker code.
-    Prefer: send_sms_reply(user_id, text)
-    """
-    msg = _strip_bestie_prefix((text or "").strip())
-    if not msg:
-        logger.warning("[Integrations][Compat] Empty message for user_id={}, skipping", user_id)
-        return {"ok": False, "reason": "empty"}
-    phone = _resolve_phone(user_id, convo_id=convo_id)
-    if not phone:
-        logger.error("[Integrations][Compat] ❌ No phone for user_id={} convo_id={}, aborting", user_id, convo_id)
-        return {"ok": False, "reason": "no_phone"}
-    return _send_outbound(phone, msg)
