@@ -1523,6 +1523,19 @@ def _looks_like_concrete_picks(text: str) -> bool:
     lines = [ln.strip() for ln in t.splitlines() if ln.strip()]
     return bool(_LISTY_RE.search(t) or len(lines) >= 3)
 
+# --- conversational opener for image-only messages (no links) ---
+def _image_engagement_copy(user_text: str) -> str:
+    """
+    Friendly, on-brand first reply when the user sends a photo.
+    - Do NOT link or recommend yet.
+    - Ask two or three crisp questions to understand the goal.
+    """
+    vibe = "Obsessed with the vibe in your pic. 💫"
+    q1   = "What’s the occasion or plan for this look?"
+    q2   = "Any budget & sizing notes (XS–XL) I should keep in mind?"
+    q3   = "Do you want exact matches or inspired twins?"
+    return f"{vibe}\n• {q1}\n• {q2}\n• {q3}"
+
 # ---------------------------------------------------------------------- #
 # Main worker entrypoint
 # ---------------------------------------------------------------------- #
@@ -1665,7 +1678,7 @@ def generate_reply_job(
         has_quiz = False
 
     # 5) Chat-first (single GPT pass)
-    try:
+    try:        
         persona = (
             "You are Bestie — sharp, funny, emotionally fluent, and glamorously blunt. "
             "Answer now; don’t interview me. One playful follow-up at most. "
@@ -1677,19 +1690,21 @@ def generate_reply_job(
             quiz=os.getenv("QUIZ_URL", "https://tally.so/r/YOUR_QUIZ_ID"),
             packs="https://schizobestie.gumroad.com/"
         )
+        goal = "image_engage" if (media_urls and not _has_shop_intent(user_text)) else None
 
         raw = ai.generate_reply(
             user_text=user_text,
-            product_candidates=[],        # nothing scripted
             user_id=user_id,
             system_prompt=persona,
+            product_candidates=[],              # keep it empty for organic talk
             context={
                 "has_completed_quiz": has_quiz,
                 "media_urls": media_urls or [],
-            }
+            },
+            session_goal=goal,
         )
 
-        # keep it light — don't over-sanitize
+          # keep it light — don't over-sanitize
         cleaned = _clean_reply(raw)
         reply = (cleaned.strip() if cleaned else (raw.strip() if raw else ""))
         # remove survey-ish prompts

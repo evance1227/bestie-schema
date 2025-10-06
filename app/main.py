@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os, re, time
+import json
 from typing import Any, List, Optional
 
 from dotenv import load_dotenv
@@ -251,22 +252,96 @@ def process_incoming(
     msg_id = raw_body.get("customData", {}).get("message_id") or message_id
     phone  = user_phone
     text   = text_val or (raw_body.get("customData", {}).get("text") or "")
-    logger.info("[API][Process] Starting DB insert for msg_id=%s phone=%s text=%s", msg_id, phone, text)
- 
-    # Collect image/media URLs from the webhook payload (augment any provided)
-    media_urls = list(media_urls or [])
-    cd = raw_body.get("customData", {}) if isinstance(raw_body, dict) else {}
-    for k in (
-        "message.attachments[0].url",  # first attachment from GHL
-        "customData.media[0]",
-        "maybe_media_1",
-        "maybe_media_2",
-        "maybe_media_3",
-    ):
-        u = cd.get(k)
-        if u:
-            media_urls.append(u)
+    # --- BEGIN PREAMBLE: normalize ids/text/media for this webhook call ---
+    import json
 
+    # Pick the inbound body object regardless of the caller's name (safe lookups)
+    rb = locals().get("raw_body")
+    if rb is None:
+        rb = locals().get("body")  # do not reference 'body' directly
+
+
+    # Always promote to a dict
+    if not isinstance(rb, dict):
+        try:
+            rb = dict(rb or {})
+        except Exception:
+            rb = {}
+    raw_body = rb
+
+    # Custom-data dict if present (GHL puts your “Custom Data” here)
+    cd = raw_body.get("customData", {}) if isinstance(raw_body, dict) else {}
+
+    # Basic identifiers with safe fallbacks
+    msg_id = (
+        (locals().get("message_id") or "")                  # function arg if provided
+        or cd.get("message_id")
+        or (raw_body.get("message", {}) or {}).get("id")
+        or ""
+    )
+
+    phone = (
+        (locals().get("user_phone") or "")
+        or cd.get("user_phone")
+        or (raw_body.get("contact", {}) or {}).get("phone")
+        or ""
+    )
+
+    # Prefer explicit text_val; fall back to customData.text, then standard message body
+    text = (
+        (locals().get("text_val") or "").strip()
+        or (cd.get("text") or "")
+        or (raw_body.get("message", {}) or {}).get("body")
+        or ""
+    )
+
+    # Build/augment media_urls from several places (standard + your custom keys)
+    media_urls = list(locals().get("media_urls") or [])
+
+    # 1) Standard LeadConnector/GHL: message.attachments is a list of objects with url/fileUrl/link
+    try:
+        std_atts = (raw_body.get("message", {}) or {}).get("attachments") or []
+        for att in std_atts:
+            if isinstance(att, dict):
+                u = att.get("url") or att.get("fileUrl") or att.get("link")
+                if u:
+                    media_urls.append(u)
+    except Exception:
+        pass
+
+    # 2) Your workflow “Custom Data” key you showed in the screenshot (use either name safely)
+    for key in ("message.attachments", "message.attach"):
+        val = cd.get(key)
+        if not val:
+            continue
+        try:
+            # Sometimes GHL sends this as a JSON string; sometimes as a list
+            if isinstance(val, str):
+                s = val.strip()
+                if s.startswith("[") or s.startswith("{"):
+                    val = json.loads(s)
+                elif s.startswith("http"):
+                    media_urls.append(s)
+                    continue
+            if isinstance(val, list):
+                for item in val:
+                    if isinstance(item, str) and item.startswith("http"):
+                        media_urls.append(item)
+                    elif isinstance(item, dict):
+                        u = item.get("url") or item.get("fileUrl") or item.get("link")
+                        if u:
+                            media_urls.append(u)
+        except Exception:
+            pass
+
+    # 3) Legacy fallbacks in case some workflows still use them
+    for k in ("customData.media[0]", "maybe_media_1", "maybe_media_2", "maybe_media_3"):
+        v = cd.get(k)
+        if v:
+            media_urls.append(v)
+    # --- END PREAMBLE ---
+
+    logger.info("[API][Process] Starting DB insert for msg_id=%s phone=%s text=%s", msg_id, phone, text)
 
     user_id: Optional[int] = None
     convo_id: Optional[int] = None
@@ -275,20 +350,14 @@ def process_incoming(
     try:
         from sqlalchemy import text as sqltext
 
-        try:
-            with db.session() as s:
-                models.insert_message(s, convo_id, "out", message_id, full_text)
-                s.commit()
-            logger.info(
-                "[Worker][DB] Outbound stored: convo_id=%s user_id=%s msg_id=%s",
-                convo_id, user_id, message_id
-            )
-        except Exception as e:
-            # Don’t block sending if the DB is down
-            logger.warning(
-                "[Worker][DB] Outbound store FAILED (db unavailable): %s",
-                e
-            )
+        with db.session() as s:
+            # 1) store inbound message
+            s.execute(sqltext("""
+                INSERT INTO inbound_messages (message_id, user_phone, text, created_at)
+                VALUES (:mid, :phone, :txt, NOW())
+                ON CONFLICT (message_id) DO NOTHING
+            """), {"mid": msg_id, "phone": phone, "txt": text})
+            s.commit()
 
             # 2) look up (or create) the user by phone so we get stable ids
             row = s.execute(sqltext("""
@@ -366,14 +435,14 @@ def process_incoming(
         _queue = Queue(os.getenv("QUEUE_NAME", "bestie_queue"), connection=_conn)
 
         job = enqueue_generate_reply(
-            _queue,                           # ← first positional arg
-            convo_id=convo_id,
-            user_id=user_id,
-            text_val=text,
-            user_phone=phone,
-            media_urls=(media_urls or []),
-            msg_id=msg_id,                    # ← use webhook message id for dedupe
-        )
+        _queue,                # your Queue object (whatever you named it)
+        user_id,               # int
+        convo_id,              # int
+        text,                  # resolved text from the preamble above
+        media_urls=media_urls, # <-- the list we just built
+        user_phone=phone,      # <-- pass phone so worker has it
+    )
+
         logger.success(
             "[API][Queue] ✅ Enqueued job=%s convo_id=%s user_id=%s text_len=%d",
             getattr(job, "id", "n/a"), convo_id, user_id, len(text or "")
