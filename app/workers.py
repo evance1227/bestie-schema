@@ -1061,295 +1061,88 @@ def _segments_for_sms(
     return [p for p in out if p]
 
 # after
+# --------------------------------------------------------------------
+# app/workers.py
+# Replace the entire _store_and_send(...) with this version
+# --------------------------------------------------------------------
+from typing import Optional
+import os, uuid
+
 def _store_and_send(
     user_id: int,
     convo_id: int,
     text_val: str,
-    send_phone: Optional[str] = None,
-    user_text: Optional[str] = None,   
+    send_phone: Optional[str] = None,           # phone from webhook (DB may be down)
+    user_text: Optional[str] = None,
     media_urls: list[str] | None = None,
 ) -> None:
     """
-    Store once, send once. No manual segmentation or [1/3] prefixes.
-    Carriers will stitch if the payload segments on their side.
+    Store once, send once.
+      - Fallback: if segmentation produced no parts, send a single friendly line.
+      - Success: join parts and send.
+    Always uses phone_override so we deliver even when DB is unavailable.
     """
-    # --- outbound dedupe: skip if we just sent the exact same text in this convo ---
-    # ---- dedupe (check now, set later after success) ----
-    dedupe_key = None
-    try:
-        from hashlib import sha1
-        sig = sha1(((str(convo_id) + ":" + (text_val or "")).encode("utf-8"))).hexdigest()
-        dedupe_key = f"sent:{convo_id}:{sig}"
-        if _rds and _rds.exists(dedupe_key):
-            logger.info("[Send][Dedupe] Skipping duplicate send for convo %s", convo_id)
-            return
-    except Exception:
-        dedupe_key = None
 
-    image_mode = bool(media_urls)
-
-    text_val = (text_val or "").strip()
-    if not text_val:
-        if bool(media_urls):
-            text_val = _image_probe(user_text)     # add this helper once, see below
-        else:
-            logger.warning("[Send] Empty text_val and no media; aborting")
-            return
-
-
-    # else: continue — lens block will add picks for images
-
-    # ==== Preserve Amazon search links if allow-token is present ====
-    _allow_amz = False
-    if _ALLOW_AMZ_SEARCH_TOKEN in text_val:
-        _allow_amz = True
-        text_val = text_val.replace(_ALLOW_AMZ_SEARCH_TOKEN, "", 1).lstrip()
-
-
-    # ==== Final shaping (single body) ====
-    text_val = _add_personality_if_flat(text_val)
-    text_val = _strip_link_placeholders(text_val)
-    if not _allow_amz:
-        text_val = _strip_amazon_search_links(text_val)
-
-    # sanitizers
-    text_val = _unwrap_markdown_links(text_val)
-    text_val = _strip_styling(text_val)
-    text_val = _dedupe_spaces(text_val)
-    text_val = _tidy_urls_per_line(text_val)
-
-    # wrappers
-    text_val = wrap_all_affiliates(text_val)     # adds Amazon ?tag= / SYL redirect
-    text_val = normalize_syl_links(text_val)     # legacy sylikes → shopmy.us
-    text_val = ensure_not_link_ending(text_val)
-   
-    # Optional debug marker (visible once)
-    DEBUG_MARKER = os.getenv("DEBUG_MARKER", "")
-    if DEBUG_MARKER:
-        text_val = text_val.rstrip() + f"\n{DEBUG_MARKER}"
-    OFFER_EMAIL = (os.getenv("OFFER_EMAIL_ON_OVERFLOW") or "0").lower() in ("1","true","yes")
-    per  = int(os.getenv("SMS_PER_PART", "360"))
-    maxp = int(os.getenv("SMS_MAX_PARTS", "2"))
-
-    if OFFER_EMAIL and len(text_val) > (per * maxp):
-        text_val = (
-            text_val[: (per * maxp) - 80].rstrip()
-            + "\n\nToo long to fit by SMS. Want the full list by email? Reply EMAIL."
-        )
-    # Optional email-offer (rotating, only when helpful)
-    per  = int(os.getenv("SMS_PER_PART", "320"))
-    maxp = int(os.getenv("SMS_MAX_PARTS", "3"))
-    text_val = _maybe_add_email_offer(text_val, per, maxp)
-
-    # === IMAGE MATCHES (neutral, token-scored; affiliate upgrade; wrap + validate) ===
-    try:
-        if media_urls:
-            ut = (user_text or "").strip()
-
-            # Lens candidates
-            cands = lens_products(media_urls[0], allowed_domains=None, topn=12)
-
-            # Score by user words (no category rules). Keep >0; if none, we'll fall back.
-            scored = [( _score_image_candidate(ut, c), c ) for c in cands]
-            winners = [c for s, c in scored if s > 0]
-
-            if not winners:
-                # Fall back to two SYL searches from user text
-                toks = _tokenize_query(ut)
-                q1 = " ".join(toks[:4]) or (ut or "best match")
-                q2 = " ".join(toks[4:8]) or q1
-                links = []
-                try: links.append((" ".join(t.capitalize() for t in q1.split()) or "Top picks", _syl_search_url(q1, ut)))
-                except Exception: pass
-                if q2 != q1:
-                    try: links.append(("More picks", _syl_search_url(q2, ut)))
-                    except Exception: pass
-
-                intro = "Found close matches from your photo & request:"
-                lines = [f"- {title} — {url}" for title, url in links if url]
-                text_val = (intro + "\n" + "\n".join(lines)).strip()
-                image_mode = True
-
-            else:
-                # Deduplicate by host for variety
-                by_host = {}
-                for c in winners:
-                    h = (c.get("host") or "").lower()
-                    if h and h not in by_host:
-                        by_host[h] = c
-                deduped = list(by_host.values())
-
-                # Guarantee URL (synthesize if missing)
-                fixed = []
-                for c in deduped:
-                    title = (c.get("title") or "").strip() or (c.get("host") or "").strip()
-                    host  = (c.get("host") or "").lower()
-                    url   = (c.get("url")  or "").strip()
-                    if not (url.startswith("http://") or url.startswith("https://")):
-                        try:
-                            if "amazon." in host:
-                                url = _amz_search_url(title or ut or "best match")
-                            else:
-                                url = _syl_search_url(title or (ut or "best match"), f"{ut} {host}".strip())
-                        except Exception:
-                            url = ""
-                    if url:
-                        fixed.append({"title": title, "url": url, "host": host})
-
-                if not fixed:
-                    # same fallback as above
-                    toks = _tokenize_query(ut)
-                    q1 = " ".join(toks[:4]) or (ut or "best match")
-                    q2 = " ".join(toks[4:8]) or q1
-                    fixed = []
-                    try: fixed.append({"title": (" ".join(t.capitalize() for t in q1.split()) or "Top picks"), "url": _syl_search_url(q1, ut), "host":"search"})
-                    except Exception: pass
-                    if q2 != q1:
-                        try: fixed.append({"title": "More picks", "url": _syl_search_url(q2, ut), "host":"search"})
-                        except Exception: pass
-
-                picks = fixed[:2]   # two links → fits 2 SMS parts
-
-                if picks:
-                    # affiliate upgrade (SYL preferred, Amazon next)
-                    picks = _affiliate_upgrade(picks, ut)
-
-                    # build body
-                    intro = "Found close matches:"
-                    lines = [f"- {p['title']} — {p['url']}" for p in picks]
-                    text_val = (intro + "\n" + "\n".join(lines)).strip()
-
-                    # wrap AFTER building body (ensures deep links become SYL/Amazon)
-                    text_val = wrap_all_affiliates(text_val)
-                    text_val = normalize_syl_links(text_val)
-                    text_val = ensure_not_link_ending(text_val)
-
-                    # validate wrapped links; fallback to SYL search on mismatch
-                    validated_lines = []
-                    for ln in text_val.splitlines():
-                        if (" — http" not in ln) and ("http" not in ln):
-                            validated_lines.append(ln)
-                            continue
-                        parts = ln.split(" — http", 1)
-                        if len(parts) != 2:
-                            validated_lines.append(ln)
-                            continue
-                        label = parts[0].strip()
-                        url   = "http" + parts[1].strip()
-
-                        # expected host from the pick whose title prefix appears in label
-                        expect = ""
-                        for p in picks:
-                            if p["title"] and p["title"].split()[0] in label:
-                                expect = p.get("host","")
-                                break
-                        if not expect:
-                            try:
-                                from urllib.parse import urlparse
-                                expect = urlparse(url).netloc
-                            except Exception:
-                                pass
-
-                        if _looks_live_and_same_host(url, expect):
-                            validated_lines.append(f"{label} — {url}")
-                        else:
-                            try:
-                                alt = _syl_search_url(label or (ut or "best match"), ut)
-                                validated_lines.append(f"{label} — {alt}")
-                            except Exception:
-                                validated_lines.append(label)
-
-                    text_val = "\n".join(validated_lines).strip()
-                    image_mode = True
-    except Exception as e:
-        logger.warning("[Vision] image block error: {}", e)
-    # === END IMAGE MATCHES ===
-
-    # Final safety: ensure bullets have links, then shorten labels
-    text_val = _ensure_links_on_bullets(text_val, user_text or "")
-    text_val = _shorten_bullet_labels(text_val)
-
-    # Link-first (only real URLs)
-    lines = [ln for ln in (text_val or "").splitlines()]
-    link_lines  = [ln for ln in lines if ("http://" in ln) or ("https://" in ln) or (" — http" in ln)]
-    other_lines = [ln for ln in lines if ln not in link_lines]
-
-    if image_mode:
-        # PHOTO MODE: keep only the link lines (drops any stray narration)
-        text_val = "\n".join(link_lines).strip()
-    else:
-        # TEXT MODE: links first, then remaining copy
-        text_val = "\n".join(
-            link_lines + ([""] if (link_lines and other_lines) else []) + other_lines
-        ).strip()
-
-    # tidy phrasing now that links are at the top
-    text_val = _clean_here_phrases(text_val)
+    # final tidy so SMS doesn't end on a bare URL
     text_val = ensure_not_link_ending(text_val)
 
-    # Split into SMS parts (2 × 380 or 360 if that’s your env)
+    # split into SMS parts (carriers stitch on their side)
     parts = _segments_for_sms(
         text_val,
         per=int(os.getenv("SMS_PER_PART", "380")),
         max_parts=int(os.getenv("SMS_MAX_PARTS", "2")),
-        prefix_reserve=8,   # room for "[1/2] "
+        prefix_reserve=8,  # room for "[1/2] "
     )
-    # --- segmentation debug + hard guard ---
     try:
         logger.info("[Send][Seg] parts=%d body_len=%d", len(parts or []), len(text_val or ""))
     except Exception:
         pass
 
+    # ----- Fallback path: no parts produced -----
     if not parts:
         logger.warning("[Send] No parts produced; sending fallback single part")
 
-        # conversational fallback body (stay warm & friendly)
         full_text = (text_val or "").strip()
         if not full_text:
+            # ultra-short, warm, non-salesy fallback
             full_text = (
                 "I’m seeing the vibe 💫 Want exact matches or close twins? "
                 "Tell me budget + fit + any must-haves and I’ll curate tight. ✨"
             )
 
-        message_id = str(uuid.uuid4())
-
-        # DB store is tolerant — never block the send
+        # tolerant DB store (never block send)
+        msg_id = str(uuid.uuid4())
         try:
             with db.session() as s:
-                models.insert_message(s, convo_id, "out", message_id, full_text)
-                s.commit()
-            logger.info(
-                "[Worker][DB] Outbound stored: convo_id=%s user_id=%s msg_id=%s",
-                convo_id, user_id, message_id,
-            )
+                models.insert_message(s, convo_id, user_id, msg_id, full_text)
         except Exception as e:
             logger.warning("[Worker][DB] Outbound store FAILED (db unavailable): %s", e)
 
-        # actually SEND the SMS
+        # send (use phone from webhook if provided)
         try:
             integrations.send_sms_reply(user_id, full_text, phone_override=send_phone)
         except Exception as e:
             logger.error("[Send][Error] fallback err=%s", e)
-
         return
 
-    # mark this exact body as sent (for 60s) NOW that we succeeded
-    try:
-        if _rds and dedupe_key:
-            _rds.set(dedupe_key, "1", ex=60)
-    except Exception:
-        pass
-
-    # ✅ SEND in the non-fallback path
+    # ----- Success path: join & send -----
     full_text = "\n".join(parts).strip()
+    logger.info("[Send][Join] parts=%d override=%s body[:80]=%r",
+                len(parts), bool(send_phone), full_text[:80])
+
+    # tolerant DB store (never block send)
+    msg_id = str(uuid.uuid4())
+    try:
+        with db.session() as s:
+            models.insert_message(s, convo_id, user_id, msg_id, full_text)
+    except Exception as e:
+        logger.warning("[Worker][DB] Outbound store FAILED (db unavailable): %s", e)
+
     try:
         integrations.send_sms_reply(user_id, full_text, phone_override=send_phone)
     except Exception as e:
         logger.error("[Send][Error] err=%s", e)
-
     return
-
-    # --- END INSERT ---
 
 # --------------------------------------------------------------------- #
 # Rename flow

@@ -104,21 +104,25 @@ def _col_exists(table: str, col: str) -> bool:
         return False
 
 
-def _normalize_phone(raw: Optional[str]) -> str:
-    """Normalize to E.164 (assume US if 10 digits)."""
-    if not raw:
-        return ""
-    s = str(raw).strip()
-    digits = re.sub(r"\D", "", s)
+import re
+
+def _normalize_phone(p: str | None) -> str | None:
+    if not p:
+        return None
+    digits = re.sub(r"\D+", "", p)
     if not digits:
-        return ""
-    if s.startswith("+"):
-        return "+" + digits
-    if len(digits) == 11 and digits.startswith("1"):
-        return "+" + digits
+        return None
+    # if already E.164 with leading 1 removed (10 digits), add +1
     if len(digits) == 10:
         return "+1" + digits
-    return "+" + digits  # last resort
+    # if 11 digits starting with 1, add +
+    if len(digits) == 11 and digits.startswith("1"):
+        return "+" + digits
+    # if already starts with + and >= 11, return as-is
+    if p.strip().startswith("+"):
+        return p.strip()
+    # fallback: add + and hope GHL accepts
+    return "+" + digits
 
 
 def _mask_phone(p: str) -> str:
@@ -299,25 +303,28 @@ def _post_with_retry(url: str, payload: Dict[str, Any], headers: Dict[str, str],
             time.sleep(backoff + random.random() * 0.4)
             backoff *= 2
 
-# --- insert here (above _send_outbound) ---
 def send_sms_reply(user_id: int, text: str, phone_override: str | None = None):
     """
-    Send outbound SMS via LeadConnector webhook.
-    Posts to the configured GHL webhook with {phone, message}.
-    Returns a small dict with ok/status so callers can log intelligently.
+    Send an outbound SMS via LeadConnector webhook.
+    Uses phone_override (from webhook/queue) when provided; falls back to DB lookup.
     """
     msg = _strip_bestie_prefix((text or "").strip())
     if not msg:
-        logger.warning("[Integrations][Send] Empty message for user_id=%s, skipping", user_id)
+        logger.warning("[Integrations][Send] Empty message for user_id=%s; skipping", user_id)
         return {"ok": False, "reason": "empty"}
 
-    # NEW: allow the worker to bypass DB when it already knows the phone
-    phone = _normalize_phone(phone_override) if phone_override else _resolve_phone(user_id)
+    phone_src = "override" if phone_override else "db"
+    phone_raw = phone_override if phone_override else _resolve_phone(user_id)
+    phone = _normalize_phone(phone_raw)
+
+    logger.info("[Integrations][Send] route=%s raw=%r normalized=%r", phone_src, phone_raw, phone)
+
     if not phone:
-        logger.error("[Integrations][Send] ❌ No phone found for user_id=%s, aborting send", user_id)
+        logger.error("[Integrations][Send] ❌ No phone for user_id=%s; abort", user_id)
         return {"ok": False, "reason": "no_phone"}
 
     return _send_outbound(phone, msg)
+
 
 # --- end insert ---
 
