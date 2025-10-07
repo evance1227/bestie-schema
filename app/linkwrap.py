@@ -421,28 +421,70 @@ def _wrap_url(url: str) -> str:
 
 def wrap_all_affiliates(text: str) -> str:
     """
-    Rewrite every link in the text with affiliate logic.
-    Order:
-      1) rewrite markdown links first
-      2) rewrite remaining plain URLs
+    Normalize outgoing links:
+      - prefer SYL for premium retailers (sephora/ulta/revolve/etc.)
+      - ensure Amazon links/searches are ALWAYS tagged with our associate ID
+      - leave all other domains unchanged
+    Works for both [markdown](url) and bare URLs in the text.
     """
-    if not text:
-        return text
 
-    # 1) Markdown links [label](url)
+    PREMIUM_SYL_DOMAINS = (
+        "sephora.com",
+        "ulta.com",
+        "revolve.com",
+        "glossier.com",
+        "anthropologie.com",
+        "net-a-porter.com",
+        "nordstrom.com",
+    )
+
+    amz_tag = os.getenv("AMAZON_ASSOCIATE_TAG", "").strip()
+
+    def _domain(u: str) -> str:
+        try:
+            return urllib.parse.urlparse(u).netloc.lower()
+        except Exception:
+            return ""
+
+    def _is_amazon(u: str) -> bool:
+        d = _domain(u)
+        return d.endswith("amazon.com") or d.endswith("amazon.co.uk") or d.endswith("amazon.ca")
+
+    def _ensure_amazon_tag(u: str) -> str:
+        # Add &tag= if missing (and if we have a tag configured)
+        if not amz_tag:
+            return u  # we won't mutate if tag isn't configured
+        if "tag=" in u:
+            return u
+        sep = "&" if ("?" in u) else "?"
+        return f"{u}{sep}tag={amz_tag}"
+
+    def _should_syl(u: str) -> bool:
+        d = _domain(u)
+        return any(p in d for p in PREMIUM_SYL_DOMAINS)
+
+    def _wrap_url(u: str) -> str:
+        if not u or not u.startswith("http"):
+            return u
+        # premium retailers → wrap with SYL
+        if _should_syl(u):
+            return build_syl_redirect("premium", u)
+        # Amazon → ensure tag on any link (search or product)
+        if _is_amazon(u):
+            return _ensure_amazon_tag(u)
+        # otherwise unchanged
+        return u
+
+    # --- rewrite markdown links [label](url) ---
     def _md_repl(m: re.Match) -> str:
         label, url = m.group(1), m.group(2)
         return f"[{label}]({_wrap_url(url)})"
 
     out = _MD_LINK_RE.sub(_md_repl, text)
 
-    # 2) Plain URLs
+    # --- rewrite plain URLs ---
     def _plain_repl(m: re.Match) -> str:
         url = m.group(0)
-        # If this exact URL already appears inside a markdown link we just rewrote,
-        # leave it as-is to avoid double work.
-        if f"]({url})" in out:
-            return url
         return _wrap_url(url)
 
     out = _URL_RE.sub(_plain_repl, out)

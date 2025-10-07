@@ -418,7 +418,6 @@ def build_messages(
     elif recent:
         msgs.extend(recent)
 
-
     user_payload = user_text.strip()
 
     if context:

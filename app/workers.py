@@ -536,12 +536,6 @@ def _ensure_links_on_bullets(text: str, user_text: str) -> str:
         else:
             out.extend(cl.rstrip() for cl in chunk_lines)
 
-        i = j
-        if "amazon" in line.lower() and "http" not in line.lower():
-            # build a safe search URL from the user query; keeps behavior minimal
-            amz = build_amazon_search_url(user_text or "")
-            line = re.sub(r"(?i)\bamazon\b", f"Amazon: {amz}", line)
-
     reply_out = "\n".join(out)
     return wrap_all_affiliates(reply_out)
 
