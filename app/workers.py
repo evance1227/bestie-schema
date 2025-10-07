@@ -1532,6 +1532,7 @@ def generate_reply_job(
         # Remove explicit allow token from user-visible text and fix preamble
         reply = _strip_allow_tokens(reply)
         reply = _strip_links_preamble(reply)
+        reply = re.sub(r"\b(s\s+to|links?\s+to)\b", "", reply, flags=re.I).strip()
         reply = _anti_form_guard(reply, user_text)
         # If user clearly asked for products but reply is vague, rewrite to concrete picks
         if _looks_like_product_intent(user_text) and not _looks_like_concrete_picks(reply):

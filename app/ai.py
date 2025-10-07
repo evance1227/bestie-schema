@@ -412,8 +412,12 @@ def build_messages(
     persona = persona or compose_persona(user_id)
     persona += "\nYou’re free-flowing and intuitive. If they send a photo, talk naturally about it first—observe, react, and help them decide what to do next."
     msgs = [{"role": "system", "content": persona}]
-    if recent:
+    # Keep a bit more context when the user sends very short confirmations (e.g., "yes", "no", "ok")
+    if recent and len((user_text or "").strip()) <= 5:
+        msgs.extend(recent[-3:])   # last three turns are usually enough to keep thread
+    elif recent:
         msgs.extend(recent)
+
 
     user_payload = user_text.strip()
 

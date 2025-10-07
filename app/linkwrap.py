@@ -18,7 +18,7 @@ import re
 import logging
 from urllib.parse import urlparse, urlunparse, parse_qs, urlencode, quote, quote_plus, unquote
 import urllib.parse
-import os
+
 
 # =========================
 # ENV
@@ -114,8 +114,6 @@ def normalize_syl_links(text: str) -> str:
 def build_amazon_search_url(query: str) -> str:
     """
     Build an Amazon search URL that is ALWAYS tagged with our associate ID.
-    If the tag env var is missing, we raise so callers can decide what to do
-    (better to skip than leak an untagged link).
     """
     q = urllib.parse.quote_plus((query or "").strip())
     tag = os.getenv("AMAZON_ASSOCIATE_TAG", "").strip()
@@ -449,6 +447,18 @@ def wrap_all_affiliates(text: str) -> str:
 
     out = _URL_RE.sub(_plain_repl, out)
     return out
+
+def build_syl_redirect(retailer: str, url: str) -> str:
+    """
+    Wraps premium retailer URLs (Sephora, Ulta, Revolve, etc.)
+    with your ShopYourLikes redirect pattern.
+    """
+    pub = os.getenv("SYL_PUBLISHER_ID", "").strip()
+    if not pub or "sylikes.com" in url:
+        return url  # skip if already wrapped or no publisher id
+
+    encoded = urllib.parse.quote_plus(url)
+    return f"https://go.sylikes.com/redirect?publisher_id={pub}&url={encoded}"
 
 _URL_END_RE = re.compile(r"(https?://[^\s)]+)\s*$", re.I)
 
