@@ -28,6 +28,7 @@ import random
 import time
 import requests
 import json
+from app.linkwrap import build_amazon_search_url
 from app.ai import generate_contextual_closer
 from typing import Optional, List, Dict, Tuple
 from datetime import datetime, timezone, timedelta
@@ -104,14 +105,25 @@ GENIUSLINK_WRAP   = (os.getenv("GENIUSLINK_WRAP") or "").strip()
 GL_REWRITE        = os.getenv("GL_REWRITE", "1").lower() not in ("0", "false", "")
 _AMZN_RE          = re.compile(r"https?://(?:www\.)?amazon\.[^\s)\]]+", re.I)
 
-_AMZ_SEARCH_RE = re.compile(r"https?://(?:www\.)?amazon\.[^/\s]+/s\?[^)\s]+", re.I)
+_AMZ_TAG = os.getenv("AMAZON_ASSOCIATE_TAG", "").strip()
+_AMZ_SEARCH_RE = re.compile(r"https?://(?:www\.)?amazon\.com/s\?[^ \n]+", re.I)
 
 def _strip_amazon_search_links(text: str) -> str:
-    """Remove Amazon search URLs; we only allow direct DP links (handled upstream) or non-Amazon tutorials."""
+    """
+    Remove Amazon search URLs unless they include our exact &tag= associate id.
+    We still allow direct DP links or non-Amazon links upstream.
+    """
+    def _keep_if_tagged(m):
+        url = m.group(0)
+        # keep only if the link includes our tag; otherwise blank it
+        if _AMZ_TAG and f"tag={_AMZ_TAG}" in url:
+            return url
+        return ""
     try:
-        return _AMZ_SEARCH_RE.sub("", text or "")
+        return _AMZ_SEARCH_RE.sub(_keep_if_tagged, text or "")
     except Exception:
         return text
+
 # Strip bracketed link placeholders like: [link for ideas: ...]
 _LINK_PLACEHOLDER_RE = re.compile(r"\[(?:link|links)[^\]]*\]", re.I)
 _URL_WORD_RE = re.compile(r"\bURL\b[: ]?", re.I)

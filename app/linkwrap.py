@@ -112,10 +112,16 @@ def normalize_syl_links(text: str) -> str:
     return pattern.sub(_repl, text)
 
 def build_amazon_search_url(query: str) -> str:
+    """
+    Build an Amazon search URL that is ALWAYS tagged with our associate ID.
+    If the tag env var is missing, we raise so callers can decide what to do
+    (better to skip than leak an untagged link).
+    """
     q = urllib.parse.quote_plus((query or "").strip())
     tag = os.getenv("AMAZON_ASSOCIATE_TAG", "").strip()
-    base = f"https://www.amazon.com/s?k={q}"
-    return f"{base}&tag={tag}" if tag else base
+    if not tag:
+        raise RuntimeError("AMAZON_ASSOCIATE_TAG is required for Amazon links")
+    return f"https://www.amazon.com/s?k={q}&tag={tag}"
 
 _AFFIL_PARAMS = {
     # generic
