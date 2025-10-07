@@ -16,9 +16,9 @@ from __future__ import annotations
 import os
 import re
 import logging
-from urllib.parse import urlparse, urlunparse, parse_qs, urlencode, quote, quote_plus
-from urllib.parse import urlparse, parse_qs, unquote
-
+from urllib.parse import urlparse, urlunparse, parse_qs, urlencode, quote, quote_plus, unquote
+import urllib.parse
+import os
 
 # =========================
 # ENV
@@ -110,6 +110,12 @@ def normalize_syl_links(text: str) -> str:
         retailer_url = unquote(retailer_url)
         return f"https://go.shopmy.us/p-{pub}?url={retailer_url}"
     return pattern.sub(_repl, text)
+
+def build_amazon_search_url(query: str) -> str:
+    q = urllib.parse.quote_plus((query or "").strip())
+    tag = os.getenv("AMAZON_ASSOCIATE_TAG", "").strip()
+    base = f"https://www.amazon.com/s?k={q}"
+    return f"{base}&tag={tag}" if tag else base
 
 _AFFIL_PARAMS = {
     # generic

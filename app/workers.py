@@ -124,6 +124,18 @@ def _strip_link_placeholders(text: str) -> str:
         return t
     except Exception:
         return text
+    
+import re, urllib.parse, os
+
+_ALLOW_TOKEN_RE = re.compile(r"\[\[\s*ALLOW_AMZ_SEARCH\s*\]\]", re.I)
+_LINKS_TO_RE   = re.compile(r"^\s*links?\s+to\s+", re.I)
+
+def _strip_allow_tokens(s: str) -> str:
+    return _ALLOW_TOKEN_RE.sub("", s or "").strip()
+
+def _strip_links_preamble(s: str) -> str:
+    # remove “Links to ” or “Link to ” ONLY at the start, so we don’t leave a dangling “s”
+    return _LINKS_TO_RE.sub("", s or "").strip()
 
 # Opening/tone guards
 OPENING_BANNED = [
@@ -492,6 +504,10 @@ def _ensure_links_on_bullets(text: str, user_text: str) -> str:
             out.extend(cl.rstrip() for cl in chunk_lines)
 
         i = j
+        if "amazon" in line.lower() and "http" not in line.lower():
+            # build a safe search URL from the user query; keeps behavior minimal
+            amz = build_amazon_search_url(user_text or "")
+            line = re.sub(r"(?i)\bamazon\b", f"Amazon: {amz}", line)
 
     return "\n".join(out)
     
@@ -1501,6 +1517,9 @@ def generate_reply_job(
         cleaned = _clean_reply(raw)
         reply = (cleaned.strip() if cleaned else (raw.strip() if raw else ""))
         # remove survey-ish prompts
+        # Remove explicit allow token from user-visible text and fix preamble
+        reply = _strip_allow_tokens(reply)
+        reply = _strip_links_preamble(reply)
         reply = _anti_form_guard(reply, user_text)
         # If user clearly asked for products but reply is vague, rewrite to concrete picks
         if _looks_like_product_intent(user_text) and not _looks_like_concrete_picks(reply):
