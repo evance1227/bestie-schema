@@ -29,6 +29,7 @@ import time
 import requests
 import json
 from app.linkwrap import build_amazon_search_url
+from app.linkwrap import wrap_all_affiliates
 from app.ai import generate_contextual_closer
 from typing import Optional, List, Dict, Tuple
 from datetime import datetime, timezone, timedelta
@@ -436,9 +437,9 @@ def _ensure_links_on_bullets(text: str, user_text: str) -> str:
 
         label, retailer = _extract_label_and_retailer("\n".join(chunk_lines))
 
-        # CASE A: chunk already has a link → upgrade & validate, then rewrite
+        # CASE A: chunk already has a link – upgrade & validate, then rewrite
         if any("http://" in cl or "https://" in cl for cl in chunk_lines):
-            # 1) first url in the chunk
+            # 1) find the first URL in the chunk
             orig_url = ""
             for cl in chunk_lines:
                 m = re.search(r"(https?://\S+)", cl)
@@ -446,7 +447,27 @@ def _ensure_links_on_bullets(text: str, user_text: str) -> str:
                     orig_url = m.group(1)
                     break
 
+            # 2) if the URL is a premium retailer, replace with a retailer SEARCH (more stable)
+            #    SYL will wrap it downstream
+            try:
+                host = urlparse(orig_url).netloc.lower()
+                if host.startswith("www."):
+                    host = host[4:]
+            except Exception:
+                host = ""
+
+            if host in _RETAILER_SEARCH:
+                # Build a store search using the label (fallback to user_text)
+                q = quote_plus((label or user_text or "best match").strip())
+                search_url = _RETAILER_SEARCH[host].format(q=q)
+                # Prefer the store search over fragile product slugs
+                alt_url = search_url
+            else:
+                alt_url = ""  # leave empty so we fall back below if needed
+
+
             # 2) affiliate candidate (SYL→Amazon), else keep brand url
+        if not alt_url:
             alt_url = _prefer_affiliate_url(label, user_text) or orig_url
 
             # 3) if still not affiliate, try again to monetize
@@ -521,7 +542,9 @@ def _ensure_links_on_bullets(text: str, user_text: str) -> str:
             amz = build_amazon_search_url(user_text or "")
             line = re.sub(r"(?i)\bamazon\b", f"Amazon: {amz}", line)
 
-    return "\n".join(out)
+    reply_out = "\n".join(out)
+    return wrap_all_affiliates(reply_out)
+
     
 # --- Prefer affiliate-friendly links for text bullets (no category rules) ---
 _AFFIL_HINT = "sephora ulta nordstrom revolve shopbop target anthropologie free people amazon"
@@ -595,7 +618,9 @@ def _shorten_bullet_labels(text: str, max_len: int = 42) -> str:
             out.append(f"{label} — http{rest}")
         else:
             out.append(ln)
-    return "\n".join(out)
+    reply_out = "\n".join(out)
+    return wrap_all_affiliates(reply_out)
+
 
 # --- Copy tidy: remove dangling "here" phrasings when links are above ---
 _BAD_HERE = (
@@ -626,13 +651,13 @@ from urllib.parse import quote_plus
 
 # --- Retailer search URLs for SYL wrapping -----------------------------------
 _RETAILER_SEARCH = {
-    "sephora":  "https://www.sephora.com/search?keyword={q}",
-    "ulta":     "https://www.ulta.com/search?searchText={q}",
-    "nordstrom":"https://www.nordstrom.com/sr?keyword={q}",
-    "revolve":  "https://www.revolve.com/r/search?search={q}",
-    "shopbop":  "https://www.shopbop.com/actions/searchResultsAction.action?query={q}",
-    "target":   "https://www.target.com/s?searchTerm={q}",
-    "walmart":  "https://www.walmart.com/search?q={q}",
+    "sephora.com":   "https://www.sephora.com/search?keyword={q}",
+    "ulta.com":      "https://www.ulta.com/searchresults?Ntt={q}",
+    "nordstrom.com": "https://www.nordstrom.com/sr?keyword={q}",
+    "revolve.com":   "https://www.revolve.com/r/search/?q={q}",
+    "shopbop.com":   "https://www.shopbop.com/actions/searchResultsAction.action?query={q}",
+    "target.com":    "https://www.target.com/s?searchTerm={q}",
+    "walmart.com":   "https://www.walmart.com/search?q={q}",
 }
 
 # simple brand→retailer hints (extend anytime)
@@ -1532,6 +1557,7 @@ def generate_reply_job(
         # Remove explicit allow token from user-visible text and fix preamble
         reply = _strip_allow_tokens(reply)
         reply = _strip_links_preamble(reply)
+        reply = wrap_all_affiliates(reply)
         reply = re.sub(r"\b(s\s+to|links?\s+to)\b", "", reply, flags=re.I).strip()
         reply = _anti_form_guard(reply, user_text)
         # If user clearly asked for products but reply is vague, rewrite to concrete picks
@@ -1656,6 +1682,7 @@ def generate_reply_job(
         or (_ALLOW_AMZ_SEARCH_TOKEN in (text_val or ""))
     ):
         reply = _shorten_bullet_labels(_ensure_links_on_bullets(reply, user_text))
+        reply = wrap_all_affiliates(reply)
     else:
         # stay purely conversational — no "features" language unless they ask
         reply = _clean_reply(reply)
