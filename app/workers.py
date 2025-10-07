@@ -1616,18 +1616,18 @@ def generate_reply_job(
         or (_ALLOW_AMZ_SEARCH_TOKEN in (text_val or ""))
     )
 
-    # Only convert to shoppable bullets when it makes sense
+    # --- Only convert to shoppable bullets when it makes sense ---
     if (
-        image_mode                      # image present (meant for picks)
-        or _has_shop_intent(user_text)  # user asked for link/options/buy
-        or _has_shop_intent(reply)      # model itself promised picks/links
-        or (_ALLOW_AMZ_SEARCH_TOKEN in (text_val or ""))  # explicit allow token
+        image_mode  # user sent a photo
+        and _has_shop_intent(user_text)  # they asked for links/sizes/etc.
+        or _has_shop_intent(reply)
+        or (_ALLOW_AMZ_SEARCH_TOKEN in (text_val or ""))
     ):
-        reply = _shorten_bullet_labels(
-            _ensure_links_on_bullets(reply, user_text)
-        )
+        reply = _shorten_bullet_labels(_ensure_links_on_bullets(reply, user_text))
+    else:
+        # stay purely conversational — no "features" language unless they ask
+        reply = _clean_reply(reply)
 
-    # else: leave reply purely conversational
 
     _store_and_send(
         user_id, convo_id, reply, user_phone,
