@@ -427,6 +427,15 @@ def wrap_all_affiliates(text: str) -> str:
       - leave all other domains unchanged
     Works for both [markdown](url) and bare URLs in the text.
     """
+    # Normalize any old SYL pattern to the canonical ShopMy URL first
+    try:
+        text = normalize_syl_links(text)  # rewrites go.sylikes.com → go.shopmy.us/p-<pub>?url=...
+    except Exception:
+        pass
+
+    # Strip inline HTML attributes like target="_blank"> or target='_blank'>
+    text = re.sub(r'\s*target\s*=\s*([\'"])_blank\1\s*>?', "", text, flags=re.I)
+
 
     PREMIUM_SYL_DOMAINS = (
         "sephora.com",
@@ -492,19 +501,15 @@ def wrap_all_affiliates(text: str) -> str:
 
 def build_syl_redirect(retailer: str, url: str) -> str:
     """
-    Wrap premium retailer URLs (Sephora, Ulta, Revolve, etc.)
-    with the canonical ShopMy redirect pattern.
-    Example: https://go.shopmy.us/p/<pub>?url=<encoded>
+    Canonical ShopMy redirect: https://go.shopmy.us/p-<pub>?url=<encoded>
     """
     pub = os.getenv("SYL_PUBLISHER_ID", "").strip()
     if not pub:
         return url
-    # if already wrapped with shopmy, keep it
     if "go.shopmy.us" in url:
         return url
-
     encoded = urllib.parse.quote_plus(url)
-    return f"https://go.shopmy.us/p/{pub}?url={encoded}"
+    return f"https://go.shopmy.us/p-{pub}?url={encoded}"
 
 _URL_END_RE = re.compile(r"(https?://[^\s)]+)\s*$", re.I)
 

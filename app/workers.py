@@ -174,6 +174,11 @@ def _best_amz_query(label: str | None, user_text: str | None) -> str:
     t = re.sub(r"[^0-9A-Za-z .,'/-]+", " ", t)
     t = re.sub(r"\s+", " ", t).strip()
     return t or "best match"
+# Short confirmation -> continue the previous picks flow
+_CONFIRM_YES_RE = re.compile(r"^\s*(y|ya|yes|yep|yup|ok|okay|sure|please|do it|go ahead)\b", re.I)
+
+def _is_yes_confirm(s: str | None) -> bool:
+    return bool(_CONFIRM_YES_RE.search(s or ""))
 
 # Opening/tone guards
 OPENING_BANNED = [
@@ -472,98 +477,97 @@ def _ensure_links_on_bullets(text: str, user_text: str) -> str:
                     orig_url = m.group(1)
                     break
 
-            # 2) if the URL is a premium retailer, replace with a retailer SEARCH (more stable)
+        # 2) if the URL is a premium retailer, replace with a retailer SEARCH (more stable)
             #    SYL will wrap it downstream
-            try:
-                host = urlparse(orig_url).netloc.lower()
-                if host.startswith("www."):
-                    host = host[4:]
-            except Exception:
-                host = ""
+        try:
+            host = urlparse(orig_url).netloc.lower()
+            if host.startswith("www."):
+                host = host[4:]
+        except Exception:
+            host = ""        
 
-            if host in _RETAILER_SEARCH:
-                # Build a store search using the label (fallback to user_text)
-                q = quote_plus((label or user_text or "best match").strip())
-                search_url = _RETAILER_SEARCH[host].format(q=q)
-                # Prefer the store search over fragile product slugs
-                alt_url = search_url
-            else:
-                alt_url = ""  # leave empty so we fall back below if needed
+        if host in _RETAILER_SEARCH:
+            # Build a store search using the label (fallback to user_text)
+            q = quote_plus((label or user_text or "best match").strip())
+            search_url = _RETAILER_SEARCH[host].format(q=q)
+            # Prefer the store search over fragile product slugs
+            alt_url = search_url
+        else:
+            alt_url = ""  # leave empty so we fall back below if needed
 
 
             # 2) affiliate candidate (SYL→Amazon), else keep brand url
         if not alt_url:
             alt_url = _prefer_affiliate_url(label, user_text) or orig_url
 
-            # 3) if still not affiliate, try again to monetize
-            try:
-                host = urlparse(alt_url).netloc.lower()
-            except Exception:
-                host = ""
-            if not _is_affiliate_hostname(host):
-                improved = _prefer_affiliate_url(label, user_text)
-                if improved:
-                    alt_url = improved
+        # 3) if still not affiliate, try again to monetize
+        try:
+            host = urlparse(alt_url).netloc.lower()
+        except Exception:
+            host = ""
+        if not _is_affiliate_hostname(host):
+            improved = _prefer_affiliate_url(label, user_text)
+            if improved:
+                alt_url = improved
 
-            # 4) validate; if unsafe, fall back to affiliate search again
-            if not _is_https_live(alt_url):
-                fallback = _prefer_affiliate_url(label, user_text)
-                if fallback:
-                    alt_url = fallback
+        # 4) validate; if unsafe, fall back to affiliate search again
+        if not _is_https_live(alt_url):
+            fallback = _prefer_affiliate_url(label, user_text)
+            if fallback:
+                alt_url = fallback
 
-            # 5) rewrite first bullet line and drop raw link-only lines
-            first_line = chunk_lines[0].rstrip()
-            first_line = re.sub(r"\s[—–-]\shttps?://\S+\s*$", "", first_line)  # remove trailing existing link
-            first_line = re.sub(r"\s[—–-]\s*$", "", first_line)
+        # 5) rewrite first bullet line and drop raw link-only lines
+        first_line = chunk_lines[0].rstrip()
+        first_line = re.sub(r"\s[—–-]\shttps?://\S+\s*$", "", first_line)  # remove trailing existing link
+        first_line = re.sub(r"\s[—–-]\s*$", "", first_line)
 
-            if alt_url:
-                out.append(f"{first_line} — {alt_url}")
-            else:
-                out.append(first_line)
+        if alt_url:
+            out.append(f"{first_line} — {alt_url}")
+        else:
+            out.append(first_line)
 
-            for k in range(1, len(chunk_lines)):
-                if ("http://" in chunk_lines[k]) or ("https://" in chunk_lines[k]):
-                    continue
-                out.append(chunk_lines[k].rstrip())
+        for k in range(1, len(chunk_lines)):
+            if ("http://" in chunk_lines[k]) or ("https://" in chunk_lines[k]):
+                continue
+            out.append(chunk_lines[k].rstrip())
 
-            i = j
-            continue
+        i = j
+        continue
 
         # CASE B: no link in the chunk → build one
         
-        url = ""       # ensure url is always defined in this branch
+    url = ""       # ensure url is always defined in this branch
 
-        if label:
-            try:
-                if want_amazon or retailer.lower().startswith("amazon"):
-                    # optional deep link if you added it
-                    url = _amz_deep_link_if_obvious(label)
-                    if not url:
-                        url = _amz_search_url(_best_amz_query(label, user_text), user_text)
-                else:
-                    url = _prefer_affiliate_url(label, user_text) or _syl_search_url(label or (user_text or "best match"), user_text)
-            except Exception:
-                url = ""
+    if label:
+        try:
+            if want_amazon or retailer.lower().startswith("amazon"):
+                # optional deep link if you added it
+                url = _amz_deep_link_if_obvious(label)
+                if not url:
+                    url = _amz_search_url(_best_amz_query(label, user_text), user_text)
+            else:
+                url = _prefer_affiliate_url(label, user_text) or _syl_search_url(label or (user_text or "best match"), user_text)
+        except Exception:
+            url = ""
 
-        # FINAL GUARANTEE (this is where "if not url" was blowing up)
-        if not url:
-            try:
-                url = _syl_search_url(label or (user_text or "best match"), user_text) or _amz_search_url(label or (user_text or "best match"))
-            except Exception:
-                url = ""
+    # FINAL GUARANTEE (this is where "if not url" was blowing up)
+    if not url:
+        try:
+            url = _syl_search_url(label or (user_text or "best match"), user_text) or _amz_search_url(label or (user_text or "best match"))
+        except Exception:
+            url = ""
 
-        if url:
-            first_line = chunk_lines[0].rstrip()
-            first_line = re.sub(r"\s[—–-]\s*$", "", first_line)
-            out.append(f"{first_line} — {url}")
-            for k in range(1, len(chunk_lines)):
-                out.append(chunk_lines[k].rstrip())
-        else:
-            out.extend(cl.rstrip() for cl in chunk_lines)
+    if url:
+        first_line = chunk_lines[0].rstrip()
+        first_line = re.sub(r"\s[—–-]\s*$", "", first_line)
+        out.append(f"{first_line} — {url}")
+        for k in range(1, len(chunk_lines)):
+            out.append(chunk_lines[k].rstrip())
+    else:
+        out.extend(cl.rstrip() for cl in chunk_lines)
 
     reply_out = "\n".join(out)
     return wrap_all_affiliates(reply_out)
-
     
 # --- Prefer affiliate-friendly links for text bullets (no category rules) ---
 _AFFIL_HINT = "sephora ulta nordstrom revolve shopbop target anthropologie free people amazon"
@@ -1187,25 +1191,25 @@ def _store_and_send(
             logger.error("[Send][Error] fallback err=%s", e)
         return
 
-    # ----- Success path: join & send -----
-    full_text = "\n".join(parts).strip()
-    logger.info("[Send][Join] parts=%d override=%s body[:80]=%r",
-                len(parts), bool(send_phone), full_text[:80])
+    # ----- Success path: send each part in order (GHL won't auto-segment) -----
+    total = len(parts)
+    for idx, p in enumerate(parts, 1):
+        body = p if total == 1 else f"[{idx}/{total}] {p}"
+        # tolerant DB store (never block send) — we store each part
+        msg_id = str(uuid.uuid4())
+        try:
+            with db.session() as s:
+                models.insert_message(s, convo_id, user_id, msg_id, body)
+        except Exception as e:
+            logger.warning("[Worker][DB] Outbound store FAILED (db unavailable): %s", e)
+        # send this part
+        try:
+            integrations.send_sms_reply(user_id, body, phone_override=send_phone)
+        except Exception as e:
+            logger.error("[Send][Error] err=%s", e)
 
-    # tolerant DB store (never block send)
-    msg_id = str(uuid.uuid4())
-    try:
-        with db.session() as s:
-            models.insert_message(s, convo_id, user_id, msg_id, full_text)
-    except Exception as e:
-        logger.warning("[Worker][DB] Outbound store FAILED (db unavailable): %s", e)
-
-    try:
-        integrations.send_sms_reply(user_id, full_text, phone_override=send_phone)
-    except Exception as e:
-        logger.error("[Send][Error] err=%s", e)
     return
-
+    
 # --------------------------------------------------------------------- #
 # Rename flow
 #---------------------------------------------------------------------- #
@@ -1582,18 +1586,19 @@ def generate_reply_job(
         reply = re.sub(r"\s{2,}", " ", reply).strip()
         reply = re.sub(r"[:\-–]\s*$", "", reply)
         reply = _anti_form_guard(reply, user_text)
-        # If user clearly asked for products but reply is vague, rewrite to concrete picks
-        if _looks_like_product_intent(user_text) and not _looks_like_concrete_picks(reply):
+        # If user clearly asked for products OR confirmed, but reply is vague, rewrite to concrete picks
+        if (_looks_like_product_intent(user_text) or _is_yes_confirm(user_text)) and not _looks_like_concrete_picks(reply):
             try:
                 rescue = ai.rewrite_as_three_picks(
                     user_text=user_text,
                     base_reply=reply,
-                    system_prompt=persona
+                    system_prompt=persona,
                 )
                 if rescue and len(rescue.strip()) > len((reply or "").strip()):
                     reply = rescue.strip()
             except Exception:
                 pass
+
 
         reply = _maybe_append_ai_closer(reply, user_text, category=None, convo_id=convo_id)
         # is the user explicitly asking for links?
