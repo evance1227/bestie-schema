@@ -492,15 +492,19 @@ def wrap_all_affiliates(text: str) -> str:
 
 def build_syl_redirect(retailer: str, url: str) -> str:
     """
-    Wraps premium retailer URLs (Sephora, Ulta, Revolve, etc.)
-    with your ShopYourLikes redirect pattern.
+    Wrap premium retailer URLs (Sephora, Ulta, Revolve, etc.)
+    with the canonical ShopMy redirect pattern.
+    Example: https://go.shopmy.us/p/<pub>?url=<encoded>
     """
     pub = os.getenv("SYL_PUBLISHER_ID", "").strip()
-    if not pub or "sylikes.com" in url:
-        return url  # skip if already wrapped or no publisher id
+    if not pub:
+        return url
+    # if already wrapped with shopmy, keep it
+    if "go.shopmy.us" in url:
+        return url
 
     encoded = urllib.parse.quote_plus(url)
-    return f"https://go.sylikes.com/redirect?publisher_id={pub}&url={encoded}"
+    return f"https://go.shopmy.us/p/{pub}?url={encoded}"
 
 _URL_END_RE = re.compile(r"(https?://[^\s)]+)\s*$", re.I)
 

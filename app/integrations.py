@@ -305,26 +305,21 @@ def _post_with_retry(url: str, payload: Dict[str, Any], headers: Dict[str, str],
 
 def send_sms_reply(user_id: int, text: str, phone_override: str | None = None):
     """
-    Send an outbound SMS via LeadConnector webhook.
-    Uses phone_override (from webhook/queue) when provided; falls back to DB lookup.
+    Wrapper that prepares the message + phone, then hands off to _send_outbound().
+    Uses phone_override (from webhook/queue) when provided so we can send even if DB is down.
     """
     msg = _strip_bestie_prefix((text or "").strip())
     if not msg:
         logger.warning("[Integrations][Send] Empty message for user_id=%s; skipping", user_id)
         return {"ok": False, "reason": "empty"}
 
-    phone_src = "override" if phone_override else "db"
+    # Choose phone from override (webhook) or DB
     phone_raw = phone_override if phone_override else _resolve_phone(user_id)
-    phone = _normalize_phone(phone_raw)
+    logger.info("[Integrations][Send] route=%s phone_raw=%r",
+                "override" if phone_override else "db", phone_raw)
 
-    logger.info("[Integrations][Send] route=%s raw=%r normalized=%r", phone_src, phone_raw, phone)
-
-    if not phone:
-        logger.error("[Integrations][Send] ❌ No phone for user_id=%s; abort", user_id)
-        return {"ok": False, "reason": "no_phone"}
-
-    return _send_outbound(phone, msg)
-
+    # Hand off to your EXISTING robust sender (keep your current _send_outbound)
+    return _send_outbound(phone_raw, msg)
 
 # --- end insert ---
 
