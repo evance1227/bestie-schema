@@ -466,6 +466,14 @@ def _ensure_links_on_bullets(text: str, user_text: str) -> str:
             j += 1
 
         label, retailer = _extract_label_and_retailer("\n".join(chunk_lines))
+            # --- extract label/retailer safely (used by both Case A and B) ---
+        label: str = ""
+        retailer: str = ""
+        try:
+            label, retailer = _extract_label_and_retailer("\n".join(chunk_lines))
+        except Exception:
+            # keep empty defaults; downstream guards will handle it
+            pass
 
         # CASE A: chunk already has a link – upgrade & validate, then rewrite
         if any("http://" in cl or "https://" in cl for cl in chunk_lines):
