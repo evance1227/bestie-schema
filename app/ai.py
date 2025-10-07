@@ -284,44 +284,58 @@ DEFAULT_NAME = "Bestie"
 
 def _fetch_profile_bits(user_id: Optional[int]) -> Tuple[str, str, str]:
     """
-    Return (persona_addon, bestie_name, quiz_profile_text)
+    Safely fetch persona add-ons for the user.
+    Returns (persona_addon, bestie_name, quiz_profile_text).
+    Falls back to safe defaults if DB is unavailable or no row exists.
     """
+    # Safe defaults
+    persona_addon: str = ""
+    bestie_name: str = DEFAULT_NAME
+    quiz_profile_text: str = ""
+
     if not user_id:
-        return "", DEFAULT_NAME, ""
+        return persona_addon, bestie_name, quiz_profile_text
+
     try:
         with db.session() as s:
             row = s.execute(
                 sqltext("""
                     SELECT
-                      COALESCE(persona,'') AS persona,
-                      COALESCE(bestie_name,'') AS bestie_name,
-                      COALESCE(sizes::text,'') AS sizes,
-                      COALESCE(brands::text,'') AS brands,
-                      COALESCE(budget_range,'') AS budget,
+                      COALESCE(persona,'')          AS persona,
+                      COALESCE(bestie_name,'')      AS bestie_name,
+                      COALESCE(sizes::text,'')      AS sizes,
+                      COALESCE(brands::text,'')     AS brands,
+                      COALESCE(budget_range,'')     AS budget,
                       COALESCE(sensitivities::text,'') AS sensitivities,
-                      COALESCE(memory_notes,'') AS memory_notes
+                      COALESCE(memory_notes,'')     AS memory_notes
                     FROM user_profiles
                     WHERE user_id = :uid
                 """),
                 {"uid": user_id}
             ).first()
 
-        persona_addon = (row[0] or "").strip() if row else ""
-        bestie_name = (row[1] or "").strip() if row else DEFAULT_NAME
+        if row:
+            persona_addon = (row[0] or "").strip()
+            # fallback to DEFAULT_NAME if empty/whitespace
+            bn = (row[1] or "").strip()
+            bestie_name = bn if bn else DEFAULT_NAME
 
-        quiz_data = {
-            "Sizes": row[2] if row else "",
-            "Favorite Brands": row[3] if row else "",
-            "Budget Range": row[4] if row else "",
-            "Topics to Avoid": row[5] if row else "",
-            "Emotional Notes": row[6] if row else "",
-        }
-        quiz_profile_lines = [f"{k}: {v}" for k, v in quiz_data.items() if v]
-        quiz_profile_text = "\n".join(quiz_profile_lines)
-        return persona_addon, (bestie_name or DEFAULT_NAME), quiz_profile_text
+            quiz_data = {
+                "Sizes":            row[2] or "",
+                "Favorite Brands":  row[3] or "",
+                "Budget Range":     row[4] or "",
+                "Topics to Avoid":  row[5] or "",
+                "Emotional Notes":  row[6] or "",
+            }
+            quiz_profile_text = "\n".join(
+                f"{k}: {v}" for k, v in quiz_data.items() if v
+            )
+
     except Exception as e:
-        logger.exception("[AI][Persona] Fetch failed for user_id={}: {}", user_id, e)
-        return "", DEFAULT_NAME, ""
+        # Keep it quiet when DB is down; do not raise, just use defaults
+        logger.warning("[AI][Persona] DB unavailable; using defaults for user_id=%s: %s", user_id, e)
+
+    return persona_addon, bestie_name, quiz_profile_text
 
 def compose_persona(user_id: Optional[int], session_goal: Optional[str] = None) -> str:
     """
