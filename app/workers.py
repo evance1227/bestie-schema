@@ -150,6 +150,31 @@ def _strip_links_preamble(s: str) -> str:
     # remove “Links to ” or “Link to ” ONLY at the start, so we don’t leave a dangling “s”
     return _LINKS_TO_RE.sub("", s or "").strip()
 
+# --- Amazon query cleaner -----------------------------------------------------
+_AMZ_QUERY_STOP = re.compile(
+    r"\b(can you|could you|please|send|shoot|over|that|this|link|links?|"
+    r"so i can.*|buy it (there|here)|available on|on amazon|for me)\b",
+    re.I,
+)
+
+def _best_amz_query(label: str | None, user_text: str | None) -> str:
+    """
+    Choose a clean search phrase for Amazon:
+      - prefer the bullet label if present (usually 'Brand • Product')
+      - else strip meta phrases from the user text
+    """
+    if (label or "").strip():
+        return label.strip()
+    t = (user_text or "")
+    # remove urls
+    t = re.sub(r"https?://\S+", "", t)
+    # drop meta phrases ("send the link", "so I can buy it there", etc.)
+    t = _AMZ_QUERY_STOP.sub(" ", t)
+    # collapse whitespace / punctuation noise
+    t = re.sub(r"[^0-9A-Za-z .,'/-]+", " ", t)
+    t = re.sub(r"\s+", " ", t).strip()
+    return t or "best match"
+
 # Opening/tone guards
 OPENING_BANNED = [
     "it sounds like", "i understand that", "you're not alone",
@@ -514,7 +539,7 @@ def _ensure_links_on_bullets(text: str, user_text: str) -> str:
                     # optional deep link if you added it
                     url = _amz_deep_link_if_obvious(label)
                     if not url:
-                        url = _amz_search_url(label or (user_text or "best match"))
+                        url = _amz_search_url(_best_amz_query(label, user_text), user_text)
                 else:
                     url = _prefer_affiliate_url(label, user_text) or _syl_search_url(label or (user_text or "best match"), user_text)
             except Exception:
@@ -562,7 +587,7 @@ def _prefer_affiliate_url(label: str, user_text: str) -> str:
         pass
     # 2) Amazon next
     try:
-        url = _amz_search_url(label or (ut or "best match"))
+        url = _amz_search_url(_best_amz_query(label, user_text), user_text)
         if url:
             return url
     except Exception:
@@ -1548,11 +1573,14 @@ def generate_reply_job(
         cleaned = _clean_reply(raw)
         reply = (cleaned.strip() if cleaned else (raw.strip() if raw else ""))
         # remove survey-ish prompts
-        # Remove explicit allow token from user-visible text and fix preamble
+        # Remove explicit allow token from user-visible text and fix preamble       
+        reply = _shorten_bullet_labels(_ensure_links_on_bullets(reply, user_text))
+        reply = wrap_all_affiliates(reply)        
         reply = _strip_allow_tokens(reply)
         reply = _strip_links_preamble(reply)
-        reply = wrap_all_affiliates(reply)
         reply = re.sub(r"\b(s\s+to|links?\s+to)\b", "", reply, flags=re.I).strip()
+        reply = re.sub(r"\s{2,}", " ", reply).strip()
+        reply = re.sub(r"[:\-–]\s*$", "", reply)
         reply = _anti_form_guard(reply, user_text)
         # If user clearly asked for products but reply is vague, rewrite to concrete picks
         if _looks_like_product_intent(user_text) and not _looks_like_concrete_picks(reply):
