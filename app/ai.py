@@ -410,7 +410,7 @@ def build_messages(
     if product_candidates:
         product_block = build_product_block(product_candidates)
         user_payload += "\n\n" + product_block
-   
+    # ------- BEGIN vision-aware user message -------
     img_urls = []
     if context:
         img_urls = (context or {}).get("media_urls") or []
@@ -420,11 +420,12 @@ def build_messages(
             "role": "user",
             "content": [
                 {"type": "text", "text": user_text or user_payload or "What do you think?"},
-                {"type": "image_url", "image_url": img_urls[0]},
+                {"type": "image_url", "image_url": {"url": img_urls[0]}},  # <-- FIXED here
             ],
         })
     else:
         msgs.append({"role": "user", "content": user_text or user_payload})
+    # -------- END vision-aware user message --------
 
     return msgs
   
