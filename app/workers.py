@@ -576,6 +576,7 @@ def _ensure_links_on_bullets(text: str, user_text: str) -> str:
 
             # 6) rewrite first bullet line and drop raw link-only lines
             first_line = chunk_lines[0].rstrip()
+            alt_url = _force_partner_search_if_brand(alt_url, label, user_text)
             # remove trailing existing link or naked dash
             first_line = re.sub(r"\s[—–-]\shttps?://\S+\s*$", "", first_line)
             first_line = re.sub(r"\s[—–-]\s*$", "", first_line)
@@ -637,7 +638,7 @@ def _ensure_links_on_bullets(text: str, user_text: str) -> str:
                     if tmpl:
                         url = tmpl.format(q=q)
                         break
-
+        url = _force_partner_search_if_brand(url, label, user_text)
         if url:
             first_line = chunk_lines[0].rstrip()
             first_line = re.sub(r"\s[—–-]\s*$", "", first_line)
@@ -776,6 +777,32 @@ _PREFERRED_PARTNER_ORDER = [
     "sephora.com",
     "ulta.com",
 ]
+def _force_partner_search_if_brand(url: str | None, label: str, user_text: str) -> str | None:
+    """
+    If 'url' points to a non-affiliate brand host (not shopmy/us, not premium partners),
+    replace it with the first available premium partner search using the label/user_text.
+    Otherwise return url unchanged.
+    """
+    if not url:
+        return url
+    try:
+        h = urlparse(url).netloc.lower()
+        if h.startswith("www."):
+            h = h[4:]
+    except Exception:
+        return url
+
+    # if already shopmy/us or a premium partner, keep
+    if _is_affiliate_hostname(h) or h in _RETAILER_SEARCH:
+        return url
+
+    # For brand hosts (frye.com, samedelman.com, drscholls.com, etc.) → force partner search
+    q = quote_plus((label or user_text or "best match").strip())
+    for partner in _PREFERRED_PARTNER_ORDER:
+        tmpl = _RETAILER_SEARCH.get(partner)
+        if tmpl:
+            return tmpl.format(q=q)
+    return url
 
 # simple brand→retailer hints (extend anytime)
 _BRAND_HINTS = {
