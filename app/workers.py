@@ -179,6 +179,30 @@ _CONFIRM_YES_RE = re.compile(r"^\s*(y|ya|yes|yep|yup|ok|okay|sure|please|do it|g
 
 def _is_yes_confirm(s: str | None) -> bool:
     return bool(_CONFIRM_YES_RE.search(s or ""))
+# --- Strong shopping intent ---------------------------------------------------
+# signals: explicit "send me links", product nouns, event + clothing nouns, or budget/size
+_SHOP_VERB_RE  = re.compile(r"\b(send|show|find|grab|shoot|link|links|buy|purchase|order|recommend|rec|pick|picks)\b", re.I)
+_PRODUCT_NOUNS = re.compile(r"\b(dress|boot|tee|top|jean|jacket|coat|sweater|skirt|bag|heel|sandal|fragrance|perfume|liner|lip|mascara|foundation|concealer)\b", re.I)
+_EVENT_WORDS   = re.compile(r"\b(concert|wedding|date|party|event|interview|game|trip|vacation)\b", re.I)
+
+_HAS_BUDGET_RE = re.compile(r"\$?\d{2,4}\s*(?:-\s*\$?\d{2,4})|\bunder\s*\$?\d+\b|\bover\s*\$?\d+\b", re.I)
+_HAS_SIZE_RE   = re.compile(r"\b(xs|s|m|l|xl|xxl|2x|3x|\d{0,2}\s*(?:petite|tall)?)\b", re.I)
+
+def _has_budget_or_size(s: str | None) -> bool:
+    t = (s or "")
+    return bool(_HAS_BUDGET_RE.search(t) or _HAS_SIZE_RE.search(t))
+
+def _strong_product_intent(user_text: str | None, reply_so_far: str | None) -> bool:
+    """True if the user is obviously shopping or we already promised picks."""
+    u = (user_text or "").lower()
+    r = (reply_so_far or "").lower()
+    return (
+        _has_shop_intent(u)                      # your existing detector
+        or "http" in r                           # model already started linking
+        or _has_budget_or_size(u)                # budget/size given
+        or (_SHOP_VERB_RE.search(u) and _PRODUCT_NOUNS.search(u))  # verb+noun
+        or (_EVENT_WORDS.search(u) and _PRODUCT_NOUNS.search(u))   # event+noun
+    )
 
 # Opening/tone guards
 OPENING_BANNED = [
@@ -1623,8 +1647,8 @@ def generate_reply_job(
         reply = re.sub(r"\s{2,}", " ", reply).strip()
         reply = re.sub(r"[:\-–]\s*$", "", reply)
         reply = _anti_form_guard(reply, user_text)
-        # If user clearly asked for products OR confirmed, but reply is vague, rewrite to concrete picks
-        if (_looks_like_product_intent(user_text) or _is_yes_confirm(user_text)) and not _looks_like_concrete_picks(reply):
+        # If shopping intent is clear, jump straight to concrete picks (no survey)
+        if _strong_product_intent(user_text, reply) and not _looks_like_concrete_picks(reply):
             try:
                 rescue = ai.rewrite_as_three_picks(
                     user_text=user_text,
@@ -1633,8 +1657,9 @@ def generate_reply_job(
                 )
                 if rescue and len(rescue.strip()) > len((reply or "").strip()):
                     reply = rescue.strip()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.exception("[Picks] rewrite failed: %s", e)
+
 
 
         reply = _maybe_append_ai_closer(reply, user_text, category=None, convo_id=convo_id)
