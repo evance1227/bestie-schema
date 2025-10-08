@@ -750,6 +750,8 @@ _PREFERRED_PARTNER_ORDER = [
     "nordstrom.com",
     "anthropologie.com",
     "freepeople.com",
+    "sephora.com",
+    "ulta.com",
 ]
 
 # simple brand→retailer hints (extend anytime)
