@@ -535,7 +535,16 @@ def _ensure_links_on_bullets(text: str, user_text: str) -> str:
                 # Prefer the store search over fragile product slugs
                 alt_url = search_url
             else:
-                alt_url = ""  # leave empty so we fall back below if needed
+                # If the original host isn’t one of our premium partners and isn’t affiliate,
+                # route to the first available premium partner’s search for this label.
+                alt_url = ""
+                if not _is_affiliate_hostname(host):
+                    q = quote_plus((label or user_text or "best match").strip())
+                    for partner in _PREFERRED_PARTNER_ORDER:
+                        tmpl = _RETAILER_SEARCH.get(partner)
+                        if tmpl:
+                            alt_url = tmpl.format(q=q)
+                            break
 
             # 3) affiliate candidate (SYL→Amazon), else keep brand url
             if not alt_url:
@@ -734,6 +743,14 @@ _RETAILER_SEARCH = {
     "target.com":    "https://www.target.com/s?searchTerm={q}",
     "walmart.com":   "https://www.walmart.com/search?q={q}",
 }
+
+# Highest-payout / preferred partners — in order
+_PREFERRED_PARTNER_ORDER = [
+    "revolve.com",
+    "nordstrom.com",
+    "anthropologie.com",
+    "freepeople.com",
+]
 
 # simple brand→retailer hints (extend anytime)
 _BRAND_HINTS = {
@@ -1257,6 +1274,7 @@ def _store_and_send(
         # send this part
         try:
             integrations.send_sms_reply(user_id, body, phone_override=send_phone)
+            time.sleep(0.35)  # small pause improves ordering & delivery across gateways
         except Exception as e:
             logger.error("[Send][Error] err=%s", e)
 
@@ -1659,8 +1677,6 @@ def generate_reply_job(
                     reply = rescue.strip()
             except Exception as e:
                 logger.exception("[Picks] rewrite failed: %s", e)
-
-
 
         reply = _maybe_append_ai_closer(reply, user_text, category=None, convo_id=convo_id)
         # is the user explicitly asking for links?
