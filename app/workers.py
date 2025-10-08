@@ -545,7 +545,15 @@ def _ensure_links_on_bullets(text: str, user_text: str) -> str:
                         if tmpl:
                             alt_url = tmpl.format(q=q)
                             break
-
+            # If alt_url is still empty and this was a brand PDP (non-affiliate), force partner search
+            if not alt_url and not _is_affiliate_hostname(host):
+                q = quote_plus((label or user_text or "best match").strip())
+                for partner in _PREFERRED_PARTNER_ORDER:
+                    tmpl = _RETAILER_SEARCH.get(partner)
+                    if tmpl:
+                        alt_url = tmpl.format(q=q)
+                        break
+                                
             # 3) affiliate candidate (SYL→Amazon), else keep brand url
             if not alt_url:
                 alt_url = _prefer_affiliate_url(label, user_text) or orig_url
@@ -614,6 +622,21 @@ def _ensure_links_on_bullets(text: str, user_text: str) -> str:
                 )
             except Exception:
                 url = ""
+        # If we built/kept a non-affiliate brand URL, prefer partner search
+        if url:
+            try:
+                h = urlparse(url).netloc.lower()
+                if h.startswith("www."):
+                    h = h[4:]
+            except Exception:
+                h = ""
+            if not _is_affiliate_hostname(h):
+                q = quote_plus((label or user_text or "best match").strip())
+                for partner in _PREFERRED_PARTNER_ORDER:
+                    tmpl = _RETAILER_SEARCH.get(partner)
+                    if tmpl:
+                        url = tmpl.format(q=q)
+                        break
 
         if url:
             first_line = chunk_lines[0].rstrip()
