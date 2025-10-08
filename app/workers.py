@@ -177,6 +177,47 @@ def _best_amz_query(label: str | None, user_text: str | None) -> str:
 # Short confirmation -> continue the previous picks flow
 _CONFIRM_YES_RE = re.compile(r"^\s*(y|ya|yes|yep|yup|ok|okay|sure|please|do it|go ahead)\b", re.I)
 
+def _force_partner_search_if_brand(url: str | None, label: str, user_text: str) -> str | None:
+    """
+    If url points to a non-affiliate brand host (not shopmy/us, not our premium partners),
+    replace it with the first available premium partner search using label/user_text.
+    """
+    if not url:
+        return url
+    try:
+        h = urlparse(url).netloc.lower()
+        if h.startswith("www."):
+            h = h[4:]
+    except Exception:
+        return url
+
+    # keep if already affiliate (shopmy/us or amazon) or already a premium partner
+    if _is_affiliate_hostname(h) or h in _RETAILER_SEARCH:
+        return url
+
+    q = quote_plus((label or user_text or "best match").strip())
+    for partner in _PREFERRED_PARTNER_ORDER:
+        tmpl = _RETAILER_SEARCH.get(partner)
+        if tmpl:
+            return tmpl.format(q=q)
+    return url
+
+def _strip_trailing_link_fragments(s: str) -> str:
+    """
+    Remove trailing ' - https://…', '(https://…)', '(alt: https://…)', '[link](https://…)' fragments.
+    """
+    s = s.rstrip()
+    # remove ' - https://...' at end
+    s = re.sub(r"\s[—–-]\shttps?://\S+\s*$", "", s)
+    # remove trailing dash only
+    s = re.sub(r"\s[—–-]\s*$", "", s)
+    # remove trailing parenthetical link (alt or plain)
+    s = re.sub(r"\s*\(\s*alt:?\s*https?://[^\s)]+\)\s*$", "", s, flags=re.I)
+    s = re.sub(r"\s*\(\s*https?://[^\s)]+\)\s*$", "", s)
+    # remove trailing [link](https://...)
+    s = re.sub(r"\s*\[\s*link\s*\]\s*\(\s*https?://[^\s)]+\)\s*$", "", s, flags=re.I)
+    return s.strip()
+
 def _is_yes_confirm(s: str | None) -> bool:
     return bool(_CONFIRM_YES_RE.search(s or ""))
 # --- Strong shopping intent ---------------------------------------------------
@@ -573,13 +614,9 @@ def _ensure_links_on_bullets(text: str, user_text: str) -> str:
                 fallback = _prefer_affiliate_url(label, user_text)
                 if fallback:
                     alt_url = fallback
-
-            # 6) rewrite first bullet line and drop raw link-only lines
-            first_line = chunk_lines[0].rstrip()
             alt_url = _force_partner_search_if_brand(alt_url, label, user_text)
-            # remove trailing existing link or naked dash
-            first_line = re.sub(r"\s[—–-]\shttps?://\S+\s*$", "", first_line)
-            first_line = re.sub(r"\s[—–-]\s*$", "", first_line)
+            # 6) rewrite first bullet line and drop raw link-only lines
+            first_line = _strip_trailing_link_fragments(chunk_lines[0])
 
             if alt_url:
                 out.append(f"{first_line} — {alt_url}")
