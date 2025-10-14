@@ -204,6 +204,24 @@ _AMZ_QUERY_STOP = re.compile(
     r"so i can.*|buy it (there|here)|available on|on amazon|for me)\b",
     re.I,
 )
+_STOPWORDS = {
+    "the","for","and","with","that","this","those","these","some","any","much","more","less",
+    "please","send","give","show","shoot","find","buy","purchase","order","brand","name",
+    "can","could","would","will","now","today","really","very","like","about","into","from"
+}
+
+def _carry_user_modifiers(user_text: str | None, label: str | None) -> str:
+    """
+    Keep the user's own descriptors (>=3 chars, not stopwords) and prepend them
+    to the model's label. Example: "lip liner stain 8.5 waterproof" + "NARS Velvet Matte ..."
+    -> "lip liner stain 8.5 waterproof NARS Velvet Matte ..."
+    """
+    t = (user_text or "")
+    mods = [w for w in re.findall(r"[A-Za-z0-9\-]{3,}", t) if w.lower() not in _STOPWORDS]
+    base = (label or "").strip()
+    q = (" ".join(mods + ([base] if base else []))).strip()
+    # normalize whitespace and cap length
+    return re.sub(r"\s+", " ", q)[:120] or (base or t or "best match")
 
 def _best_amz_query(label: str | None, user_text: str | None) -> str:
     """
@@ -243,7 +261,7 @@ def _force_partner_search_if_brand(url: str | None, label: str, user_text: str) 
     if _is_affiliate_hostname(h) or h in _RETAILER_SEARCH:
         return url
 
-    q = quote_plus((label or user_text or "best match").strip())
+    q = quote_plus(_carry_user_modifiers(user_text, label))
     for partner in _PREFERRED_PARTNER_ORDER:
         tmpl = _RETAILER_SEARCH.get(partner)
         if tmpl:
@@ -619,7 +637,7 @@ def _ensure_links_on_bullets(text: str, user_text: str) -> str:
 
             if host in _RETAILER_SEARCH:
                 # Build a store search using the label (fallback to user_text)
-                q = quote_plus((label or user_text or "best match").strip())
+                q = quote_plus(_carry_user_modifiers(user_text, label))
                 search_url = _RETAILER_SEARCH[host].format(q=q)
                 # Prefer the store search over fragile product slugs
                 alt_url = search_url
@@ -628,7 +646,7 @@ def _ensure_links_on_bullets(text: str, user_text: str) -> str:
                 # route to the first available premium partner’s search for this label.
                 alt_url = ""
                 if not _is_affiliate_hostname(host):
-                    q = quote_plus((label or user_text or "best match").strip())
+                    q = quote_plus(_carry_user_modifiers(user_text, label))
                     for partner in _PREFERRED_PARTNER_ORDER:
                         tmpl = _RETAILER_SEARCH.get(partner)
                         if tmpl:
@@ -636,7 +654,7 @@ def _ensure_links_on_bullets(text: str, user_text: str) -> str:
                             break
             # If alt_url is still empty and this was a brand PDP (non-affiliate), force partner search
             if not alt_url and not _is_affiliate_hostname(host):
-                q = quote_plus((label or user_text or "best match").strip())
+                q = quote_plus(_carry_user_modifiers(user_text, label))
                 for partner in _PREFERRED_PARTNER_ORDER:
                     tmpl = _RETAILER_SEARCH.get(partner)
                     if tmpl:
@@ -718,7 +736,7 @@ def _ensure_links_on_bullets(text: str, user_text: str) -> str:
             except Exception:
                 h = ""
             if not _is_affiliate_hostname(h):
-                q = quote_plus((label or user_text or "best match").strip())
+                q = quote_plus(_carry_user_modifiers(user_text, label))
                 for partner in _PREFERRED_PARTNER_ORDER:
                     tmpl = _RETAILER_SEARCH.get(partner)
                     if tmpl:
@@ -882,7 +900,7 @@ def _force_partner_search_if_brand(url: str | None, label: str, user_text: str) 
         return url
 
     # For brand hosts (frye.com, samedelman.com, drscholls.com, etc.) → force partner search
-    q = quote_plus((label or user_text or "best match").strip())
+    q = quote_plus(_carry_user_modifiers(user_text, label))
     for partner in _PREFERRED_PARTNER_ORDER:
         tmpl = _RETAILER_SEARCH.get(partner)
         if tmpl:

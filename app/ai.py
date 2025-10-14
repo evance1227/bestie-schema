@@ -413,8 +413,10 @@ def build_messages(
     persona += "\nYou’re free-flowing and intuitive. If they send a photo, talk naturally about it first—observe, react, and help them decide what to do next."
     msgs = [{"role": "system", "content": persona}]
     # Keep a bit more context when the user sends very short confirmations (e.g., "yes", "no", "ok")
-    if recent and len((user_text or "").strip()) <= 5:
-        msgs.extend(recent[-3:])   # last three turns are usually enough to keep thread
+    # Keep more context when the user sends short confirmations (e.g., "yes", "ok")
+    if recent:
+        short = len((user_text or "").strip()) <= 5
+        msgs.extend(recent[-3:] if short else recent)
     elif recent:
         msgs.extend(recent)
 
@@ -572,6 +574,7 @@ def generate_reply(
 def rewrite_as_three_picks(user_text: str, base_reply: str, system_prompt: str) -> str:
     """
     If the first reply dodged, ask GPT to rewrite into 2–3 product picks with one-liners.
+    Carry forward any explicit user modifiers (e.g., ‘stain’, ‘waterproof’, sizes, budgets) exactly; do not substitute related categories.
     """
     import os, logging
     from openai import OpenAI
