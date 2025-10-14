@@ -14,8 +14,8 @@ Notes:
 - No em dashes in user-facing output. We sanitize.
 - Links are left intact for workers.py to run link hygiene.
 """
-
 from __future__ import annotations
+from openai import OpenAI
 
 import os
 import re
@@ -255,6 +255,22 @@ def single_line(system: str, user: str, *, max_tokens: int = 60, temperature: fl
         except Exception:
             pass
         return ""
+def _load_recent_by_convo(convo_id: int, limit: int = 12) -> List[Dict]:
+    turns: List[Dict] = []
+    try:
+        from redis import Redis
+        _r = Redis.from_url(os.getenv("REDIS_URL"))
+        key = f"conv:{convo_id}:turns"
+        raw = _r.lrange(key, 0, limit - 1) or []
+        # Redis returns newest-first; reverse for oldest-first
+        for b in reversed(raw):
+            try:
+                turns.append(json.loads(b))
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return turns
 
 # ------------------------------------------------------------------------
 # Multimodal helpers (allow [IMG:url] inline tags if workers ever pass them through)
@@ -400,6 +416,22 @@ def _load_recent_turns(user_id: Optional[int], limit: int = 12) -> List[Dict]:
     except Exception as e:
         logger.debug("[AI][Mem] load_recent_turns error: {}", e)
         return []
+def _load_recent_by_convo(convo_id: int, limit: int = 12) -> list[dict]:
+    turns: list[dict] = []
+    try:
+        from redis import Redis
+        _r = Redis.from_url(os.getenv("REDIS_URL"))
+        key = f"conv:{convo_id}:turns"
+        raw = _r.lrange(key, 0, limit - 1) or []
+        for b in reversed(raw):  # newest-first -> oldest-first
+            try:
+                turns.append(json.loads(b))
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return turns
+    
 def build_messages(
     user_text: str,
     user_id: int,
@@ -412,8 +444,21 @@ def build_messages(
     persona = persona or compose_persona(user_id)
     persona += "\nYou’re free-flowing and intuitive. If they send a photo, talk naturally about it first—observe, react, and help them decide what to do next."
     msgs = [{"role": "system", "content": persona}]
-    # Keep a bit more context when the user sends very short confirmations (e.g., "yes", "no", "ok")
-    # Keep more context when the user sends short confirmations (e.g., "yes", "ok")
+    # Merge recent conversation from Redis by convo_id if provided
+    convo_id = None
+    if context and isinstance(context, dict):
+        convo_id = context.get("convo_id")
+
+    recent = []
+    if convo_id is not None:
+        recent = _load_recent_by_convo(convo_id, limit=12)
+
+    # keep context; for very short user inputs keep last 3 for more stickiness
+    if recent:
+        short = len((user_text or "").strip()) <= 5
+        msgs.extend(recent[-3:] if short else recent)
+
+    # Keep a bit more context when the user sends very short confirmations (e.g., "yes", "no", "ok") 
     if recent:
         short = len((user_text or "").strip()) <= 5
         msgs.extend(recent[-3:] if short else recent)

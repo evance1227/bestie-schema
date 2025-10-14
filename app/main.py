@@ -482,6 +482,15 @@ def process_incoming(
         # Build a Queue here; do not pass this Queue into job args, only to the helper.
         _conn  = Redis.from_url(os.getenv("REDIS_URL"))
         _queue = Queue(os.getenv("QUEUE_NAME", "bestie_queue"), connection=_conn)
+        # ---- Save incoming turn to Redis (conversation buffer) ----
+        try:
+            from redis import Redis
+            _r = Redis.from_url(os.getenv("REDIS_URL"))
+            key = f"conv:{convo_id}:turns"
+            _r.lpush(key, json.dumps({"role": "user", "content": text or ""}))
+            _r.ltrim(key, 0, 23)  # keep last ~24 turns
+        except Exception:
+            pass
 
         job = enqueue_generate_reply(
         _queue,                # your Queue object (whatever you named it)

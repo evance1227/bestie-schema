@@ -683,7 +683,7 @@ def _ensure_links_on_bullets(text: str, user_text: str) -> str:
             alt_url = _force_partner_search_if_brand(alt_url, label, user_text)
             # 6) rewrite first bullet line and drop raw link-only lines
             first_line = _strip_trailing_link_fragments(chunk_lines[0])
-            final_url = _force_partner_search_if_brand(alt_url, label, user_text)
+            final_url  = _force_partner_search_if_brand(alt_url, label, user_text)
 
             if final_url:
                 out.append(f"{first_line} — {final_url}")
@@ -701,47 +701,29 @@ def _ensure_links_on_bullets(text: str, user_text: str) -> str:
         # =========================
         # CASE B: no link in the chunk → build one
         # =========================
-        url = ""  # ensure url is always defined in this branch
+        url = ""  # ensure defined
 
         if label:
             try:
                 if want_amazon or retailer.lower().startswith("amazon"):
-                    # optional deep link if you added it
-                    url = _amz_deep_link_if_obvious(label)
+                    url = _amz_deep_link_if_obvious(label) or ""
                     if not url:
                         url = _amz_search_url(_best_amz_query(label, user_text), user_text)
                 else:
-                    url = (
-                        _prefer_affiliate_url(label, user_text)
-                        or _syl_search_url(label or (user_text or "best match"), user_text)
-                    )
+                    url = _prefer_affiliate_url(label, user_text) \
+                    or _syl_search_url(label or (user_text or "best match"), user_text)
             except Exception:
                 url = ""
 
         # FINAL GUARANTEE
         if not url:
             try:
-                url = (
-                    _syl_search_url(label or (user_text or "best match"), user_text)
-                    or _amz_search_url(_best_amz_query(label, user_text), user_text)
-                )
+                url = _syl_search_url(label or (user_text or "best match"), user_text) \
+                or _amz_search_url(_best_amz_query(label, user_text), user_text)
             except Exception:
                 url = ""
-        # If we built/kept a non-affiliate brand URL, prefer partner search
-        if url:
-            try:
-                h = urlparse(url).netloc.lower()
-                if h.startswith("www."):
-                    h = h[4:]
-            except Exception:
-                h = ""
-            if not _is_affiliate_hostname(h):
-                q = quote_plus(_carry_user_modifiers(user_text, label))
-                for partner in _PREFERRED_PARTNER_ORDER:
-                    tmpl = _RETAILER_SEARCH.get(partner)
-                    if tmpl:
-                        url = tmpl.format(q=q)
-                        break
+
+        # Render: partner-first + clean label
         if url:
             final_url = _force_partner_search_if_brand(url, label, user_text)
             first_line = _strip_trailing_link_fragments(chunk_lines[0])
@@ -752,6 +734,7 @@ def _ensure_links_on_bullets(text: str, user_text: str) -> str:
             out.extend(cl.rstrip() for cl in chunk_lines)
 
         i = j
+
 
     reply_out = "\n".join(out)
     return wrap_all_affiliates(reply_out)
@@ -1411,6 +1394,16 @@ def _store_and_send(
         # send (use phone from webhook if provided)
         try:
             integrations.send_sms_reply(user_id, full_text, phone_override=send_phone)
+            # ---- Save assistant SMS part to Redis ----
+            try:
+                from redis import Redis
+                _r = Redis.from_url(os.getenv("REDIS_URL"))
+                key = f"conv:{convo_id}:turns"
+                _r.lpush(key, json.dumps({"role": "assistant", "content": body if 'body' in locals() else full_text}))
+                _r.ltrim(key, 0, 23)
+            except Exception:
+                pass
+
         except Exception as e:
             logger.error("[Send][Error] fallback err=%s", e)
         return
@@ -1429,6 +1422,16 @@ def _store_and_send(
         # send this part
         try:
             integrations.send_sms_reply(user_id, body, phone_override=send_phone)
+            # ---- Save assistant SMS part to Redis ----
+            try:
+                from redis import Redis
+                _r = Redis.from_url(os.getenv("REDIS_URL"))
+                key = f"conv:{convo_id}:turns"
+                _r.lpush(key, json.dumps({"role": "assistant", "content": body if 'body' in locals() else full_text}))
+                _r.ltrim(key, 0, 23)
+            except Exception:
+                pass
+
             time.sleep(0.35)  # small pause improves ordering & delivery across gateways
         except Exception as e:
             logger.error("[Send][Error] err=%s", e)
@@ -1795,6 +1798,7 @@ def generate_reply_job(
             context={
                 "has_completed_quiz": has_quiz,
                 "media_urls": media_urls or [],
+                "convo_id": convo_id,   
             },
         )
 
@@ -1805,6 +1809,22 @@ def generate_reply_job(
     # keep it light — don't over-sanitize
     cleaned = _clean_reply(raw)
     reply = (cleaned.strip() if cleaned else (raw.strip() if raw else ""))
+    _LINK_WORDS = re.compile(r"\blinks?\b", re.I)
+
+    if (
+        _strong_product_intent(user_text, None)
+        or _LINK_WORDS.search(user_text or "")
+    ) and not _looks_like_concrete_picks(reply):
+        try:
+            rescue = ai.rewrite_as_three_picks(
+                user_text=user_text,
+                base_reply=reply,
+                system_prompt=persona,
+            )
+            if rescue and len(rescue.strip()) > len((reply or "").strip()):
+                reply = rescue.strip()
+        except Exception as e:
+            logger.exception("[Picks] early rewrite failed: %s", e)
 
         # remove survey-ish prompts
         # Remove explicit allow token from user-visible text and fix preamble       
@@ -1953,6 +1973,11 @@ def generate_reply_job(
         # stay purely conversational — no "features" language unless they ask
         reply = _clean_reply(reply)
 
+    # final catch-all: ensure any lingering brand links are wrapped
+    try:
+        reply = wrap_all_affiliates(reply)
+    except Exception:
+        pass
 
     _store_and_send(
         user_id, convo_id, reply, user_phone,
