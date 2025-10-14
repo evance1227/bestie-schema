@@ -151,6 +151,54 @@ def _strip_links_preamble(s: str) -> str:
     return _LINKS_TO_RE.sub("", s or "").strip()
 
 # --- Amazon query cleaner -----------------------------------------------------
+_PRICE_RE = re.compile(r"\$[\s]*([0-9]{2,5})(?:[.,][0-9]{2})?")
+
+def _relabel_best_mid_splurge(body: str) -> str:
+    """
+    Find the first three bullets with prices, sort by price asc,
+    and relabel them to Best (lowest), Mid (middle), Splurge (highest).
+    'Best', 'Mid', 'Splurge' substrings in the label are rewritten if present.
+    """
+    lines = body.splitlines()
+    picks = []  # (idx, price, text)
+
+    for i, ln in enumerate(lines):
+        m = _PRICE_RE.search(ln)
+        if m:
+            try:
+                price = int(m.group(1))
+                picks.append((i, price, ln))
+            except Exception:
+                continue
+        if len(picks) >= 3 and len(picks) == 3:
+            # we only care about the first 3 priced bullets
+            break
+
+    if len(picks) < 2:
+        return body  # nothing to relabel
+
+    # sort by price ascending
+    picks_sorted = sorted(picks, key=lambda x: x[1])
+    labels = [("Best:", picks_sorted[0][0]),
+              ("Mid:", picks_sorted[1][0])]
+    if len(picks_sorted) >= 3:
+        labels.append(("Splurge:", picks_sorted[2][0]))
+
+    def _rewrite_label(text: str, new_tag: str) -> str:
+        # wipe any existing Best/Mid/Splurge tag at start of line and set new one
+        t = re.sub(r"^\s*[*\-]\s*(Best|Mid|Splurge)\s*:\s*", "", text, flags=re.I)
+        # ensure a bullet prefix is preserved (e.g., "- " or "1. ")
+        if re.match(r"^\s*[*\-]\s", text):
+            return re.sub(r"^\s*[*\-]\s*", f"- {new_tag} ", t, count=1)
+        if re.match(r"^\s*\d+\.\s", text):
+            return re.sub(r"^\s*\d+\.\s*", f"- {new_tag} ", t, count=1)
+        return f"- {new_tag} {t.lstrip()}"
+
+    for new_tag, idx in labels:
+        lines[idx] = _rewrite_label(lines[idx], new_tag)
+
+    return "\n".join(lines)
+
 _AMZ_QUERY_STOP = re.compile(
     r"\b(can you|could you|please|send|shoot|over|that|this|link|links?|"
     r"so i can.*|buy it (there|here)|available on|on amazon|for me)\b",
@@ -617,9 +665,10 @@ def _ensure_links_on_bullets(text: str, user_text: str) -> str:
             alt_url = _force_partner_search_if_brand(alt_url, label, user_text)
             # 6) rewrite first bullet line and drop raw link-only lines
             first_line = _strip_trailing_link_fragments(chunk_lines[0])
+            final_url = _force_partner_search_if_brand(alt_url, label, user_text)
 
-            if alt_url:
-                out.append(f"{first_line} — {alt_url}")
+            if final_url:
+                out.append(f"{first_line} — {final_url}")
             else:
                 out.append(first_line)
 
@@ -675,11 +724,10 @@ def _ensure_links_on_bullets(text: str, user_text: str) -> str:
                     if tmpl:
                         url = tmpl.format(q=q)
                         break
-        url = _force_partner_search_if_brand(url, label, user_text)
         if url:
-            first_line = chunk_lines[0].rstrip()
-            first_line = re.sub(r"\s[—–-]\s*$", "", first_line)
-            out.append(f"{first_line} — {url}")
+            final_url = _force_partner_search_if_brand(url, label, user_text)
+            first_line = _strip_trailing_link_fragments(chunk_lines[0])
+            out.append(f"{first_line} — {final_url}")
             for k in range(1, len(chunk_lines)):
                 out.append(chunk_lines[k].rstrip())
         else:
@@ -1750,6 +1798,7 @@ def generate_reply_job(
         reply = wrap_all_affiliates(reply)        
         reply = _strip_allow_tokens(reply)
         reply = _strip_links_preamble(reply)
+        reply = _relabel_best_mid_splurge(reply)
         reply = re.sub(r"\b(s\s+to|links?\s+to)\b", "", reply, flags=re.I).strip()
         reply = re.sub(r"\s{2,}", " ", reply).strip()
         reply = re.sub(r"[:\-–]\s*$", "", reply)
