@@ -253,6 +253,13 @@ def _best_amz_query(label: str | None, user_text: str | None) -> str:
     return t or "best match"
 # Short confirmation -> continue the previous picks flow
 _CONFIRM_YES_RE = re.compile(r"^\s*(y|ya|yes|yep|yup|ok|okay|sure|please|do it|go ahead)\b", re.I)
+_PREFERRED_PARTNER_ORDER = (
+    "sephora.com",
+    "ulta.com",
+    "nordstrom.com",
+    "dermstore.com",
+    "amazon.com",
+)
 
 def _force_partner_search_if_brand(url: str | None, label: str, user_text: str) -> str | None:
     """
@@ -721,44 +728,46 @@ def _ensure_links_on_bullets(text: str, user_text: str) -> str:
         # =========================
         # CASE B: no link in the chunk → build one
         # =========================
-        url = ""  # ensure defined
+        # ensure url var exists
+        url = ""
 
-        if label:
-            try:
-                if want_amazon or retailer.lower().startswith("amazon"):
-                    url = _amz_deep_link_if_obvious(label) or ""
-                    if not url:
-                        url = _amz_search_url(_best_amz_query(label, user_text), user_text)
-                else:
-                    url = _prefer_affiliate_url(label, user_text) \
-                    or _syl_search_url(label or (user_text or "best match"), user_text)
-            except Exception:
-                url = ""
+        label = label.strip() if label else ""
+        want_amazon = bool(re.search(r"\bamazon\b", user_text or "", re.I))
 
-        # FINAL GUARANTEE
+        try:
+            if want_amazon:
+                # build a **search** link that is always Tagged
+                q = label or (user_text or "best match")
+                url = build_amazon_search_url(q)
+            else:
+                # Build a ShopMy **retailer search** redirect; falls back to "" if no retailer implied
+                url = _syl_search_url(label or (user_text or "best match"), user_text)
+        except Exception:
+            url = ""
+
+        # FINAL GUARANTEE: if still no url, try generic SYL first, then Amazon
         if not url:
             try:
-                url = _syl_search_url(label or (user_text or "best match"), user_text) \
-                or _amz_search_url(_best_amz_query(label, user_text), user_text)
+                url = _syl_search_url(label or (user_text or "best match"), user_text) or \
+                    build_amazon_search_url(label or "best match")
             except Exception:
                 url = ""
 
-        # Render: partner-first + clean label
-        if url:
-            final_url = _force_partner_search_if_brand(url, label, user_text)
-            first_line = _strip_trailing_link_fragments(chunk_lines[0])
-            out.append(f"{first_line} — {final_url}")
-            for k in range(1, len(chunk_lines)):
-                out.append(chunk_lines[k].rstrip())
-        else:
-            out.extend(cl.rstrip() for cl in chunk_lines)
+    # --- Render: partner-first + clean label ---
+    if url:
+        final_url  = _force_partner_search_if_brand(url, label, user_text)
+        first_line = _strip_trailing_link_fragments(chunk_lines[0])
+        out.append(f"{first_line} — {final_url}")
+        for k in range(1, len(chunk_lines)):
+            out.append(chunk_lines[k].rstrip())
+    else:
+        # no url, keep raw chunk (but trimmed)
+        out.extend(cl.rstrip() for cl in chunk_lines)
 
         i = j
 
-
     reply_out = "\n".join(out)
     return wrap_all_affiliates(reply_out)
-
     
 # --- Prefer affiliate-friendly links for text bullets (no category rules) ---
 _AFFIL_HINT = "sephora ulta nordstrom revolve shopbop target anthropologie free people amazon"

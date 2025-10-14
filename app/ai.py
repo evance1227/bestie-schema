@@ -512,7 +512,13 @@ def generate_reply(
     **If the user asks “where to buy”, “find this”, or “send me the link”:
     - Identify the item in 1 sentence (style + key features).
     - Ask 3 fast qualifiers (size, budget cap, any preference).
-    - Offer: “Say YES and I’ll send 3 options — budget, mid, splurge — with links.”**
+    rescue_system = (
+    system_prompt +
+    "\nRewrite your advice into a decisive SMS with 3 concrete product picks."
+    "\nFor each pick include a one-liner why it fits the user’s ask."
+    "\nNo intake questions. No 'Best/Mid/Splurge' labels."
+)
+
     If multiple images appear, assume the last one is the primary reference unless the user says otherwise.
     All replies must fit one SMS (<= 520 chars).
     """.strip()
