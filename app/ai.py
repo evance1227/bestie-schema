@@ -634,6 +634,7 @@ def rewrite_as_three_picks(user_text: str, base_reply: str, system_prompt: str) 
           "(each pick on its own line). Keep it to one message under ~450 characters. "
           "Carry forward any explicit user modifiers (e.g., “stain”, “waterproof”, sizes, budgets) "
           "verbatim; do not substitute related categories. Do not ask follow-up questions."
+          "Rewrite your advice into exactly three bullets with product name and a single link per bullet. "
     )
  
     try:

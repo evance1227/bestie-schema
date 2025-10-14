@@ -149,6 +149,17 @@ def _strip_allow_tokens(s: str) -> str:
 def _strip_links_preamble(s: str) -> str:
     # remove “Links to ” or “Link to ” ONLY at the start, so we don’t leave a dangling “s”
     return _LINKS_TO_RE.sub("", s or "").strip()
+# --- Copy tidy: drop Best/Mid/Splurge labels and any inline angle-bracket URLs ---
+_BMS_PREFIX = re.compile(r"^\s*\*\*(?:Best|Mid|Splurge)\*\*\s*[:\-–]\s*", re.I)
+_INLINE_URL = re.compile(r"<https?://[^ >]+>", re.I)
+
+def _strip_bms_and_inline_urls(text: str) -> str:
+    out = []
+    for ln in (text or "").splitlines():
+        ln = _BMS_PREFIX.sub("", ln).strip()
+        ln = _INLINE_URL.sub("", ln).strip()
+        out.append(ln)
+    return "\n".join(out)
 
 # --- Amazon query cleaner -----------------------------------------------------
 _PRICE_RE = re.compile(r"\$[\s]*([0-9]{2,5})(?:[.,][0-9]{2})?")
@@ -568,6 +579,15 @@ def _is_affiliate_hostname(host: str) -> bool:
     if h.startswith("www."):
         h = h[4:]
     return h.endswith("shopmy.us") or ("amazon." in h)
+
+# ===== Partner routing preferences =====
+_PREFERRED_PARTNER_ORDER = (
+    "sephora.com",
+    "ulta.com",
+    "nordstrom.com",
+    "dermstore.com",
+    "amazon.com",
+)
 
 def _ensure_links_on_bullets(text: str, user_text: str) -> str:
     """
@@ -1830,6 +1850,7 @@ def generate_reply_job(
         # Remove explicit allow token from user-visible text and fix preamble       
     try:
         reply = _shorten_bullet_labels(_ensure_links_on_bullets(reply, user_text))
+        reply = _strip_bms_and_inline_urls(reply)
     except Exception as e:
         logger.exception("[Links] bulletization failed: %s", e)
         reply = ensure_not_link_ending(reply)
