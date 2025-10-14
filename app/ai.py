@@ -571,10 +571,12 @@ def generate_reply(
             pass
 
     return text
+
 def rewrite_as_three_picks(user_text: str, base_reply: str, system_prompt: str) -> str:
     """
     If the first reply dodged, ask GPT to rewrite into 2–3 product picks with one-liners.
-    Carry forward any explicit user modifiers (e.g., ‘stain’, ‘waterproof’, sizes, budgets) exactly; do not substitute related categories.
+    Carry forward any explicit user modifiers (e.g., “stain”, “waterproof”, sizes, budgets) exactly;
+    do not substitute related categories.
     """
     import os, logging
     from openai import OpenAI
@@ -582,12 +584,13 @@ def rewrite_as_three_picks(user_text: str, base_reply: str, system_prompt: str) 
     model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
     rescue_system = (
-        system_prompt +
-        "\nRewrite your advice into a decisive, helpful SMS with 2–3 concrete product picks "
-        "(BEST → Mid → Budget) each with a crisp one-liner benefit. "
-        "No surveys. Avoid 'check reviews'/'identify concerns'. ≤ 520 chars. No links unless asked."
+        system_prompt
+        + "\n\nRewrite your advice into a decisive, helpful SMS with 2–3 concrete product picks "
+          "(each pick on its own line). Keep it to one message under ~450 characters. "
+          "Carry forward any explicit user modifiers (e.g., “stain”, “waterproof”, sizes, budgets) "
+          "verbatim; do not substitute related categories. Do not ask follow-up questions."
     )
-
+ 
     try:
         resp = client.chat.completions.create(
             model=model,
