@@ -24,6 +24,8 @@ import os
 import re
 import json
 import random
+from app import db
+from app import integrations_serp
 from typing import Optional, List, Dict, Tuple
 from datetime import datetime, timezone
 
@@ -475,8 +477,10 @@ def build_messages(
         user_payload += "\n\n" + "\n".join(ctx_lines)
 
     if product_candidates:
+        product_candidates = _enrich_candidates_with_pdp(product_candidates)
         product_block = build_product_block(product_candidates)
         user_payload += "\n\n" + product_block
+
     # ------- BEGIN vision-aware user message -------
     img_urls = []
     if context:
@@ -882,7 +886,29 @@ def extract_product_intent(text: str) -> Optional[Dict[str, str]]:
     
     return None
 
-from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
+def _enrich_candidates_with_pdp(product_candidates: List[Dict]) -> List[Dict]:
+    """
+    If a candidate has no url (or a non-allowed url), try to fetch a PDP on Amazon/SYL merchants.
+    Uses integrations_serp to look up top PDPs.
+    """
+    enriched: List[Dict] = []
+    for p in product_candidates or []:
+        name = str(p.get("name") or p.get("title") or "").strip()
+        url  = str(p.get("url") or "").strip()
+        if url:
+            enriched.append(p)
+            continue
+        pdp_url = ""
+        try:
+            # prefer Amazon PDP; your integrations_serp can be a thin wrapper over SerpAPI/Google
+            pdp_url = integrations_serp.find_pdp_url(name)  # implement to return allowed PDP or ""
+        except Exception:
+            pdp_url = ""
+        q = dict(p)
+        if pdp_url:
+            q["url"] = pdp_url
+        enriched.append(q)
+    return enriched
 
 def build_product_block(product_candidates: List[Dict]) -> str:
     """

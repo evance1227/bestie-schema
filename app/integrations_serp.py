@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import re
 import requests
 from urllib.parse import urlparse, urlunparse, parse_qs, urlencode
 from loguru import logger
@@ -102,7 +103,16 @@ def _is_probably_sold_out(url: str, host: str) -> bool:
     except Exception:
         # if we can't tell, don't exclude
         return False
+    
+_AMAZON_DP_RE = re.compile(r"https?://(?:www\.)?amazon\.com/(?:gp/product|dp)/[A-Z0-9]{8,12}")
 
+def find_pdp_url(name: str) -> str:
+    """
+    Minimal stub: if your sources already attach a candidate list on the product dict,
+    prefer any Amazon dp/gp URL. Otherwise, return "" to let best_link fall back to search.
+    Replace this with your real SERP lookup when ready.
+    """
+    return ""  # Implement with your SERP integration when available
 
 def lens_products(
     image_url: str,
