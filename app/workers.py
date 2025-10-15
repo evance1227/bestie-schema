@@ -431,6 +431,8 @@ def _is_affiliate_url(url: str) -> bool:
         return h.endswith("shopmy.us") or ("amazon." in h)
     except Exception:
         return False
+    
+_AFFIL_HINT = "sephora ulta nordstrom revolve shopbop target anthropologie free people amazon"
 
 def _affiliate_upgrade(picks: list[dict], user_text: str) -> list[dict]:
     """
