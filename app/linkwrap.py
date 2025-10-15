@@ -141,33 +141,93 @@ def _wrap(url: str, cfg) -> str:
         return cfg.syl.wrap(url)             # your existing SYL wrapper (shop-links.co etc.)
     return url  # last resort; but with our config this should rarely trigger.
 
+# app/linkwrap.py
+
+import urllib.parse, http.client, os
+
+def _head_ok(url: str, timeout=6) -> bool:
+    try:
+        p = urllib.parse.urlsplit(url)
+        conn = http.client.HTTPSConnection(p.netloc, timeout=timeout)
+        path = p.path or "/"
+        if p.query:
+            path += "?" + p.query
+        conn.request("HEAD", path)
+        r = conn.getresponse()
+        return 200 <= r.status < 400
+    except Exception:
+        return False
+
+def _amazon_search(query: str) -> str:
+    return f"https://www.amazon.com/s?k={urllib.parse.quote_plus(query)}"
+
+def _is_allowed_host(host: str) -> bool:
+    host = host.lower()
+    if host.endswith("amazon.com"):
+        return True
+    # SYL merchants are allowed via your wrapper; use the env list if present
+    allowed = (os.getenv("SYL_MERCHANTS", "") or "")
+    return allowed.strip() == "*"  # you run with "*" today
+
+def _looks_like_pdp(host: str, path: str) -> bool:
+    host = host.lower()
+    path = path.lower()
+    if host.endswith("amazon.com"):
+        return ("/dp/" in path) or ("/gp/product/" in path)
+    if host.endswith("sephora.com"):
+        return "/product/" in path
+    if host.endswith("ulta.com"):
+        return "/p/" in path
+    if host.endswith("nordstrom.com"):
+        return "/s/" in path
+    if host.endswith("dermstore.com"):
+        return "/product_" in path
+    return False
+
+def _wrap(url: str, *, cfg) -> str:
+    if getattr(cfg, "GENIUSLINK_ENABLED", False):
+        return cfg.genius.wrap(url)
+    if "amazon." in url and getattr(cfg, "AMAZON_ASSOCIATE_TAG", ""):
+        parts = urllib.parse.urlsplit(url)
+        qs = urllib.parse.parse_qs(parts.query, keep_blank_values=True)
+        qs["tag"] = [cfg.AMAZON_ASSOCIATE_TAG]
+        new_q = urllib.parse.urlencode(qs, doseq=True)
+        return urllib.parse.urlunsplit((parts.scheme, parts.netloc, parts.path, new_q, parts.fragment))
+    if getattr(cfg, "SYL_ENABLED", False):
+        return cfg.syl.wrap(url)
+    return url
+
 def best_link(query: str, candidates: list[str] | None, *, cfg) -> str:
     """
-    Allowed-only strategy:
-      - If any candidate resolves AND its domain is allowed → wrap & use.
-      - Else try SYL search template for any allowed domain in env.
-      - Else use Amazon search.
-    Always go through wrappers.
+    Preference order:
+      1) A live PDP on Amazon/SYL merchant from candidates.
+      2) Any live candidate on allowed hosts.
+      3) Amazon search (wrapped).
     """
-    # 1) Candidate pass
     for cand in candidates or []:
         if not cand:
             continue
         cand = cand.strip().strip("<>")
-        parts = urllib.parse.urlsplit(cand)
-        if not parts.scheme.startswith("http"):
+        try:
+            parts = urllib.parse.urlsplit(cand)
+        except Exception:
             continue
-        if _is_allowed(parts.netloc) and _head_ok(cand):
-            return _wrap(cand, cfg)
-
-    # 2) SYL search (env-driven)
-    for dom in ALLOWED_SYL_DOMAINS:
-        search_url = _syl_search(dom, query)
-        if search_url:
-            return _wrap(search_url, cfg)
-
-    # 3) Amazon search fallback
-    return _wrap(_amazon_search(query), cfg)
+        host, path = parts.netloc, parts.path or "/"
+        if not _is_allowed_host(host):
+            continue
+        if _looks_like_pdp(host, path) and _head_ok(cand):
+            return _wrap(cand, cfg=cfg)
+    # try any live candidate on allowed hosts (even if not definitely PDP)
+    for cand in candidates or []:
+        try:
+            parts = urllib.parse.urlsplit(cand.strip().strip("<>"))
+        except Exception:
+            continue
+        host = parts.netloc
+        if _is_allowed_host(host) and _head_ok(cand):
+            return _wrap(cand, cfg=cfg)
+    # fallback to Amazon search
+    return _wrap(_amazon_search(query), cfg=cfg)
 
 def normalize_syl_links(text: str) -> str:
     """

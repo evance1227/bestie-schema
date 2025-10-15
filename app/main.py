@@ -474,41 +474,38 @@ def process_incoming(
         convo_id = user_id
 
     # ---------- Always enqueue the worker job ----------
-    from redis import Redis
-    from rq import Queue
-    from app.task_queue import enqueue_generate_reply
+    from app.task_queue import enqueue_generate_reply, q as task_q  # use the canonical Queue
 
     try:
-        # Build a Queue here; do not pass this Queue into job args, only to the helper.
-        _conn  = Redis.from_url(os.getenv("REDIS_URL"))
-        _queue = Queue(os.getenv("QUEUE_NAME", "bestie_queue"), connection=_conn)
         # ---- Save incoming turn to Redis (conversation buffer) ----
         try:
-            from redis import Redis
-            _r = Redis.from_url(os.getenv("REDIS_URL"))
+            _r = task_q.connection  # reuse same Redis connection as the Queue
             key = f"conv:{convo_id}:turns"
             _r.lpush(key, json.dumps({"role": "user", "content": text or ""}))
             _r.ltrim(key, 0, 23)  # keep last ~24 turns
         except Exception:
             pass
 
+        # Enqueue the worker job on the same queue the worker listens on
         job = enqueue_generate_reply(
-        _queue,                # your Queue object (whatever you named it)
-        user_id,               # int
-        convo_id,              # int
-        text,                  # resolved text from the preamble above
-        media_urls=media_urls, # <-- the list we just built
-        user_phone=user_phone,     # <-- pass phone so worker has it
-    )
+            task_q,              # Queue instance from app.task_queue
+            user_id,             # int
+            convo_id,            # int
+            text,                # message text
+            media_urls=media_urls,
+            user_phone=user_phone,
+            msg_id=message_id,
+        )
 
         logger.success(
-            "[API][Queue] ✅ Enqueued job=%s convo_id=%s user_id=%s text_len=%d",
-            getattr(job, "id", "n/a"), convo_id, user_id, len(text or "")
+            "[API][Queue] ✅ Enqueued job_id=%s queue=%s redis=%s",
+            getattr(job, "id", "n/a"),
+            task_q.name,
+            os.getenv("REDIS_URL", "")[:60] + "…",
         )
-    except Exception as e:
+    except Exception:
         logger.exception("[API][Queue] ❌ Failed to enqueue job")
         return {"ok": True, "error": "process_incoming_failed"}
-
 
 @app.post("/webhook/incoming_message")
 async def incoming_message_any(req: Request):
