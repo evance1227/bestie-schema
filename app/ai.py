@@ -16,6 +16,9 @@ Notes:
 """
 from __future__ import annotations
 from openai import OpenAI
+# app/ai.py (top)
+from app.linkwrap import best_link
+from app.sms import to_plain_sms
 
 import os
 import re
@@ -506,6 +509,19 @@ def generate_reply(
     Single entrypoint used by workers.py. Returns one SMS-ready reply string.
     Answer-first. No surveys. If it's a product ask, give real picks.
     """
+    # ---- FAST PATH: explicit single-link request ----------------------------
+    import re
+    m = re.search(r"(?i)\b(send|give)\s+me\s+(the\s+)?link\s+for\s+(.+)$", user_text.strip())
+    if m:
+        product_name = m.group(3).strip().rstrip(".!?")
+        safe_url = best_link(query=product_name, candidates=[], cfg=os)  # uses env wrappers
+        msg = (
+            f"{product_name} — {safe_url}\n"
+            "Best practice: apply 30 min before sun, reapply every 2 hours & after swimming; "
+            "layer SPF on burn-prone areas."
+        )
+        return to_plain_sms(msg)
+
     vision_guidance = """
     If an image is provided, answer the user's question **about the image** directly.
     Be decisive: give a verdict and 1 clear next step; keep any description minimal.
@@ -516,8 +532,9 @@ def generate_reply(
     system_prompt +
     "\nRewrite your advice into a decisive SMS with 3 concrete product picks."
     "\nFor each pick include a one-liner why it fits the user’s ask."
-    "\nNo intake questions. No 'Best/Mid/Splurge' labels."
+    "\nNo intake questions. No “Best/Mid/Splurge” labels."
 )
+
 
     If multiple images appear, assume the last one is the primary reference unless the user says otherwise.
     All replies must fit one SMS (<= 520 chars).
@@ -620,7 +637,13 @@ def generate_reply(
                 text = rescue
         except Exception:
             pass
-
+    # ---- FINAL SMS HYGIENE --------------------------------------------------
+    try:
+        # Pass through our affiliate normalizer for any raw links the model emitted
+        text = linkwrap.wrap_all_affiliates(text)
+    except Exception:
+        pass
+    text = to_plain_sms(text)
     return text
 
 def rewrite_as_three_picks(user_text: str, base_reply: str, system_prompt: str) -> str:
@@ -871,24 +894,18 @@ def build_product_block(product_candidates: List[Dict]) -> str:
     safe: List[Dict] = []
 
     for p in product_candidates[:3]:
-        url = str(p.get("url") or "")
-        final = url
+        # --- URL affiliate hygiene (single source of truth) ------------------
+        name = str(p.get("name") or p.get("title") or "Product")
+        raw_url = str(p.get("url") or "")
         try:
-            gl = linkwrap.convert_to_geniuslink(url) if url else ""
-            if gl and "geni.us" in gl and os.getenv("GL_REWRITE", "0").lower() in ("1", "true"):
-                final = gl
-            elif "amazon.com" in url:
-                parsed = urlparse(url)
-                q = parse_qs(parsed.query)
-                q["tag"] = ["schizobestie-20"]
-                new_query = urlencode(q, doseq=True)
-                final = urlunparse(parsed._replace(query=new_query))
-        except Exception as e:
-            logger.debug("[Linkwrap] URL tweak failed: {}", e)
+            final = best_link(query=name, candidates=[raw_url] if raw_url else [], cfg=os)
+        except Exception:
+            # Hard fallback: Amazon search gets wrapped downstream anyway
+            final = best_link(query=name, candidates=[], cfg=os)
 
         safe.append(
             {
-                "name": str(p.get("name") or p.get("title") or "Product"),
+                "name": name,
                 "category": str(p.get("category") or ""),
                 "url": final,
                 "review": str(p.get("review") or ""),

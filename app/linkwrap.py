@@ -87,6 +87,87 @@ _AMAZON_HOST  = re.compile(r"(^|\.)(amazon\.[^/]+)$", re.I)
 # --- Legacy SYL link normalizer (hotfix) ---
 # --- Legacy SYL link normalizer (hotfix) ---
 import re
+import json, os, urllib.parse, http.client
+
+def _load_allowed():
+    doms = os.getenv("SYL_ALLOWED_DOMAINS", "")
+    allowed = [d.strip().lower() for d in doms.split(",") if d.strip()]
+    tmpl = os.getenv("SYL_SEARCH_TEMPLATES_JSON", "{}")
+    try:
+        templates = {k.lower(): v for k, v in json.loads(tmpl).items()}
+    except Exception:
+        templates = {}
+    return set(allowed), templates
+
+ALLOWED_SYL_DOMAINS, SYL_TEMPLATES = _load_allowed()
+
+def _head_ok(url: str, timeout=5) -> bool:
+    try:
+        parts = urllib.parse.urlsplit(url)
+        conn = http.client.HTTPSConnection(parts.netloc, timeout=timeout)
+        path = parts.path or "/"
+        if parts.query:
+            path += "?" + parts.query
+        conn.request("HEAD", path)
+        r = conn.getresponse()
+        return 200 <= r.status < 400
+    except Exception:
+        return False
+
+def _amazon_search(query: str) -> str:
+    return f"https://www.amazon.com/s?k={urllib.parse.quote_plus(query)}"
+
+def _syl_search(domain: str, query: str) -> str | None:
+    domain = domain.lower()
+    if domain in ALLOWED_SYL_DOMAINS and domain in SYL_TEMPLATES:
+        return SYL_TEMPLATES[domain].format(q=urllib.parse.quote_plus(query))
+    return None
+
+def _is_allowed(domain: str) -> bool:
+    d = domain.lower()
+    return d.endswith("amazon.com") or any(d.endswith(x) for x in ALLOWED_SYL_DOMAINS)
+
+def _wrap(url: str, cfg) -> str:
+    # Prefer your existing wrappers; no raw links.
+    if getattr(cfg, "GENIUSLINK_ENABLED", False):
+        return cfg.genius.wrap(url)          # your existing shortener
+    if "amazon." in url and getattr(cfg, "AMAZON_ASSOCIATE_TAG", ""):
+        parts = urllib.parse.urlsplit(url)
+        qs = urllib.parse.parse_qs(parts.query, keep_blank_values=True)
+        qs["tag"] = [cfg.AMAZON_ASSOCIATE_TAG]
+        new_q = urllib.parse.urlencode(qs, doseq=True)
+        return urllib.parse.urlunsplit((parts.scheme, parts.netloc, parts.path, new_q, parts.fragment))
+    if getattr(cfg, "SYL_ENABLED", False):
+        return cfg.syl.wrap(url)             # your existing SYL wrapper (shop-links.co etc.)
+    return url  # last resort; but with our config this should rarely trigger.
+
+def best_link(query: str, candidates: list[str] | None, *, cfg) -> str:
+    """
+    Allowed-only strategy:
+      - If any candidate resolves AND its domain is allowed → wrap & use.
+      - Else try SYL search template for any allowed domain in env.
+      - Else use Amazon search.
+    Always go through wrappers.
+    """
+    # 1) Candidate pass
+    for cand in candidates or []:
+        if not cand:
+            continue
+        cand = cand.strip().strip("<>")
+        parts = urllib.parse.urlsplit(cand)
+        if not parts.scheme.startswith("http"):
+            continue
+        if _is_allowed(parts.netloc) and _head_ok(cand):
+            return _wrap(cand, cfg)
+
+    # 2) SYL search (env-driven)
+    for dom in ALLOWED_SYL_DOMAINS:
+        search_url = _syl_search(dom, query)
+        if search_url:
+            return _wrap(search_url, cfg)
+
+    # 3) Amazon search fallback
+    return _wrap(_amazon_search(query), cfg)
 
 def normalize_syl_links(text: str) -> str:
     """
@@ -204,15 +285,15 @@ def _append_amz_tag(u: str) -> str:
         return u
 # --- retailer routing map (pattern -> (merchant_key, search_url_format)) ---
 _RETAILER_ROUTES = [
-    (r"(?i)\bsephora\b",        ("sephora",        "https://www.sephora.com/search?keyword={q}")),
-    (r"(?i)\bultra\b|\bulta\b", ("ulta",           "https://www.ulta.com/search?Ntt={q}")),
-    (r"(?i)\bnordstrom\b",      ("nordstrom",      "https://www.nordstrom.com/sr?keyword={q}")),
-    (r"(?i)\btarget\b",         ("target",         "https://www.target.com/s?searchTerm={q}")),
+    (r"(?i)\bsephora\b",        ("sephora.com",        "https://www.sephora.com/search?keyword={q}")),
+    (r"(?i)\bultra\b|\bulta\b", ("ulta.com",           "https://www.ulta.com/search?Ntt={q}")),
+    (r"(?i)\bnordstrom\b",      ("nordstrom.com",      "https://www.nordstrom.com/sr?keyword={q}")),
+    (r"(?i)\btarget\b",         ("target.com",         "https://www.target.com/s?searchTerm={q}")),
     # nice-to-haves you asked for:
     (r"(?i)\banthropologie\b|\banthro\b",
-                                ("anthropologie",  "https://www.anthropologie.com/search?q={q}")),
+                                ("anthropologie.com",  "https://www.anthropologie.com/search?q={q}")),
     (r"(?i)\bfree\s*people\b|\bfreepeople\b",
-                                ("freepeople",     "https://www.freepeople.com/s?query={q}")),
+                                ("freepeople.com",     "https://www.freepeople.com/s?query={q}")),
 ]
 
 def _syl_search_url(name: str, user_text: str) -> str:
