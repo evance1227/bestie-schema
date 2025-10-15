@@ -197,37 +197,110 @@ def _wrap(url: str, *, cfg) -> str:
         return cfg.syl.wrap(url)
     return url
 
-def best_link(query: str, candidates: list[str] | None, *, cfg) -> str:
+# ----------------- Merchant-first link chooser ----------------- #
+def best_link(
+    query: str,
+    candidates: list[str] | None,
+    *,
+    cfg,
+    preferred_domains: list[str] | None = None,
+) -> str:
     """
-    Preference order:
-      1) A live PDP on Amazon/SYL merchant from candidates.
-      2) Any live candidate on allowed hosts.
-      3) Amazon search (wrapped).
+    Pick the monetization-best link:
+      1) If the user named retailers (preferred_domains), stay on those (SYL) – no Amazon fallback.
+      2) Otherwise evaluate SYL merchant search vs Amazon and choose by AFFIL_STRATEGY:
+         - syl-first | amazon-first | max-revenue
+    PDP candidates always win when live.
     """
+    preferred = [d.strip().lower() for d in (preferred_domains or [])]
+    prefer_only = len(preferred) > 0
+
+    strategy = (os.getenv("AFFIL_STRATEGY") or "max-revenue").strip().lower()
+    # rough basis points; tune in env to reflect your real rev shares
+    syl_bps = int(os.getenv("SYL_BPS", "1200"))       # 12%
+    amz_bps = int(os.getenv("AMAZON_BPS", "300"))     # 3%
+
+    def _host(u: str) -> str:
+        try:
+            return urllib.parse.urlsplit(u).netloc.lower()
+        except Exception:
+            return ""
+
+    def _host_ok(h: str) -> bool:
+        return _is_allowed_host(h) and (not prefer_only or any(h.endswith(d) for d in preferred))
+
+    # (0) PDP candidate wins if it matches host policy and is live
     for cand in candidates or []:
         if not cand:
             continue
-        cand = cand.strip().strip("<>")
+        u = cand.strip().strip("<>")
+        h = _host(u)
+        if _host_ok(h) and _looks_like_pdp(h, urllib.parse.urlsplit(u).path or "/") and _head_ok(u):
+            return _wrap(u, cfg=cfg)
+
+    # Build SYL retailer searches we could send (if any)
+    syl_options: list[str] = []
+    if prefer_only:
+        for dom in preferred:
+            srch = _retailer_search_url(dom, query)
+            if srch:
+                syl_options.append(srch)
+    else:
+        # When no preferred merchants were named, consider a few common SYL retailers from ENV
         try:
-            parts = urllib.parse.urlsplit(cand)
+            import json
+            tmpl_map = json.loads(os.getenv("SYL_SEARCH_TEMPLATES_JSON", "{}"))
+            # light heuristic: try Revolve, Free People, Nordstrom first if present
+            for key in ("revolve.com","freepeople.com","nordstrom.com","shopbop.com","sephora.com","ulta.com","dermstore.com"):
+                if key in tmpl_map:
+                    syl_options.append(tmpl_map[key].format(q=urllib.parse.quote_plus(query)))
         except Exception:
-            continue
-        host, path = parts.netloc, parts.path or "/"
-        if not _is_allowed_host(host):
-            continue
-        if _looks_like_pdp(host, path) and _head_ok(cand):
-            return _wrap(cand, cfg=cfg)
-    # try any live candidate on allowed hosts (even if not definitely PDP)
+            pass
+
+    # Any allowed/live candidate (non-PDP) that matches the host policy
     for cand in candidates or []:
-        try:
-            parts = urllib.parse.urlsplit(cand.strip().strip("<>"))
-        except Exception:
-            continue
-        host = parts.netloc
-        if _is_allowed_host(host) and _head_ok(cand):
-            return _wrap(cand, cfg=cfg)
-    # fallback to Amazon search
-    return _wrap(_amazon_search(query), cfg=cfg)
+        u = cand.strip().strip("<>")
+        if _host_ok(_host(u)) and _head_ok(u):
+            return _wrap(u, cfg=cfg)
+
+    # If user constrained merchants: return first SYL option (or "")
+    if prefer_only:
+        if syl_options:
+            return _wrap(syl_options[0], cfg=cfg)
+        return ""  # do not leak to Amazon when merchant was explicitly requested
+
+    # No constraint → pick by strategy among SYL vs Amazon search
+    amz = _amazon_search(query)
+    syl = syl_options[0] if syl_options else ""
+
+    def _score(url: str) -> int:
+        # crude scoring by expected rev share; PDP candidates were handled earlier
+        if not url:
+            return -1
+        h = _host(url)
+        return syl_bps if h and "amazon." not in h else amz_bps
+
+    if strategy == "syl-first":
+        return _wrap(syl or amz, cfg=cfg)
+    if strategy == "amazon-first":
+        return _wrap(amz or syl, cfg=cfg)
+    # max-revenue (default)
+    return _wrap((syl if _score(syl) >= _score(amz) else amz), cfg=cfg)
+
+def _retailer_search_url(domain: str, query: str) -> str | None:
+    """
+    Build a retailer site-search URL using SYL search templates from ENV.
+    Env: SYL_SEARCH_TEMPLATES_JSON = {"revolve.com":"https://www.revolve.com/r/Search.jsp?searchBy=All&searchQuery={q}", ...}
+    """
+    try:
+        import json
+        tmpl_map = json.loads(os.getenv("SYL_SEARCH_TEMPLATES_JSON", "{}"))
+        for k, fmt in tmpl_map.items():
+            if domain.endswith(k) or k.endswith(domain):
+                return fmt.format(q=urllib.parse.quote_plus(query))
+    except Exception:
+        pass
+    return None
 
 def normalize_syl_links(text: str) -> str:
     """

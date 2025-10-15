@@ -31,6 +31,7 @@ import json
 from app.linkwrap import build_amazon_search_url
 from app.linkwrap import wrap_all_affiliates
 from app.linkwrap import best_link
+from app.ai import _extract_preferred_domains
 from app.sms import to_plain_sms
 from app.ai import generate_contextual_closer
 from typing import Optional, List, Dict, Tuple
@@ -641,10 +642,13 @@ def _ensure_links_on_bullets(text: str, user_text: str) -> str:
         # 3) Build a safe, wrapped link (Amazon/SYL only)
         try:
             candidates = [url] if url else []
-            preferred = _extract_preferred_domains(user_text) if ' _extract_preferred_domains' in globals() else []
-            safe = best_link(query=(name or user_text or "best match"),
-                            candidates=candidates, cfg=os,
-                            preferred_domains=preferred)
+            preferred = _extract_preferred_domains(user_text)
+            safe = best_link(
+                query=(name or user_text or "best match"),
+                candidates=candidates,
+                cfg=os,
+                preferred_domains=preferred,
+)
         except Exception:
             safe = best_link(query=(name or user_text or "best match"),
                              candidates=[], cfg=os)
