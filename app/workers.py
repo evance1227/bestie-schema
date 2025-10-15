@@ -641,8 +641,10 @@ def _ensure_links_on_bullets(text: str, user_text: str) -> str:
         # 3) Build a safe, wrapped link (Amazon/SYL only)
         try:
             candidates = [url] if url else []
+            preferred = _extract_preferred_domains(user_text) if ' _extract_preferred_domains' in globals() else []
             safe = best_link(query=(name or user_text or "best match"),
-                             candidates=candidates, cfg=os)
+                            candidates=candidates, cfg=os,
+                            preferred_domains=preferred)
         except Exception:
             safe = best_link(query=(name or user_text or "best match"),
                              candidates=[], cfg=os)

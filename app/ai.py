@@ -197,7 +197,32 @@ OPENING_BANNED = [
     "i'm sorry you're", "technology can be", "i get that"
 ]
 
+_MERCHANT_SYNONYMS = {
+    "revolve": "revolve.com",
+    "free people": "freepeople.com",
+    "freepeople": "freepeople.com",
+    "nordstrom": "nordstrom.com",
+    "sephora": "sephora.com",
+    "ulta": "ulta.com",
+    "dermstore": "dermstore.com",
+    "shopbop": "shopbop.com",
+}
+
 # ------------------ Helpers ------------------------ #
+def _extract_preferred_domains(user_text: str) -> list[str]:
+    t = (user_text or "").lower()
+    out = []
+    for key, dom in _MERCHANT_SYNONYMS.items():
+        if key in t:
+            out.append(dom)
+    # keep order as mentioned by user; de-dupe
+    seen = set()
+    ordered = []
+    for d in out:
+        if d not in seen:
+            ordered.append(d); seen.add(d)
+    return ordered
+
 def _sanitize_output(text: str) -> str:
     """Keep house style: no em dashes, trim, single spaces."""
     if not text:
@@ -480,6 +505,16 @@ def build_messages(
         product_candidates = _enrich_candidates_with_pdp(product_candidates)
         product_block = build_product_block(product_candidates)
         user_payload += "\n\n" + product_block
+        preferred = _extract_preferred_domains(os.getenv("LATEST_USER_TEXT", "") or "")
+    # If you already have `user_text` in scope here, pass that instead of env.
+
+    final = best_link(
+        query=name,
+        candidates=[raw_url] if raw_url else [],
+        cfg=os,
+        preferred_domains=preferred,   # <<< NEW
+    )
+
 
     # ------- BEGIN vision-aware user message -------
     img_urls = []
