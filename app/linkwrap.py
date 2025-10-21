@@ -18,6 +18,9 @@ import re
 import logging
 from urllib.parse import urlparse, urlunparse, parse_qs, urlencode, quote, quote_plus, unquote
 import urllib.parse
+import logging
+logger = logging.getLogger(__name__)
+
 
 
 # =========================
@@ -138,7 +141,17 @@ def _wrap(url: str, cfg) -> str:
         new_q = urllib.parse.urlencode(qs, doseq=True)
         return urllib.parse.urlunsplit((parts.scheme, parts.netloc, parts.path, new_q, parts.fragment))
     if getattr(cfg, "SYL_ENABLED", False):
-        return cfg.syl.wrap(url)             # your existing SYL wrapper (shop-links.co etc.)
+    # TEMP: skip SYL for preferred merchant flows to avoid bad redirect
+        skip_env = (os.getenv("SYL_TEMP_SKIP_DOMAINS", "") or "").lower().split(",")
+        skip = {d.strip() for d in skip_env if d.strip()}
+        try:
+            host = urllib.parse.urlsplit(url).netloc.lower()
+        except Exception:
+            host = ""
+        if host and host in skip:
+            return url  # send direct merchant link until SYL is fixed
+        return cfg.syl.wrap(url)
+            # your existing SYL wrapper (shop-links.co etc.)
     return url  # last resort; but with our config this should rarely trigger.
 
 # app/linkwrap.py
@@ -185,16 +198,35 @@ def _looks_like_pdp(host: str, path: str) -> bool:
     return False
 
 def _wrap(url: str, *, cfg) -> str:
+    # Prefer your existing shorteners/wrappers
     if getattr(cfg, "GENIUSLINK_ENABLED", False):
         return cfg.genius.wrap(url)
+
     if "amazon." in url and getattr(cfg, "AMAZON_ASSOCIATE_TAG", ""):
         parts = urllib.parse.urlsplit(url)
         qs = urllib.parse.parse_qs(parts.query, keep_blank_values=True)
         qs["tag"] = [cfg.AMAZON_ASSOCIATE_TAG]
         new_q = urllib.parse.urlencode(qs, doseq=True)
         return urllib.parse.urlunsplit((parts.scheme, parts.netloc, parts.path, new_q, parts.fragment))
+
     if getattr(cfg, "SYL_ENABLED", False):
+        # TEMP: skip SYL for specific merchants to avoid the bad redirect
+        skip_env = (os.getenv("SYL_TEMP_SKIP_DOMAINS", "") or "").lower().split(",")
+        skip = {d.strip() for d in skip_env if d.strip()}
+        try:
+            host = urllib.parse.urlsplit(url).netloc.lower()
+        except Exception:
+            host = ""
+
+        # <<< PASTE THESE THREE LINES RIGHT HERE >>>
+        if host and host in skip:
+            logger.info("[Affil] SYL skip host=%s url=%s", host, url)
+            return url  # send direct merchant link until SYL is fixed
+
+        # otherwise use your SYL wrapper (shopmy)
         return cfg.syl.wrap(url)
+
+    # Last resort (should rarely trigger with your config)
     return url
 
 # ----------------- Merchant-first link chooser ----------------- #
