@@ -196,3 +196,43 @@ def lens_products(
             results = kept
 
     return results[:max(1, topn)]
+# app/integrations_serp.py
+import os, requests
+
+def find_pdp_url(name: str, domains: list[str] | None = None) -> str:
+    """
+    Try to return a BUY-NOW PDP URL.
+    - For Amazon: use Rainforest API search → first ASIN → https://www.amazon.com/dp/<asin>
+    - For non-Amazon merchants (Revolve/FP/Nordstrom): return "" for now (we’ll keep SYL search)
+    """
+    name = (name or "").strip()
+    doms = [d.lower() for d in (domains or [])]
+
+    # If the user asked for specific merchants and none is amazon.com, skip Amazon.
+    if doms and not any(d.endswith("amazon.com") for d in doms):
+        return ""
+
+    api_key = os.getenv("RAINFOREST_API_KEY", "")
+    if not api_key or not name:
+        return ""
+
+    try:
+        resp = requests.get(
+            "https://api.rainforestapi.com/request",
+            params={
+                "api_key": api_key,
+                "type": "search",
+                "amazon_domain": "amazon.com",
+                "search_term": name,
+            },
+            timeout=7,
+        )
+        data = resp.json() if resp.ok else {}
+        results = (data.get("search_results") or [])[:6]
+        for r in results:
+            asin = r.get("asin")
+            if asin:
+                return f"https://www.amazon.com/dp/{asin}"
+    except Exception:
+        pass
+    return ""

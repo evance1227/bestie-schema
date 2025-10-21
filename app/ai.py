@@ -914,11 +914,9 @@ def extract_product_intent(text: str) -> Optional[Dict[str, str]]:
     
     return None
 
+from app import integrations_serp
+
 def _enrich_candidates_with_pdp(product_candidates: List[Dict]) -> List[Dict]:
-    """
-    If a candidate has no url (or a non-allowed url), try to fetch a PDP on Amazon/SYL merchants.
-    Uses integrations_serp to look up top PDPs.
-    """
     enriched: List[Dict] = []
     for p in product_candidates or []:
         name = str(p.get("name") or p.get("title") or "").strip()
@@ -926,17 +924,23 @@ def _enrich_candidates_with_pdp(product_candidates: List[Dict]) -> List[Dict]:
         if url:
             enriched.append(p)
             continue
+
+        # pass through the merchants the user asked for
         pdp_url = ""
         try:
-            # prefer Amazon PDP; your integrations_serp can be a thin wrapper over SerpAPI/Google
-            pdp_url = integrations_serp.find_pdp_url(name)  # implement to return allowed PDP or ""
+            pdp_url = integrations_serp.find_pdp_url(
+                name,
+                domains=_extract_preferred_domains(os.getenv("LATEST_USER_TEXT", "") or "")
+            )
         except Exception:
             pdp_url = ""
+
         q = dict(p)
         if pdp_url:
             q["url"] = pdp_url
         enriched.append(q)
     return enriched
+
 
 def build_product_block(product_candidates: List[Dict], preferred_domains: List[str] | None = None) -> str:
     """
