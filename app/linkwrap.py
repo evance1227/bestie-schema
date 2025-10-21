@@ -154,6 +154,17 @@ def _wrap(url: str, cfg) -> str:
             # your existing SYL wrapper (shop-links.co etc.)
     return url  # last resort; but with our config this should rarely trigger.
 
+_URL_RE = re.compile(r"(https?://[^\s)]+)")
+
+def _host_of(url: str) -> str:
+    try:
+        return urllib.parse.urlsplit(url).netloc.lower()
+    except Exception:
+        return ""
+
+def _skip_hosts_from_env() -> set[str]:
+    skip_env = (os.getenv("SYL_TEMP_SKIP_DOMAINS", "") or "")
+    return {d.strip().lower() for d in skip_env.split(",") if d.strip()}
 # app/linkwrap.py
 
 import urllib.parse, http.client, os
@@ -667,83 +678,41 @@ def _wrap_url(url: str) -> str:
 
 def wrap_all_affiliates(text: str) -> str:
     """
-    Normalize outgoing links:
-      - prefer SYL for premium retailers (sephora/ulta/revolve/etc.)
-      - ensure Amazon links/searches are ALWAYS tagged with our associate ID
-      - leave all other domains unchanged
-    Works for both [markdown](url) and bare URLs in the text.
+    Final pass: rewrite every URL using the single source of truth `_wrap(...)`
+    so Geniuslink, Amazon tag, SYL (and the SYL skip list) all apply uniformly.
+    Works for both [markdown](url) and bare URLs.
     """
-    # Normalize any old SYL pattern to the canonical ShopMy URL first
+    if not text:
+        return text
+
+    # Normalize legacy SYL patterns to the canonical ShopMy template
     try:
-        text = normalize_syl_links(text)  # rewrites go.sylikes.com → go.shopmy.us/p-<pub>?url=...
+        text = normalize_syl_links(text)
     except Exception:
         pass
 
-    # Strip inline HTML attributes like target="_blank"> or target='_blank'>
-    text = re.sub(r'\s*target\s*=\s*([\'"])_blank\1\s*>?', "", text, flags=re.I)
-
-
-    PREMIUM_SYL_DOMAINS = (
-        "sephora.com",
-        "ulta.com",
-        "revolve.com",
-        "glossier.com",
-        "anthropologie.com",
-        "net-a-porter.com",
-        "nordstrom.com",
-    )
-
-    amz_tag = os.getenv("AMAZON_ASSOCIATE_TAG", "").strip()
-
-    def _domain(u: str) -> str:
-        try:
-            return urllib.parse.urlparse(u).netloc.lower()
-        except Exception:
-            return ""
-
-    def _is_amazon(u: str) -> bool:
-        d = _domain(u)
-        return d.endswith("amazon.com") or d.endswith("amazon.co.uk") or d.endswith("amazon.ca")
-
-    def _ensure_amazon_tag(u: str) -> str:
-        # Add &tag= if missing (and if we have a tag configured)
-        if not amz_tag:
-            return u  # we won't mutate if tag isn't configured
-        if "tag=" in u:
-            return u
-        sep = "&" if ("?" in u) else "?"
-        return f"{u}{sep}tag={amz_tag}"
-
-    def _should_syl(u: str) -> bool:
-        d = _domain(u)
-        return any(p in d for p in PREMIUM_SYL_DOMAINS)
-
-    def _wrap_url(u: str) -> str:
-        if not u or not u.startswith("http"):
-            return u
-        # premium retailers → wrap with SYL
-        if _should_syl(u):
-            return build_syl_redirect("premium", u)
-        # Amazon → ensure tag on any link (search or product)
-        if _is_amazon(u):
-            return _ensure_amazon_tag(u)
-        # otherwise unchanged
-        return u
-
-    # --- rewrite markdown links [label](url) ---
+    # 1) Markdown links: [label](url)
     def _md_repl(m: re.Match) -> str:
         label, url = m.group(1), m.group(2)
-        return f"[{label}]({_wrap_url(url)})"
+        try:
+            wrapped = _wrap(url, cfg=os)
+        except Exception:
+            wrapped = url
+        return f"[{label}]({wrapped})"
 
     out = _MD_LINK_RE.sub(_md_repl, text)
 
-    # --- rewrite plain URLs ---
+    # 2) Plain URLs
     def _plain_repl(m: re.Match) -> str:
         url = m.group(0)
-        return _wrap_url(url)
+        try:
+            return _wrap(url, cfg=os)
+        except Exception:
+            return url
 
     out = _URL_RE.sub(_plain_repl, out)
     return out
+
 
 def build_syl_redirect(retailer: str, url: str) -> str:
     """
