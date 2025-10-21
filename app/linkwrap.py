@@ -247,7 +247,9 @@ def best_link(
     *,
     cfg,
     preferred_domains: list[str] | None = None,
+    strict_preferred: bool = False,
 ) -> str:
+    
     """
     Pick the monetization-best link:
       1) If the user named retailers (preferred_domains), stay on those (SYL) – no Amazon fallback.
@@ -256,7 +258,7 @@ def best_link(
     PDP candidates always win when live.
     """
     preferred = [d.strip().lower() for d in (preferred_domains or [])]
-    prefer_only = len(preferred) > 0
+    prefer_only = bool(preferred) and bool(strict_preferred)
 
     strategy = (os.getenv("AFFIL_STRATEGY") or "max-revenue").strip().lower()
     # rough basis points; tune in env to reflect your real rev shares
@@ -311,7 +313,33 @@ def best_link(
         if syl_options:
             return _wrap(syl_options[0], cfg=cfg)
         return ""  # do not leak to Amazon when merchant was explicitly requested
+    # Soft preference: if not strict, score SYL retailer searches for preferred domains vs Amazon
+    if preferred:
+        syl_soft = []
+        for dom in preferred:
+            srch = _retailer_search_url(dom, query)
+            if srch:
+                syl_soft.append(srch)
 
+        # Choose by strategy but give a small bonus to preferred merchants
+        amz = _amazon_search(query)
+        pick = None
+
+        def _score(url: str) -> int:
+            if not url: return -1
+            h = urllib.parse.urlsplit(url).netloc.lower()
+            base = int(os.getenv("SYL_BPS", "1200")) if "amazon." not in h else int(os.getenv("AMAZON_BPS", "300"))
+            bonus = int(os.getenv("PREFERRED_BONUS_BPS", "150")) if any(h.endswith(d) for d in preferred) else 0
+            return base + bonus
+
+        if syl_soft:
+            best_syl = max(syl_soft, key=_score)
+            pick = best_syl if _score(best_syl) >= _score(amz) else amz
+        else:
+            pick = amz
+
+        return _wrap(pick, cfg=cfg)
+    
     # No constraint → pick by strategy among SYL vs Amazon search
     amz = _amazon_search(query)
     syl = syl_options[0] if syl_options else ""
@@ -712,7 +740,6 @@ def wrap_all_affiliates(text: str) -> str:
 
     out = _URL_RE.sub(_plain_repl, out)
     return out
-
 
 def build_syl_redirect(retailer: str, url: str) -> str:
     """
