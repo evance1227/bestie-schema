@@ -503,18 +503,9 @@ def build_messages(
 
     if product_candidates:
         product_candidates = _enrich_candidates_with_pdp(product_candidates)
-        product_block = build_product_block(product_candidates)
+        preferred = _extract_preferred_domains(user_text)  # use the real text we have here
+        product_block = build_product_block(product_candidates, preferred_domains=preferred)
         user_payload += "\n\n" + product_block
-        preferred = _extract_preferred_domains(os.getenv("LATEST_USER_TEXT", "") or "")
-    # If you already have `user_text` in scope here, pass that instead of env.
-
-    final = best_link(
-        query=name,
-        candidates=[raw_url] if raw_url else [],
-        cfg=os,
-        preferred_domains=preferred,   # <<< NEW
-    )
-
 
     # ------- BEGIN vision-aware user message -------
     img_urls = []
@@ -584,6 +575,7 @@ def generate_reply(
 
     # 1) Build messages (persona + history + current ask)
     session_goal = (context or {}).get("session_goal")
+    os.environ["LATEST_USER_TEXT"] = user_text or ""
     messages = build_messages(
         user_id=user_id,
         user_text=user_text,
@@ -602,6 +594,7 @@ def generate_reply(
     If the user says “find this”, “where to buy”, or “send me the link”, do the same:
     identify the piece in one line, ask size/budget/preference only if it matters,
     and promise 2–3 shoppable picks. Keep it decisive and concrete.
+    - Exactly **one** link per pick. No “alt link”, no “Shop here”, no second URL on a new line.
     """.strip()
 
 
@@ -945,7 +938,7 @@ def _enrich_candidates_with_pdp(product_candidates: List[Dict]) -> List[Dict]:
         enriched.append(q)
     return enriched
 
-def build_product_block(product_candidates: List[Dict]) -> str:
+def build_product_block(product_candidates: List[Dict], preferred_domains: List[str] | None = None) -> str:
     """
     Format product block for GPT input.
     """
@@ -955,15 +948,18 @@ def build_product_block(product_candidates: List[Dict]) -> str:
     safe: List[Dict] = []
 
     for p in product_candidates[:3]:
-        # --- URL affiliate hygiene (single source of truth) ------------------
         name = str(p.get("name") or p.get("title") or "Product")
         raw_url = str(p.get("url") or "")
         try:
-            final = best_link(query=name, candidates=[raw_url] if raw_url else [], cfg=os)
+            final = best_link(
+                query=name,
+                candidates=[raw_url] if raw_url else [],
+                cfg=os,
+                preferred_domains=preferred_domains or [],   # <<< pass through
+            )
         except Exception:
-            # Hard fallback: Amazon search gets wrapped downstream anyway
-            final = best_link(query=name, candidates=[], cfg=os)
-
+            final = best_link(query=name, candidates=[], cfg=os, preferred_domains=preferred_domains or [])
+    
         safe.append(
             {
                 "name": name,

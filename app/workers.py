@@ -595,17 +595,19 @@ def _is_affiliate_hostname(host: str) -> bool:
 _PREFERRED_PARTNER_ORDER = (
     "sephora.com",
     "ulta.com",
+    "revolve.com",
+    "freepeople.com",
+    "anthropologie.com",
     "nordstrom.com",
-    "dermstore.com",
     "amazon.com",
 )
 
 def _ensure_links_on_bullets(text: str, user_text: str) -> str:
     """
-    Guarantees each numbered/bulleted product line ends with a MONETIZED link.
-    - If a link exists: keep it if it resolves; otherwise, replace with Amazon/SYL search.
-    - If no link: build Amazon/SYL search from the product name.
-    Output is SMS-safe (no <> or markdown links) and affiliate-wrapped.
+    Normalize every bullet to: "<label> — <one monetized link>".
+    - Honors preferred merchants from user_text (Revolve/Free People/etc.) via best_link(...).
+    - Drops any trailing "(Shop here ...)" or extra link lines in the same bullet chunk.
+    - Output is SMS-safe and runs through wrap_all_affiliates at the end.
     """
     lines = (text or "").splitlines()
     out: list[str] = []
@@ -614,53 +616,102 @@ def _ensure_links_on_bullets(text: str, user_text: str) -> str:
     link_md_pat  = re.compile(r'\[([^\]]+)\]\((https?://[^)]+)\)')
     link_url_pat = re.compile(r'(https?://[^\s)]+)')
 
-    for raw in lines:
+    i, n = 0, len(lines)
+    while i < n:
+        raw = lines[i]
         m = bullet_pat.match(raw)
         if not m:
             out.append(raw.rstrip())
+            i += 1
             continue
 
+        # ----- collect this bullet chunk (bullet line + following non-bullet lines) -----
+        chunk = [raw]
+        j = i + 1
+        while j < n:
+            nxt = lines[j]
+            if bullet_pat.match(nxt):       # next bullet starts: stop chunk
+                break
+            chunk.append(nxt)
+            j += 1
+
+        # ----- extract ALL urls from the whole chunk, then strip them from text -----
         body = m.group(1).strip()
-        url: str | None = None  # ensure initialized so we never hit UnboundLocalError
 
-        # 1) Extract any existing URL (markdown or bare) and strip it from the body
-        md = link_md_pat.search(body)
-        if md:
-            url  = md.group(2).strip()
-            body = link_md_pat.sub(md.group(1), body)          # drop markdown, keep label
-        else:
-            u = link_url_pat.search(body)
-            if u:
-                url  = u.group(1).strip()
-                body = link_url_pat.sub('', body).strip()       # remove bare URL from text
+        urls: list[str] = []
+        # collect markdown urls on first line
+        for mdm in link_md_pat.finditer(body):
+            urls.append(mdm.group(2).strip())
+        body = link_md_pat.sub(r"\1", body)  # keep label text, drop all markdown links
 
-        # 2) Clean leading labels like **Best:** and bold → normalized product name
+        # collect bare urls on first line
+        urls += [u.group(1).strip() for u in link_url_pat.finditer(body)]
+        body = link_url_pat.sub("", body).strip()
+
+        # scan the rest of the chunk for any urls (markdown or bare) and strip them, too
+        for k in range(1, len(chunk)):
+            line_k = chunk[k]
+            has_link = False
+            if link_md_pat.search(line_k):
+                urls += [mdm.group(2).strip() for mdm in link_md_pat.finditer(line_k)]
+                has_link = True
+            if link_url_pat.search(line_k):
+                urls += [u.group(1).strip() for u in link_url_pat.finditer(line_k)]
+                has_link = True
+            # if that line was only links, blank it out so we don't re-append later
+            if has_link:
+                chunk[k] = link_md_pat.sub("", line_k)
+                chunk[k] = link_url_pat.sub("", chunk[k]).strip()
+
+        # de-dup while preserving order
+        seen = set(); urls = [u for u in urls if not (u in seen or seen.add(u))]
+
+        # clean labels: **Best:** / bold / leading punctuation
+        body = re.sub(r"\(\s*shop\s+here[^)]*\)", "", body, flags=re.I).strip()
         name = re.sub(r'^\*\*(best|mid|splurge)\*\*:\s*', '', body, flags=re.I)
-        name = re.sub(r'^\*\*([^*]+)\*\*', r'\1', name)         # **Title** -> Title
+        name = re.sub(r'^\*\*([^*]+)\*\*', r'\1', name)
         name = re.sub(r'^\s*[-–—:]\s*', '', name).strip()
 
-        # 3) Build a safe, wrapped link (Amazon/SYL only)
+        # choose one safe link (merchant-preferred if present)
         try:
-            candidates = [url] if url else []
+            from app.ai import _extract_preferred_domains
             preferred = _extract_preferred_domains(user_text)
+        except Exception:
+            preferred = []
+
+        try:
+            candidates = urls
             safe = best_link(
                 query=(name or user_text or "best match"),
                 candidates=candidates,
                 cfg=os,
                 preferred_domains=preferred,
-)
+            )
         except Exception:
-            safe = best_link(query=(name or user_text or "best match"),
-                             candidates=[], cfg=os)
+            safe = best_link(
+                query=(name or user_text or "best match"),
+                candidates=[],
+                cfg=os,
+                preferred_domains=preferred,
+            )
 
-        # 4) Rebuild line: preserve the original bullet prefix
+        # rebuild single-line bullet, preserve original prefix spacing/numbering/dash
         prefix = raw[: raw.find(m.group(1))]
-        rebuilt = f"{prefix}{name or body} — {safe}"
-        out.append(to_plain_sms(rebuilt).rstrip())
+        rebuilt = f"{prefix}{name or body} — {safe}".rstrip()
+        out.append(to_plain_sms(rebuilt))
 
-    # Final pass: in case the model emitted any stray links elsewhere
+        # append only *non-link* commentary lines from the chunk (drop extra links)
+        for k in range(1, len(chunk)):
+            ln = chunk[k].strip()
+            if not ln:
+                continue
+            if ("http://" in ln) or ("https://" in ln):
+                continue  # drop extra URLs like "(Shop here ...)"
+            out.append(ln)
+
+        i = j  # advance to next bullet
+
     return wrap_all_affiliates("\n".join(out))
-
 
 def _amz_deep_link_if_obvious(label: str) -> str:
     """
