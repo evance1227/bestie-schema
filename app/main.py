@@ -474,34 +474,32 @@ def process_incoming(
         convo_id = user_id
 
     # ---------- Always enqueue the worker job ----------
-    from app.task_queue import enqueue_generate_reply, q as task_q  # use the canonical Queue
+    from app.task_queue import enqueue_generate_reply, q as task_q
 
     try:
-        # ---- Save incoming turn to Redis (conversation buffer) ----
+        # Save the user turn in Redis using the SAME connection as the Queue
         try:
-            _r = task_q.connection  # reuse same Redis connection as the Queue
+            _r = task_q.connection
             key = f"conv:{convo_id}:turns"
             _r.lpush(key, json.dumps({"role": "user", "content": text or ""}))
-            _r.ltrim(key, 0, 23)  # keep last ~24 turns
+            _r.ltrim(key, 0, 23)
         except Exception:
             pass
 
-        # Enqueue the worker job on the same queue the worker listens on
         job = enqueue_generate_reply(
-            task_q,              # Queue instance from app.task_queue
-            user_id,             # int
-            convo_id,            # int
-            text,                # message text
+            task_q,
+            user_id=user_id,
+            convo_id=convo_id,
+            text_val=text or "",
             media_urls=media_urls,
             user_phone=user_phone,
             msg_id=message_id,
         )
 
+        # log with resolved values (no %s placeholders)
         logger.success(
-            "[API][Queue] ✅ Enqueued job_id=%s queue=%s redis=%s",
-            getattr(job, "id", "n/a"),
-            task_q.name,
-            os.getenv("REDIS_URL", "")[:60] + "…",
+            f"[API][Queue] ✅ Enqueued job_id={getattr(job,'id',None)} "
+            f"queue={task_q.name} pending={task_q.count} redis={os.getenv('REDIS_URL','')[:60]}…"
         )
     except Exception:
         logger.exception("[API][Queue] ❌ Failed to enqueue job")
