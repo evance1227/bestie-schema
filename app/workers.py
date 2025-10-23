@@ -675,6 +675,7 @@ def _ensure_links_on_bullets(text: str, user_text: str) -> str:
 
         # --- strict-only retailer hints --------------------------------------------
         # If user didn't say "only", do not pass any merchants (None).
+        # --- strict-only retailer hints --------------------------------------------
         strict_merchants = _re_only.search(r"\bonly\b", user_text or "", _re_only.I) is not None
 
         preferred = None
@@ -684,27 +685,27 @@ def _ensure_links_on_bullets(text: str, user_text: str) -> str:
                 preferred = _extract_preferred_domains(user_text) or None
             except Exception:
                 preferred = None
-        # Bind candidates for best_link; use the URLs we collected from this bullet.
-        candidates = urls  # <-- this fixes "candidates is not defined"
+
+        candidates = urls  # use the URLs we collected from this bullet
         # ---------------------------------------------------------------------------
 
-        # try:
-        safe = best_link(
-            query=(name or user_text or "best match"),
-            candidates=candidates,              # bound above to 'urls'
-            cfg=os,
-            preferred_domains=preferred,        # None unless user said "only"
-            strict_preferred=strict_merchants,
-        )
-
-        # except Exception:
-        safe = best_link(
-            query=(name or user_text or "best match"),
-            candidates=[],                      # hard fallback
-            cfg=os,
-            preferred_domains=preferred,
-            strict_preferred=strict_merchants,
-        )
+        # build the link
+        try:
+            safe = best_link(
+                query=(name or user_text or "best match"),
+                candidates=candidates,
+                cfg=os,
+                preferred_domains=preferred,       # None unless "only"
+                strict_preferred=strict_merchants,
+            )
+        except Exception:
+            safe = best_link(
+                query=(name or user_text or "best match"),
+                candidates=[],
+                cfg=os,
+                preferred_domains=preferred,
+                strict_preferred=strict_merchants,
+            )
 
         # rebuild single-line bullet, preserve original prefix spacing/numbering/dash
         prefix = raw[: raw.find(m.group(1))]

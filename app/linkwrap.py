@@ -104,22 +104,6 @@ def _load_allowed():
 
 ALLOWED_SYL_DOMAINS, SYL_TEMPLATES = _load_allowed()
 
-def _head_ok(url: str, timeout=5) -> bool:
-    try:
-        parts = urllib.parse.urlsplit(url)
-        conn = http.client.HTTPSConnection(parts.netloc, timeout=timeout)
-        path = parts.path or "/"
-        if parts.query:
-            path += "?" + parts.query
-        conn.request("HEAD", path)
-        r = conn.getresponse()
-        return 200 <= r.status < 400
-    except Exception:
-        return False
-
-def _amazon_search(query: str) -> str:
-    return f"https://www.amazon.com/s?k={urllib.parse.quote_plus(query)}"
-
 def _syl_search(domain: str, query: str) -> str | None:
     domain = domain.lower()
     if domain in ALLOWED_SYL_DOMAINS and domain in SYL_TEMPLATES:
@@ -129,30 +113,6 @@ def _syl_search(domain: str, query: str) -> str | None:
 def _is_allowed(domain: str) -> bool:
     d = domain.lower()
     return d.endswith("amazon.com") or any(d.endswith(x) for x in ALLOWED_SYL_DOMAINS)
-
-def _wrap(url: str, cfg) -> str:
-    # Prefer your existing wrappers; no raw links.
-    if getattr(cfg, "GENIUSLINK_ENABLED", False):
-        return cfg.genius.wrap(url)          # your existing shortener
-    if "amazon." in url and getattr(cfg, "AMAZON_ASSOCIATE_TAG", ""):
-        parts = urllib.parse.urlsplit(url)
-        qs = urllib.parse.parse_qs(parts.query, keep_blank_values=True)
-        qs["tag"] = [cfg.AMAZON_ASSOCIATE_TAG]
-        new_q = urllib.parse.urlencode(qs, doseq=True)
-        return urllib.parse.urlunsplit((parts.scheme, parts.netloc, parts.path, new_q, parts.fragment))
-    if getattr(cfg, "SYL_ENABLED", False):
-    # TEMP: skip SYL for preferred merchant flows to avoid bad redirect
-        skip_env = (os.getenv("SYL_TEMP_SKIP_DOMAINS", "") or "").lower().split(",")
-        skip = {d.strip() for d in skip_env if d.strip()}
-        try:
-            host = urllib.parse.urlsplit(url).netloc.lower()
-        except Exception:
-            host = ""
-        if host and host in skip:
-            return url  # send direct merchant link until SYL is fixed
-        return cfg.syl.wrap(url)
-            # your existing SYL wrapper (shop-links.co etc.)
-    return url  # last resort; but with our config this should rarely trigger.
 
 _URL_RE = re.compile(r"(https?://[^\s)]+)")
 
@@ -249,114 +209,55 @@ def best_link(
     preferred_domains: list[str] | None = None,
     strict_preferred: bool = False,
 ) -> str:
-    
     """
-    Pick the monetization-best link:
-      1) If the user named retailers (preferred_domains), stay on those (SYL) – no Amazon fallback.
-      2) Otherwise evaluate SYL merchant search vs Amazon and choose by AFFIL_STRATEGY:
-         - syl-first | amazon-first | max-revenue
-    PDP candidates always win when live.
+    PDP > STRICT retailer search (only if user said 'only') > any live allowed candidate > Amazon search.
+    No soft preference path.
     """
-    preferred = [d.strip().lower() for d in (preferred_domains or [])]
+    preferred   = [d.strip().lower() for d in (preferred_domains or [])]
     prefer_only = bool(preferred) and bool(strict_preferred)
 
-    strategy = (os.getenv("AFFIL_STRATEGY") or "max-revenue").strip().lower()
-    # rough basis points; tune in env to reflect your real rev shares
-    syl_bps = int(os.getenv("SYL_BPS", "1200"))       # 12%
-    amz_bps = int(os.getenv("AMAZON_BPS", "300"))     # 3%
-
-    def _host(u: str) -> str:
-        try:
-            return urllib.parse.urlsplit(u).netloc.lower()
-        except Exception:
-            return ""
-
-    def _host_ok(h: str) -> bool:
-        return _is_allowed_host(h) and (not prefer_only or any(h.endswith(d) for d in preferred))
-
-    # (0) PDP candidate wins if it matches host policy and is live
+    # 1) PDP candidate on allowed host wins
     for cand in candidates or []:
         if not cand:
             continue
         u = cand.strip().strip("<>")
-        h = _host(u)
-        if _host_ok(h) and _looks_like_pdp(h, urllib.parse.urlsplit(u).path or "/") and _head_ok(u):
-            return _wrap(u, cfg=cfg)
-
-    # Build SYL retailer searches we could send (if any)
-    syl_options: list[str] = []
-    if prefer_only:
-        for dom in preferred:
-            srch = _retailer_search_url(dom, query)
-            if srch:
-                syl_options.append(srch)
-    else:
-        # When no preferred merchants were named, consider a few common SYL retailers from ENV
         try:
-            import json
-            tmpl_map = json.loads(os.getenv("SYL_SEARCH_TEMPLATES_JSON", "{}"))
-            # light heuristic: try Revolve, Free People, Nordstrom first if present
-            for key in ("revolve.com","freepeople.com","nordstrom.com","shopbop.com","sephora.com","ulta.com","dermstore.com"):
-                if key in tmpl_map:
-                    syl_options.append(tmpl_map[key].format(q=urllib.parse.quote_plus(query)))
+            parts = urllib.parse.urlsplit(u)
         except Exception:
-            pass
-
-    # Any allowed/live candidate (non-PDP) that matches the host policy
-    for cand in candidates or []:
-        u = cand.strip().strip("<>")
-        if _host_ok(_host(u)) and _head_ok(u):
+            continue
+        host, path = parts.netloc.lower(), (parts.path or "/").lower()
+        if _is_allowed_host(host) and _looks_like_pdp(host, path) and _head_ok(u):
             return _wrap(u, cfg=cfg)
 
-    # If user constrained merchants: return first SYL option (or "")
+    # 2) STRICT retailer search when user said 'only'
     if prefer_only:
-        if syl_options:
-            return _wrap(syl_options[0], cfg=cfg)
-        return ""  # do not leak to Amazon when merchant was explicitly requested
-    # Soft preference: if not strict, score SYL retailer searches for preferred domains vs Amazon
-    if preferred:
-        syl_soft = []
         for dom in preferred:
             srch = _retailer_search_url(dom, query)
             if srch:
-                syl_soft.append(srch)
+                return _wrap(srch, cfg=cfg)
+        # otherwise try any live candidate on allowed host
+        for cand in candidates or []:
+            u = (cand or "").strip().strip("<>")
+            try:
+                host = urllib.parse.urlsplit(u).netloc.lower()
+            except Exception:
+                host = ""
+            if _is_allowed_host(host) and _head_ok(u):
+                return _wrap(u, cfg=cfg)
+        return ""  # strict: do not leak to Amazon
 
-        # Choose by strategy but give a small bonus to preferred merchants
-        amz = _amazon_search(query)
-        pick = None
+    # 3) Any other live allowed candidate
+    for cand in candidates or []:
+        u = (cand or "").strip().strip("<>")
+        try:
+            host = urllib.parse.urlsplit(u).netloc.lower()
+        except Exception:
+            host = ""
+        if _is_allowed_host(host) and _head_ok(u):
+            return _wrap(u, cfg=cfg)
 
-        def _score(url: str) -> int:
-            if not url: return -1
-            h = urllib.parse.urlsplit(url).netloc.lower()
-            base = int(os.getenv("SYL_BPS", "1200")) if "amazon." not in h else int(os.getenv("AMAZON_BPS", "300"))
-            bonus = int(os.getenv("PREFERRED_BONUS_BPS", "150")) if any(h.endswith(d) for d in preferred) else 0
-            return base + bonus
-
-        if syl_soft:
-            best_syl = max(syl_soft, key=_score)
-            pick = best_syl if _score(best_syl) >= _score(amz) else amz
-        else:
-            pick = amz
-
-        return _wrap(pick, cfg=cfg)
-    
-    # No constraint → pick by strategy among SYL vs Amazon search
-    amz = _amazon_search(query)
-    syl = syl_options[0] if syl_options else ""
-
-    def _score(url: str) -> int:
-        # crude scoring by expected rev share; PDP candidates were handled earlier
-        if not url:
-            return -1
-        h = _host(url)
-        return syl_bps if h and "amazon." not in h else amz_bps
-
-    if strategy == "syl-first":
-        return _wrap(syl or amz, cfg=cfg)
-    if strategy == "amazon-first":
-        return _wrap(amz or syl, cfg=cfg)
-    # max-revenue (default)
-    return _wrap((syl if _score(syl) >= _score(amz) else amz), cfg=cfg)
+    # 4) Default: Amazon search (wrapped/tagged)
+    return _wrap(_amazon_search(query), cfg=cfg)
 
 def _retailer_search_url(domain: str, query: str) -> str | None:
     """
