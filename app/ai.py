@@ -552,7 +552,6 @@ def generate_reply(
     m = re.search(r"(?i)\b(send|give)\s+me\s+(the\s+)?link\s+for\s+(.+)$", user_text.strip())
     if m:
         product_name = m.group(3).strip().rstrip(".!?")
-        # Try to resolve a BUY-NOW PDP first (Amazon or strict merchant, if they said “only …”)
         strict_merchants = bool(re.search(r"\bonly\b", user_text or "", re.I))
         preferred = _extract_preferred_domains(user_text) if strict_merchants else None
         try:
@@ -560,7 +559,6 @@ def generate_reply(
             pdp = integrations_serp.find_pdp_url(product_name, preferred)
         except Exception:
             pdp = ""
-        # Fall back to standard chooser (may become Amazon search as last resort)
         safe_url = pdp or best_link(query=product_name, candidates=[], cfg=os)
         msg = (
             f"{product_name} — {safe_url}\n"
@@ -568,7 +566,6 @@ def generate_reply(
             "layer SPF on burn-prone areas."
         )
         return to_plain_sms(msg)
-
 
     vision_guidance = """
     If an image is provided, answer the user's question **about the image** directly.

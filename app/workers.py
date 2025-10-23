@@ -689,6 +689,7 @@ def _ensure_links_on_bullets(text: str, user_text: str) -> str:
                 preferred = None
 
                # If the bullet had no URLs, try to resolve a PDP now (Amazon or strict merchant)
+       # If the bullet had no URLs, try to resolve a PDP now (Amazon or strict merchant)
         if not urls:
             try:
                 from app import integrations_serp
@@ -719,7 +720,7 @@ def _ensure_links_on_bullets(text: str, user_text: str) -> str:
                     urls = [pdp]
         except Exception:
             pass
-
+    
         candidates = urls  # (leave this line as-is)
 
         # ---------------------------------------------------------------------------

@@ -178,6 +178,9 @@ def _wrap(url: str, *, cfg) -> str:
         qs = urllib.parse.parse_qs(parts.query, keep_blank_values=True)
         qs["tag"] = [cfg.AMAZON_ASSOCIATE_TAG]
         new_q = urllib.parse.urlencode(qs, doseq=True)
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.info("[Affil] Amazon tag applied tag=%s url=%s", cfg.AMAZON_ASSOCIATE_TAG, url)
         return urllib.parse.urlunsplit((parts.scheme, parts.netloc, parts.path, new_q, parts.fragment))
 
     if getattr(cfg, "SYL_ENABLED", False):
