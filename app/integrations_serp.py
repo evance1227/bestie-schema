@@ -62,6 +62,18 @@ def _first_match(patterns: List[re.Pattern], html_text: str) -> Optional[str]:
             return html.unescape(m.group(1))
     return None
 
+import urllib.parse
+
+def _clean_url(u: str) -> str:
+    return (u or "").strip().strip("<>")
+
+def _host(u: str) -> str:
+    """Return lowercase host of a URL or '' if it can’t be parsed."""
+    try:
+        return urllib.parse.urlsplit(u).netloc.lower()
+    except Exception:
+        return ""
+
 # --- Amazon PDP via Rainforest ------------------------------------------------
 def _amazon_pdp(query: str) -> str:
     if not RAINFOREST_API_KEY or not query.strip():
@@ -138,38 +150,124 @@ def _syl_pdp(query: str, domains: Optional[List[str]]) -> str:
     return ""
 
 # --- Public: find PDP url -----------------------------------------------------
-def find_pdp_url(query: str, domains: Optional[List[str]] = None) -> str:
+# --- SYL merchant PDP helpers -------------------------------------------------
+import re, json, html, urllib.parse
+
+def _abs(base: str, href: str) -> str:
+    return urllib.parse.urljoin(base, href)
+
+# Load retailer search URL patterns from env (what you already maintain)
+try:
+    _SYL_TEMPLATES: dict[str, str] = json.loads(os.getenv("SYL_SEARCH_TEMPLATES_JSON", "{}"))
+except Exception:
+    _SYL_TEMPLATES = {}
+
+# Minimal regex selectors per merchant to capture the first product <a href="...">
+# (We keep it regex-only to avoid extra parser deps.)
+_SELECTORS: dict[str, list[re.Pattern]] = {
+    "revolve.com": [
+        re.compile(r'<a[^>]+href="([^"]*?/product[^"]+)"', re.I),
+        re.compile(r'<a[^>]+href="(/r/[^"]+/[^"]+/[^"]+)"', re.I),
+    ],
+    "freepeople.com": [
+        re.compile(r'<a[^>]+class="c-product-card__image-link"[^>]+href="([^"]+)"', re.I),
+        re.compile(r'<a[^>]+href="(/[^"]+/products/[^"]+)"', re.I),
+    ],
+    "nordstrom.com": [
+        re.compile(r'<a[^>]+data-testid="product-card-link"[^>]+href="([^"]+)"', re.I),
+        re.compile(r'<a[^>]+href="(/s/[^"]+/\d+)"', re.I),
+    ],
+    "shopbop.com": [
+        re.compile(r'<a[^>]+class="product-img-link"[^>]+href="([^"]+)"', re.I),
+        re.compile(r'<a[^>]+href="(/product_detail/[^"]+)"', re.I),
+    ],
+    "sephora.com": [
+        re.compile(r'<a[^>]+data-at="sku_item_name"[^>]+href="([^"]+)"', re.I),
+        re.compile(r'<a[^>]+href="(/product/[^"]+)"', re.I),
+    ],
+    "ulta.com": [
+        re.compile(r'<a[^>]+class="product__name"[^>]+href="([^"]+)"', re.I),
+        re.compile(r'<a[^>]+href="(/p/[^"]+)"', re.I),
+    ],
+    "dermstore.com": [
+        re.compile(r'<a[^>]+class="productBlock_link"[^>]+href="([^"]+)"', re.I),
+        re.compile(r'<a[^>]+href="(/[^"]*product[^"]+)"', re.I),
+    ],
+}
+
+def _syl_pdp(query: str, domains: list[str] | None) -> str:
+    """Fetch the retailer search page and return the first product page URL."""
+    if not query.strip():
+        return ""
+    doms = [d.lower() for d in (domains or []) if d] if domains else list(_SYL_TEMPLATES.keys())
+    for dom in doms:
+        tmpl = _SYL_TEMPLATES.get(dom)
+        if not tmpl:
+            continue
+        try:
+            search_url = tmpl.format(q=urllib.parse.quote_plus(query))
+            resp = requests.get(
+                search_url,
+                timeout=7,
+                headers={"User-Agent": "Mozilla/5.0 (compatible; PDPResolver/1.0)"},
+            )
+            if not resp.ok:
+                continue
+            text = resp.text
+            for pat in _SELECTORS.get(dom, []):
+                m = pat.search(text)
+                if m:
+                    href = html.unescape(m.group(1))
+                    return _abs(f"https://{dom}", href)
+        except Exception:
+            continue
+    return ""
+# ----------------------------------------------------------------------------- 
+
+def find_pdp_url(name: str, domains: list[str] | None = None) -> str:
     """
     Return a BUY-NOW PDP URL for the given query.
-    - If domains include amazon.com (or domains is None), try Amazon via Rainforest.
-    - If specific SYL merchant domains are provided, try to resolve a PDP on those.
-    Returns "" if nothing found quickly.
+    Order:
+      1) Amazon PDP via Rainforest (unless caller constrained to non-Amazon domains)
+      2) SYL merchant PDP by scraping the first product from retailer search (for provided domains,
+         or for all configured SYL templates if domains is None)
     """
-    q = (query or "").strip()
+    q = (name or "").strip()
     if not q:
         return ""
 
     doms = [d.lower() for d in (domains or []) if d] if domains else []
-    # Try Amazon unless caller explicitly constrains to non-Amazon
-    if not doms or any(d.endswith("amazon.com") for d in doms):
-        pdp = _amazon_pdp(q)
-        if pdp:
-            return pdp
 
-    if doms:
-        pdp = _syl_pdp(q, doms)
-        if pdp:
-            return pdp
+    # Try Amazon unless caller explicitly constrained to non-Amazon merchants
+    try_amazon = (not doms) or any(d.endswith("amazon.com") for d in doms)
+    if try_amazon:
+        api_key = os.getenv("RAINFOREST_API_KEY", "")
+        if api_key:
+            try:
+                resp = requests.get(
+                    "https://api.rainforestapi.com/request",
+                    params={
+                        "api_key": api_key,
+                        "type": "search",
+                        "amazon_domain": "amazon.com",
+                        "search_term": q,
+                    },
+                    timeout=7,
+                )
+                data = resp.json() if resp.ok else {}
+                for item in (data.get("search_results") or [])[:8]:
+                    asin = item.get("asin")
+                    if asin:
+                        return f"https://www.amazon.com/dp/{asin}"
+            except Exception:
+                pass  # fall through to SYL
+
+    # SYL merchant PDP(s)
+    pdp = _syl_pdp(q, doms if doms else None)
+    if pdp:
+        return pdp
 
     return ""
-
-def _host(url: str) -> str:
-    try:
-        netloc = urlparse(url).netloc.lower()
-        return netloc[4:] if netloc.startswith("www.") else netloc
-    except Exception:
-        return ""
-
 
 def _clean_url(url: str) -> str:
     """Normalize retailer URLs and strip tracking params."""
