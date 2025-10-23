@@ -45,6 +45,123 @@ _UA = "BestieBot/1.0 (+https://bestie)"
 _TIMEOUT = 3.5   # seconds
 _MAX_STOCK_CHECKS = 6  # cap network calls for speed
 
+import os, re, json, time, html, urllib.parse
+import requests
+from typing import List, Optional
+
+RAINFOREST_API_KEY = os.getenv("RAINFOREST_API_KEY", "")
+
+# --- Helpers ----
+def _abs(base: str, href: str) -> str:
+    return urllib.parse.urljoin(base, href)
+
+def _first_match(patterns: List[re.Pattern], html_text: str) -> Optional[str]:
+    for pat in patterns:
+        m = pat.search(html_text)
+        if m:
+            return html.unescape(m.group(1))
+    return None
+
+# --- Amazon PDP via Rainforest ------------------------------------------------
+def _amazon_pdp(query: str) -> str:
+    if not RAINFOREST_API_KEY or not query.strip():
+        return ""
+    try:
+        r = requests.get(
+            "https://api.rainforestapi.com/request",
+            params={
+                "api_key": RAINFOREST_API_KEY,
+                "type": "search",
+                "amazon_domain": "amazon.com",
+                "search_term": query,
+            },
+            timeout=7,
+        )
+        data = r.json() if r.ok else {}
+        for item in (data.get("search_results") or [])[:8]:
+            asin = item.get("asin")
+            if asin:
+                return f"https://www.amazon.com/dp/{asin}"
+    except Exception:
+        pass
+    return ""
+
+# --- SYL merchants: fetch search HTML and grab first product card -------------
+# We use your env SYL_SEARCH_TEMPLATES_JSON for the search URL pattern.
+_SYL_TEMPLATES = {}
+try:
+    _SYL_TEMPLATES = json.loads(os.getenv("SYL_SEARCH_TEMPLATES_JSON", "{}"))
+except Exception:
+    _SYL_TEMPLATES = {}
+
+_SELECTORS = {
+    # domain -> list of (regex) patterns to capture first product HREF
+    # We keep this regex-based to avoid extra parser deps.
+    "revolve.com": [
+        re.compile(r'<a[^>]+href="([^"]+/product[^"]+)"[^>]*>'),   # product.jsp or /product…
+        re.compile(r'<a[^>]+href="(/r/[^"]+/[^"]+/[^"]+)"'),       # /r/brand/…/p/…
+    ],
+    "freepeople.com": [
+        re.compile(r'<a[^>]+class="c-product-card__image-link"[^>]+href="([^"]+)"'),
+        re.compile(r'<a[^>]+href="(/[^"]+/products/[^"]+)"'),
+    ],
+    "nordstrom.com": [
+        re.compile(r'<a[^>]+data-testid="product-card-link"[^>]+href="([^"]+)"'),
+        re.compile(r'<a[^>]+href="(/s/[^"]+/\d+)"'),
+    ],
+    "shopbop.com": [
+        re.compile(r'<a[^>]+class="product-img-link"[^>]+href="([^"]+)"'),
+        re.compile(r'<a[^>]+href="(/product_detail/[^"]+)"'),
+    ],
+}
+
+def _syl_pdp(query: str, domains: Optional[List[str]]) -> str:
+    if not query.strip():
+        return ""
+    doms = [d.lower() for d in (domains or []) if d]
+    for dom in doms:
+        tmpl = _SYL_TEMPLATES.get(dom)
+        if not tmpl:
+            continue
+        try:
+            url = tmpl.format(q=urllib.parse.quote_plus(query))
+            resp = requests.get(url, timeout=7, headers={"User-Agent":"Mozilla/5.0"})
+            if not resp.ok:
+                continue
+            text = resp.text
+            for pat in _SELECTORS.get(dom, []):
+                href = _first_match([pat], text)
+                if href:
+                    return _abs(f"https://{dom}", href)
+        except Exception:
+            continue
+    return ""
+
+# --- Public: find PDP url -----------------------------------------------------
+def find_pdp_url(query: str, domains: Optional[List[str]] = None) -> str:
+    """
+    Return a BUY-NOW PDP URL for the given query.
+    - If domains include amazon.com (or domains is None), try Amazon via Rainforest.
+    - If specific SYL merchant domains are provided, try to resolve a PDP on those.
+    Returns "" if nothing found quickly.
+    """
+    q = (query or "").strip()
+    if not q:
+        return ""
+
+    doms = [d.lower() for d in (domains or []) if d] if domains else []
+    # Try Amazon unless caller explicitly constrains to non-Amazon
+    if not doms or any(d.endswith("amazon.com") for d in doms):
+        pdp = _amazon_pdp(q)
+        if pdp:
+            return pdp
+
+    if doms:
+        pdp = _syl_pdp(q, doms)
+        if pdp:
+            return pdp
+
+    return ""
 
 def _host(url: str) -> str:
     try:
@@ -196,43 +313,46 @@ def lens_products(
             results = kept
 
     return results[:max(1, topn)]
-# app/integrations_serp.py
-import os, requests
 
+# --- PDP resolver (Amazon via Rainforest). If a non-Amazon domain is forced, skip Amazon. ---
 def find_pdp_url(name: str, domains: list[str] | None = None) -> str:
     """
-    Try to return a BUY-NOW PDP URL.
-    - For Amazon: use Rainforest API search → first ASIN → https://www.amazon.com/dp/<asin>
-    - For non-Amazon merchants (Revolve/FP/Nordstrom): return "" for now (we’ll keep SYL search)
+    Return a BUY-NOW product detail page (PDP) URL.
+    - Amazon: use Rainforest API to get the first ASIN → https://www.amazon.com/dp/<ASIN>
+    - If domains are provided and none is amazon.com, we skip the Amazon step.
     """
     name = (name or "").strip()
-    doms = [d.lower() for d in (domains or [])]
+    doms = [d.lower() for d in (domains or []) if d]
 
-    # If the user asked for specific merchants and none is amazon.com, skip Amazon.
-    if doms and not any(d.endswith("amazon.com") for d in doms):
+    # If caller constrained to non-Amazon merchants, don't try Amazon.
+    try_amazon = (not doms) or any(d.endswith("amazon.com") for d in doms)
+    if not name:
         return ""
 
-    api_key = os.getenv("RAINFOREST_API_KEY", "")
-    if not api_key or not name:
-        return ""
+    if try_amazon:
+        api_key = os.getenv("RAINFOREST_API_KEY", "")
+        if not api_key:
+            return ""
+        try:
+            resp = requests.get(
+                "https://api.rainforestapi.com/request",
+                params={
+                    "api_key": api_key,
+                    "type": "search",
+                    "amazon_domain": "amazon.com",
+                    "search_term": name,
+                },
+                timeout=7,
+            )
+            data = resp.json() if resp.ok else {}
+            results = (data.get("search_results") or [])[:6]
+            for r in results:
+                asin = r.get("asin")
+                if asin:
+                    return f"https://www.amazon.com/dp/{asin}"
+        except Exception:
+            pass
 
-    try:
-        resp = requests.get(
-            "https://api.rainforestapi.com/request",
-            params={
-                "api_key": api_key,
-                "type": "search",
-                "amazon_domain": "amazon.com",
-                "search_term": name,
-            },
-            timeout=7,
-        )
-        data = resp.json() if resp.ok else {}
-        results = (data.get("search_results") or [])[:6]
-        for r in results:
-            asin = r.get("asin")
-            if asin:
-                return f"https://www.amazon.com/dp/{asin}"
-    except Exception:
-        pass
+    # Nothing resolved
     return ""
+

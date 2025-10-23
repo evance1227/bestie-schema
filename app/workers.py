@@ -721,7 +721,19 @@ def _ensure_links_on_bullets(text: str, user_text: str) -> str:
             except Exception:
                 preferred = None
 
-        candidates = urls  # use the URLs we collected from this bullet
+       # If the bullet had no URLs, try to resolve a PDP now (Amazon or strict merchant)
+        if not urls:
+            try:
+                from app import integrations_serp
+                pdp_domains = preferred if strict_merchants and preferred else None
+                pdp = integrations_serp.find_pdp_url(name or user_text, pdp_domains)
+                if pdp:
+                    urls = [pdp]
+            except Exception:
+                pass
+
+        candidates = urls  # (leave this line as-is)
+
         # ---------------------------------------------------------------------------
 
         # build the link

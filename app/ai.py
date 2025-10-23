@@ -503,12 +503,14 @@ def build_messages(
 
     if product_candidates:
         product_candidates = _enrich_candidates_with_pdp(product_candidates)
-        preferred = _extract_preferred_domains(user_text)
+
         strict_merchants = bool(re.search(r"\bonly\b", user_text or "", re.I))
+        preferred = _extract_preferred_domains(user_text) if strict_merchants else None
+
         product_block = build_product_block(
             product_candidates,
-            preferred_domains=preferred,
-            strict_preferred=strict_merchants
+            preferred_domains=preferred,        # None when not strict
+            strict_preferred=strict_merchants,  # True only if user said "only"
         )
         user_payload += "\n\n" + product_block
 
