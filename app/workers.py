@@ -1887,50 +1887,43 @@ def generate_reply_job(
             (auto_link_flag and _looks_like_product_intent(user_text) and not _looks_like_style_intent(user_text))
         )
         if make_links_now and not _URL_RE.search(reply or ""):
-            names = _extract_pick_names(reply, maxn=3)           
+            names = _extract_pick_names(reply, maxn=3)
             if not names:
                 phrase = _phrase_from_user_text(user_text)
                 if phrase:
                     names = [phrase]
+
             if names:
-                # synthesize Amazon searches; linkwrap will add ?tag= later
-                strategy = (os.getenv("LINK_STRATEGY") or "dual").lower().strip()  # dual | syl-first | amazon-first | syl-only | amazon-only
+                # PDP-or-bust: try strict merchant PDP only if the user said “only”
+                strict_merchants = bool(re.search(r"\bonly\b", user_text or "", re.I))
+                preferred = _extract_preferred_domains(user_text) if strict_merchants else None
+
                 link_lines = []
                 for n in _pick_names_to_link(names, user_text):
-                    amz = _amz_search_url(n)
-                    syl = _syl_search_url(n, user_text)
+                    pdp = ""
+                    try:
+                        from app import integrations_serp
+                        pdp = integrations_serp.find_pdp_url(n, preferred)
+                    except Exception:
+                        pdp = ""
 
-                    if strategy == "syl-only":
-                        # only SYL; if syl is empty (not a retailer), fall back to Amazon
-                        link_lines.append(f"{n}: {syl or amz}")
+                    if not pdp:
+                        # as an emergency fallback, try Amazon PDP only
+                        try:
+                            pdp = integrations_serp.find_pdp_url(n, ["amazon.com"])
+                        except Exception:
+                            pdp = ""
 
-                    elif strategy == "amazon-only":
-                        # only Amazon
-                        link_lines.append(f"{n}: {amz}")
+                    if not pdp:
+                        # absolute last resort: a single Amazon search
+                        pdp = _amz_search_url(n)
 
-                    elif strategy == "syl-first":
-                        # prefer SYL when available; otherwise show Amazon
-                        link_lines.append(f"{n}: {syl or amz}")
-                        if syl and amz:
-                            link_lines.append(f"{n} (alt): {amz}")
-
-                    elif strategy == "amazon-first":
-                        # prefer Amazon; include SYL only if we actually have one
-                        link_lines.append(f"{n}: {amz}")
-                        if syl:
-                            link_lines.append(f"{n} (alt): {syl}")
-
-                    else:  # dual
-                        # show both; omit SYL if empty (procedures/techniques etc.)
-                        link_lines.append(f"{n}: {amz}")
-                        if syl:
-                            link_lines.append(f"{n} (alt): {syl}")
+                    link_lines.append(f"{n}: {pdp}")
 
                 link_block = "\n".join(link_lines)
-                
                 reply = ("Here you go:\n" + link_block) if link_request \
                         else (reply.rstrip() + "\n\nHere are the links:\n" + link_block)
-                # keep Amazon searches so they won't be stripped; tagging happens downstream
+                # keep as-is; wrapper will tag/shorten
                 reply = _ALLOW_AMZ_SEARCH_TOKEN + "\n" + reply
 
         # keep the list crisp if the model rambled
