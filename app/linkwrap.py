@@ -257,6 +257,20 @@ def best_link(
             return _wrap(u, cfg=cfg)
 
     # 4) Default: Amazon search (wrapped/tagged)
+    # Try to resolve a PDP directly (Amazon or SYL) before falling back to search
+    try:
+        from app import integrations_serp
+        # If strict + preferred merchants were passed, try those; otherwise try Amazon first, then SYL
+        pdp = integrations_serp.find_pdp_url(query, preferred if prefer_only else None)
+        if not pdp:
+            # If we weren’t strict, try Amazon PDP explicitly
+            pdp = integrations_serp.find_pdp_url(query, ["amazon.com"])
+        if pdp:
+            return _wrap(pdp, cfg=cfg)
+    except Exception:
+        pass
+
+    # LAST resort: Amazon search
     return _wrap(_amazon_search(query), cfg=cfg)
 
 def _retailer_search_url(domain: str, query: str) -> str | None:

@@ -37,11 +37,10 @@ from app.sms import to_plain_sms
 from app.ai import generate_contextual_closer
 from typing import Optional, List, Dict, Tuple
 from datetime import datetime, timezone, timedelta
-from urllib.parse import quote_plus
-from urllib.parse import urlparse
+from urllib.parse import urlparse, quote_plus
 from app.integrations_serp import lens_products
 
-from app.linkwrap import normalize_syl_links, _amz_search_url, _syl_search_url, wrap_all_affiliates, ensure_not_link_ending, normalize_syl_links
+from app.linkwrap import normalize_syl_links, _amz_search_url, _syl_search_url, ensure_not_link_ending
 import app.integrations as integrations
 import os, logging
 from redis import Redis
@@ -292,38 +291,6 @@ def _best_amz_query(label: str | None, user_text: str | None) -> str:
     return t or "best match"
 # Short confirmation -> continue the previous picks flow
 _CONFIRM_YES_RE = re.compile(r"^\s*(y|ya|yes|yep|yup|ok|okay|sure|please|do it|go ahead)\b", re.I)
-_PREFERRED_PARTNER_ORDER = (
-    "sephora.com",
-    "ulta.com",
-    "nordstrom.com",
-    "dermstore.com",
-    "amazon.com",
-)
-
-def _force_partner_search_if_brand(url: str | None, label: str, user_text: str) -> str | None:
-    """
-    If url points to a non-affiliate brand host (not shopmy/us, not our premium partners),
-    replace it with the first available premium partner search using label/user_text.
-    """
-    if not url:
-        return url
-    try:
-        h = urlparse(url).netloc.lower()
-        if h.startswith("www."):
-            h = h[4:]
-    except Exception:
-        return url
-
-    # keep if already affiliate (shopmy/us or amazon) or already a premium partner
-    if _is_affiliate_hostname(h) or h in _RETAILER_SEARCH:
-        return url
-
-    q = quote_plus(_carry_user_modifiers(user_text, label))
-    for partner in _PREFERRED_PARTNER_ORDER:
-        tmpl = _RETAILER_SEARCH.get(partner)
-        if tmpl:
-            return tmpl.format(q=q)
-    return url
 
 def _strip_trailing_link_fragments(s: str) -> str:
     """
@@ -721,7 +688,7 @@ def _ensure_links_on_bullets(text: str, user_text: str) -> str:
             except Exception:
                 preferred = None
 
-       # If the bullet had no URLs, try to resolve a PDP now (Amazon or strict merchant)
+               # If the bullet had no URLs, try to resolve a PDP now (Amazon or strict merchant)
         if not urls:
             try:
                 from app import integrations_serp
@@ -731,6 +698,27 @@ def _ensure_links_on_bullets(text: str, user_text: str) -> str:
                     urls = [pdp]
             except Exception:
                 pass
+
+        # If we only have disallowed/brand hosts, resolve to Amazon/SYL PDP before building candidates
+        try:
+            disallowed = True
+            for u in urls:
+                from urllib.parse import urlsplit
+                h = (urlsplit(u).netloc or "").lower()
+                from app.linkwrap import _is_allowed_host
+                if _is_allowed_host(h):
+                    disallowed = False
+                    break
+            if disallowed:
+                from app import integrations_serp
+                pdp = integrations_serp.find_pdp_url(
+                    name or user_text or "",
+                    preferred if strict_merchants and preferred else None
+                )
+                if pdp:
+                    urls = [pdp]
+        except Exception:
+            pass
 
         candidates = urls  # (leave this line as-is)
 
@@ -745,6 +733,7 @@ def _ensure_links_on_bullets(text: str, user_text: str) -> str:
                 preferred_domains=preferred,       # None unless "only"
                 strict_preferred=strict_merchants,
             )
+        # If we somehow got an Amazon search, convert it to a PDP now.        
         except Exception:
             safe = best_link(
                 query=(name or user_text or "best match"),
@@ -753,6 +742,14 @@ def _ensure_links_on_bullets(text: str, user_text: str) -> str:
                 preferred_domains=preferred,
                 strict_preferred=strict_merchants,
             )
+        try:
+            if isinstance(safe, str) and "amazon.com/s?" in safe:
+                from app import integrations_serp
+                pdp = integrations_serp.find_pdp_url(name or user_text or "", ["amazon.com"])
+                if pdp:
+                    safe = pdp  # wrapper will tag/shorten/skip as configured
+        except Exception:
+            pass
 
         # rebuild single-line bullet, preserve original prefix spacing/numbering/dash
         prefix = raw[: raw.find(m.group(1))]
@@ -842,55 +839,6 @@ def _clean_here_phrases(text: str) -> str:
             low = t.lower()
             changed = True
     return t.strip()
-
-from urllib.parse import quote_plus
-
-# --- Retailer search URLs for SYL wrapping -----------------------------------
-_RETAILER_SEARCH = {
-    "sephora.com":   "https://www.sephora.com/search?keyword={q}",
-    "ulta.com":      "https://www.ulta.com/searchresults?Ntt={q}",
-    "nordstrom.com": "https://www.nordstrom.com/sr?keyword={q}",
-    "revolve.com":   "https://www.revolve.com/r/search/?q={q}",
-    "shopbop.com":   "https://www.shopbop.com/actions/searchResultsAction.action?query={q}",
-    "target.com":    "https://www.target.com/s?searchTerm={q}",
-    "walmart.com":   "https://www.walmart.com/search?q={q}",
-}
-
-# Highest-payout / preferred partners — in order
-_PREFERRED_PARTNER_ORDER = [
-    "revolve.com",
-    "nordstrom.com",
-    "anthropologie.com",
-    "freepeople.com",
-    "sephora.com",
-    "ulta.com",
-]
-def _force_partner_search_if_brand(url: str | None, label: str, user_text: str) -> str | None:
-    """
-    If 'url' points to a non-affiliate brand host (not shopmy/us, not premium partners),
-    replace it with the first available premium partner search using the label/user_text.
-    Otherwise return url unchanged.
-    """
-    if not url:
-        return url
-    try:
-        h = urlparse(url).netloc.lower()
-        if h.startswith("www."):
-            h = h[4:]
-    except Exception:
-        return url
-
-    # if already shopmy/us or a premium partner, keep
-    if _is_affiliate_hostname(h) or h in _RETAILER_SEARCH:
-        return url
-
-    # For brand hosts (frye.com, samedelman.com, drscholls.com, etc.) → force partner search
-    q = quote_plus(_carry_user_modifiers(user_text, label))
-    for partner in _PREFERRED_PARTNER_ORDER:
-        tmpl = _RETAILER_SEARCH.get(partner)
-        if tmpl:
-            return tmpl.format(q=q)
-    return url
 
 # simple brand→retailer hints (extend anytime)
 _BRAND_HINTS = {
@@ -1831,7 +1779,7 @@ def generate_reply_job(
         # remove survey-ish prompts
         # Remove explicit allow token from user-visible text and fix preamble       
     try:
-        reply = _shorten_bullet_labels(_ensure_links_on_bullets(reply, user_text))
+        reply = _shorten_bullet_labels(_ensure_links_on_bullets(reply, user_text))        
         reply = _strip_bms_and_inline_urls(reply)
     except Exception as e:
         logger.exception("[Links] bulletization failed: %s", e)
