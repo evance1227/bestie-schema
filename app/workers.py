@@ -27,6 +27,7 @@ import hashlib
 import random
 import time
 import requests
+import re as _re_only
 import json
 from app.linkwrap import build_amazon_search_url
 from app.linkwrap import wrap_all_affiliates

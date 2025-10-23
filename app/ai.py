@@ -503,9 +503,15 @@ def build_messages(
 
     if product_candidates:
         product_candidates = _enrich_candidates_with_pdp(product_candidates)
-        preferred = _extract_preferred_domains(user_text)  # use the real text we have here
-        product_block = build_product_block(product_candidates, preferred_domains=preferred)
+        preferred = _extract_preferred_domains(user_text)
+        strict_merchants = bool(re.search(r"\bonly\b", user_text or "", re.I))
+        product_block = build_product_block(
+            product_candidates,
+            preferred_domains=preferred,
+            strict_preferred=strict_merchants
+        )
         user_payload += "\n\n" + product_block
+
 
     # ------- BEGIN vision-aware user message -------
     img_urls = []
@@ -581,8 +587,8 @@ def generate_reply(
         user_text=user_text,
         session_goal=session_goal,
         product_candidates=product_candidates,
-        context=context,   
-    )
+        context=context,
+        )
 
     # --- Best-first shopping guidance (no surveys; allow links when asked) -------
     shopping_guidance = """
@@ -941,8 +947,12 @@ def _enrich_candidates_with_pdp(product_candidates: List[Dict]) -> List[Dict]:
         enriched.append(q)
     return enriched
 
+def build_product_block(
+    product_candidates: List[Dict],
+    preferred_domains: List[str] | None = None,
+    strict_preferred: bool = False,
+) -> str:
 
-def build_product_block(product_candidates: List[Dict], preferred_domains: List[str] | None = None) -> str:
     """
     Format product block for GPT input.
     """
@@ -960,9 +970,17 @@ def build_product_block(product_candidates: List[Dict], preferred_domains: List[
                 candidates=[raw_url] if raw_url else [],
                 cfg=os,
                 preferred_domains=preferred_domains or [],   # <<< pass through
+                strict_preferred=strict_preferred, 
             )
         except Exception:
-            final = best_link(query=name, candidates=[], cfg=os, preferred_domains=preferred_domains or [])
+            final = best_link(
+            query=name,
+            candidates=[],
+            cfg=os,
+            preferred_domains=preferred_domains or [],
+            strict_preferred=strict_preferred,   # ← add this
+        )
+
     
         safe.append(
             {
