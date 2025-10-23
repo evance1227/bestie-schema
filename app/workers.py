@@ -673,32 +673,37 @@ def _ensure_links_on_bullets(text: str, user_text: str) -> str:
         name = re.sub(r'^\*\*([^*]+)\*\*', r'\1', name)
         name = re.sub(r'^\s*[-–—:]\s*', '', name).strip()
 
-        # choose one safe link
-        # Retailer names are *soft* by default — we only lock to them if the user says "only"
-        try:
-            from app.ai import _extract_preferred_domains
-        except Exception:
-            _extract_preferred_domains = lambda _t: []
+        # --- strict-only retailer hints --------------------------------------------
+        # If user didn't say "only", do not pass any merchants (None).
+        strict_merchants = _re_only.search(r"\bonly\b", user_text or "", _re_only.I) is not None
 
-        strict_merchants = bool(_re_only.search(r"\bonly\b", user_text or "", _re_only.I))
-        preferred = _extract_preferred_domains(user_text) if strict_merchants else None
+        preferred = None
+        if strict_merchants:
+            try:
+                from app.ai import _extract_preferred_domains
+                preferred = _extract_preferred_domains(user_text) or None
+            except Exception:
+                preferred = None
+        # Bind candidates for best_link; use the URLs we collected from this bullet.
+        candidates = urls  # <-- this fixes "candidates is not defined"
+        # ---------------------------------------------------------------------------
 
-        try:
-            candidates = urls
-            safe = best_link(
+        # try:
+        safe = best_link(
             query=(name or user_text or "best match"),
-            candidates=candidates,
+            candidates=candidates,              # bound above to 'urls'
             cfg=os,
-            preferred_domains=preferred,
-            strict_preferred=strict_merchants,   # <<< add this
+            preferred_domains=preferred,        # None unless user said "only"
+            strict_preferred=strict_merchants,
         )
-        except Exception:
-            safe = best_link(
+
+        # except Exception:
+        safe = best_link(
             query=(name or user_text or "best match"),
-            candidates=[],
+            candidates=[],                      # hard fallback
             cfg=os,
             preferred_domains=preferred,
-            strict_preferred=strict_merchants,   # <<< add this
+            strict_preferred=strict_merchants,
         )
 
         # rebuild single-line bullet, preserve original prefix spacing/numbering/dash
