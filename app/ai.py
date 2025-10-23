@@ -504,7 +504,10 @@ def build_messages(
     if product_candidates:
         product_candidates = _enrich_candidates_with_pdp(product_candidates)
 
-        strict_merchants = bool(re.search(r"\bonly\b", user_text or "", re.I))
+        strict_merchants = bool(
+        re.search(r"\bonly\b", user_text or "", re.I) or
+        re.search(r"\bfrom\s+(nordstrom|revolve|sephora|ulta|shopbop|free\s*people|dermstore)\b", user_text or "", re.I)
+    )
         preferred = _extract_preferred_domains(user_text) if strict_merchants else None
 
         product_block = build_product_block(

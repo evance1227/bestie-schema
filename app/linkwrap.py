@@ -249,15 +249,17 @@ def best_link(
                 return _wrap(u, cfg=cfg)
         return ""  # strict: do not leak to Amazon
 
-    # 3) Any other live allowed candidate
+    # 3) Any other live allowed PDP candidate (homepage/collection pages are ignored)
     for cand in candidates or []:
         u = (cand or "").strip().strip("<>")
         try:
-            host = urllib.parse.urlsplit(u).netloc.lower()
+            parts = urllib.parse.urlsplit(u)
+            host, path = parts.netloc.lower(), (parts.path or "/").lower()
         except Exception:
-            host = ""
-        if _is_allowed_host(host) and _head_ok(u):
+            continue
+        if _is_allowed_host(host) and _looks_like_pdp(host, path) and _head_ok(u):
             return _wrap(u, cfg=cfg)
+
 
     # 4) Default: Amazon search (wrapped/tagged)
     # Try to resolve a PDP directly (Amazon or SYL) before falling back to search
