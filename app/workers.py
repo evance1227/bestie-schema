@@ -673,28 +673,33 @@ def _ensure_links_on_bullets(text: str, user_text: str) -> str:
         name = re.sub(r'^\*\*([^*]+)\*\*', r'\1', name)
         name = re.sub(r'^\s*[-–—:]\s*', '', name).strip()
 
-        # choose one safe link (merchant-preferred if present)
+        # choose one safe link
+        # Retailer names are *soft* by default — we only lock to them if the user says "only"
         try:
             from app.ai import _extract_preferred_domains
-            preferred = _extract_preferred_domains(user_text)
         except Exception:
-            preferred = []
+            _extract_preferred_domains = lambda _t: []
+
+        strict_merchants = bool(_re_only.search(r"\bonly\b", user_text or "", _re_only.I))
+        preferred = _extract_preferred_domains(user_text) if strict_merchants else None
 
         try:
             candidates = urls
             safe = best_link(
-                query=(name or user_text or "best match"),
-                candidates=candidates,
-                cfg=os,
-                preferred_domains=preferred,
-            )
+            query=(name or user_text or "best match"),
+            candidates=candidates,
+            cfg=os,
+            preferred_domains=preferred,
+            strict_preferred=strict_merchants,   # <<< add this
+        )
         except Exception:
             safe = best_link(
-                query=(name or user_text or "best match"),
-                candidates=[],
-                cfg=os,
-                preferred_domains=preferred,
-            )
+            query=(name or user_text or "best match"),
+            candidates=[],
+            cfg=os,
+            preferred_domains=preferred,
+            strict_preferred=strict_merchants,   # <<< add this
+        )
 
         # rebuild single-line bullet, preserve original prefix spacing/numbering/dash
         prefix = raw[: raw.find(m.group(1))]
