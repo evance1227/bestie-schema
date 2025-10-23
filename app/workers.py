@@ -71,7 +71,42 @@ def _syl_allowed(merchant_key: str) -> bool:
     # allow all if wildcard present or if list is empty (no list given)
     return (not SYL_RETAILERS) or ("*" in SYL_RETAILERS) or (merchant_key in SYL_RETAILERS)
 
+# --- Orphaned "started" job rescue ------------------------------------------
+from rq import Queue
+from rq.job import Job
+from rq.registry import StartedJobRegistry
+
+def _rescue_orphaned_started_jobs(conn, queue_name: str) -> None:
+    """
+    If the worker was restarted while a job was in 'started' state,
+    move that job back onto the queue so it can be processed after boot.
+    """
+    try:
+        q = Queue(queue_name, connection=conn)
+        reg = StartedJobRegistry(queue=q)
+        for job_id in reg.get_job_ids():
+            try:
+                job = Job.fetch(job_id, connection=conn)
+                # remove from Started and re-enqueue
+                reg.remove(job, delete_job=False)
+                q.enqueue_job(job)
+                logger.warning("[Worker][Rescue] Requeued orphaned started job_id=%s", job_id)
+            except Exception:
+                logger.exception("[Worker][Rescue] failed to requeue job_id=%s", job_id)
+    except Exception:
+        logger.exception("[Worker][Rescue] registry scan failed")
+
 logger.info("[Boot] USE_GHL_ONLY=%s  SEND_FALLBACK_ON_ERROR=%s", USE_GHL_ONLY, SEND_FALLBACK_ON_ERROR)
+# Re-queue any jobs that were "started" when a deploy restarted the worker
+try:
+    _queue_name = os.getenv("QUEUE_NAME", "bestie_queue")
+    if _rds:
+        _rescue_orphaned_started_jobs(_rds, _queue_name)
+except Exception:
+    logger.exception("[Worker][Rescue] on-boot scan failed")
+
+
+# ---------------------------------------------------------------------------
 
 # Dev bypass
 DEV_BYPASS_PHONE = os.getenv("DEV_BYPASS_PHONE", "").strip()
@@ -1606,7 +1641,7 @@ def generate_reply_job(
       3) Chat-first GPT
       4) Affiliate/link hygiene + send
     """
-    logger.info("[Worker][Start] Job: convo_id=%s user_id=%s text=%s", convo_id, user_id, text_val)
+    logger.info("[Job][Start] phone=%s len=%d", _norm_phone(user_phone), len(text_val or ""))
     reply: Optional[str] = None
 
     # Normalize phone for outbound
